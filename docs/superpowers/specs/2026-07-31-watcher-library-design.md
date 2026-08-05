@@ -61,7 +61,9 @@ Each consuming project (handler, worktree CLI, future tools) imports the library
 
 ## Database Schema
 
-The library owns these tables, created via `db.Migrate(sqlDB)` inside each consumer's database:
+The library owns these tables, created via `db.Migrate(sqlDB)` inside each consumer's database.
+
+`Migrate` is called on consumer startup, which for handler means it runs on every CLI invocation and on every statusline render (roughly every 10 seconds). It must therefore be a single `SELECT` against `watcher_schema_version` in the common case, issuing DDL only when the version differs. Read-only paths pass a flag that makes a version mismatch an error rather than a migration, so a hot render path never takes a write lock.
 
 ### `watcher_schema_version`
 
@@ -128,9 +130,37 @@ Which subscribers care about which resources. Subscribers are opaque strings nam
 | resource_id | TEXT | Resource identifier |
 | resource_url | TEXT | URL (nullable) |
 | created_at | TEXT | ISO 8601 |
+| expires_at | TEXT | Lease expiry (nullable = permanent). See Subscription Leases. |
 | deleted_at | TEXT | Soft-delete timestamp (nullable) |
 
-Indexes: `(resource_type, resource_id, deleted_at)`.
+Indexes: `(resource_type, resource_id, deleted_at, expires_at)` to cover the `ActiveResources` lookup, and `subscriber` to cover lease renewal and revocation.
+
+#### Subscription Leases
+
+Some consumers have ephemeral subscribers. agent-handler subscribes on behalf of Claude Code sessions, which can die without a clean shutdown (crash, `kill -9`, terminal closed) and therefore without soft-deleting their subscriptions. Today handler avoids stale polling by joining `sessions` and filtering `status = 'active'` — a filter the library cannot reproduce, because the library has no concept of sessions and should not acquire one.
+
+Leases make liveness a first-class library concern without leaking consumer semantics into the library:
+
+- `expires_at IS NULL` means a permanent subscription (the worktree CLI's default — a worktree's resources matter until explicitly removed).
+- A non-null `expires_at` means the subscriber must periodically renew, or the subscription stops being polled.
+
+`ActiveResources` filters on `deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now)`. Expired rows are not deleted — they remain queryable for history and can be revived by a renewal.
+
+```go
+func Subscribe(db *sql.DB, subscriber string, r Resource, opts SubscribeOpts) error
+
+type SubscribeOpts struct {
+    TTL time.Duration // zero means permanent (expires_at = NULL)
+}
+
+// Renew extends every live lease held by this subscriber.
+func Renew(db *sql.DB, subscriber string, ttl time.Duration) error
+
+// Revoke soft-deletes every subscription held by this subscriber.
+func Revoke(db *sql.DB, subscriber string) error
+```
+
+**Consumer responsibility.** The lease is a backstop, not the primary mechanism. Consumers that already know when a subscriber dies should call `Revoke` promptly; the lease only bounds the damage when that signal is missed. For handler this means: `Renew` on the existing session heartbeat, `Revoke` from `SessionEnd` and from `handler cleanup` when it archives a session, and a generous TTL so that a live-but-idle session is never dropped just because it stopped rendering its statusline.
 
 ### `watcher_resource_relationships`
 
@@ -149,7 +179,7 @@ Parent-child links between resources (e.g. Jira epic-to-story).
 | source | TEXT | What discovered this relationship |
 | created_at | TEXT | ISO 8601 |
 
-### `watcher_status`
+### `watcher_poller_status`
 
 Last success/error per poller, for health reporting.
 
@@ -159,6 +189,12 @@ Last success/error per poller, for health reporting.
 | last_success | TEXT | ISO 8601 (nullable) |
 | last_error | TEXT | ISO 8601 (nullable) |
 | last_error_message | TEXT | Error details (nullable) |
+
+Named `watcher_poller_status` rather than `watcher_status` deliberately: agent-handler already owns a `watcher_status` table with a similar shape. Reusing the name would make `CREATE TABLE IF NOT EXISTS` silently adopt handler's existing table, hiding any schema drift and leaving old and new binaries sharing one table across a rollback. Avoiding the collision outright is cheaper than detecting it.
+
+### Table Name Collision Check
+
+`Migrate()` fails loudly if it finds a `watcher_*` table it did not create and whose schema does not match its expectation, rather than adopting it. Consumers can already have tables in this namespace — handler does — and a future consumer may too. Silent adoption is the failure mode worth designing against.
 
 ## Event Types
 
@@ -278,11 +314,15 @@ consumers:
 
 The library provides:
 - `config.Load()` / `config.Save()` — read/write the config file
-- `config.ServiceToken(service)` — get credentials, clear error if not configured
+- `config.GitHub()` / `config.Jira()` / `config.Slack()` — typed per-service accessors, each returning a populated struct or a "not configured" error
 - `config.RegisterConsumer(name, dbPath)` — add a consumer to the registry
 - `config.InteractiveAuth(service)` — interactive token setup flow
 
+Accessors are typed per service rather than a single `ServiceToken(name) string`, because the services do not share a credential shape: GitHub needs one token, Jira needs host + email + token, Slack will need a bot token and possibly an app token. A lowest-common-denominator accessor would force every caller to reach around it.
+
 Consumers embed the auth flow in their own setup commands (e.g. `handler watcher auth` calls `watcher.InteractiveAuth("github")`). If credentials already exist, setup is skipped.
+
+**Permissions.** The file holds credentials. `Save` writes it `0600` (and its parent directory `0700`). `Load` refuses to read a config that is group- or world-readable, returning an error that names the file and the `chmod` needed to fix it.
 
 ## `.worktree-resources.yaml` Format
 
@@ -311,6 +351,8 @@ Primary resources are what the worktree exists for. Related resources are watche
 
 The `label` field is optional, useful for resources with opaque IDs (like Slack threads).
 
+**Unknown resource types are not an error.** The example above contains a `slack` entry while the Slack poller is out of scope for v1, and that is the normal case rather than a contrived one: these files are written by hand and by tools that may be newer than the poller set. `Load` returns unknown types unchanged, and pollers ignore resource types they do not handle. A consumer may subscribe to a resource nothing currently polls; it simply receives no events until a poller exists.
+
 API:
 - `resources.Load(path) ([]Resource, error)` — reads YAML
 - `resources.Save(path, []Resource) error` — writes YAML
@@ -327,6 +369,23 @@ The library provides helpers for setting up periodic polling via the OS schedule
 Consumers specify which pollers to run and at what interval. The scheduler helpers generate the appropriate configuration that invokes the consumer's own binary (not a library binary — the library has no binary).
 
 Example: handler would schedule `handler watcher run github` every 3 minutes, just as it does today. The worktree UI might schedule `worktree poll github` every 5 minutes. Each runs independently.
+
+## Extraction Regression Suite
+
+The library's value proposition is that a fix lands in one place and every consumer inherits it. The extraction itself is the moment that proposition is most at risk: handler's watcher code carries accumulated edge-case fixes that are easy to drop while adapting the code to new table names and signatures. One such fix landed days before this spec was written — batch-submitted GitHub reviews share a single `createdAt`, so timestamp-based dedup silently dropped every inline comment but the first.
+
+Porting handler's existing watcher tests is therefore the **first** task of Phase 1, before any adaptation, and the following behaviors are explicit acceptance criteria with golden fixtures:
+
+| Behavior | Why it breaks |
+|----------|---------------|
+| Batch-submitted review comments sharing one `createdAt` | Timestamp dedup collapses them; requires title-based dedup |
+| CI bundle upsert across multiple poll cycles for one commit SHA | Naive append produces one event per check run |
+| New-commit detection via SHA comparison against cached state | Not detectable from timestamps alone |
+| First-poll `watch_started` suppression | Without it, subscribing to an old PR floods the inbox with its entire history |
+| Jira ADF comment body extraction | Comment bodies are structured documents, not strings |
+| Jira epic-link discovery → relationship row | Only automated writer of the relationships table |
+
+Each fixture captures a recorded API response and the exact set of events the poller should emit from it.
 
 ## Test Utilities
 
@@ -348,11 +407,14 @@ Handler's watcher commands (`handler watcher run github`, `handler watcher auth`
 
 ```go
 // handler watcher run github
-poller := github.NewPoller(handlerDB, config.ServiceToken("github"))
+gh, err := config.GitHub()
+poller := github.NewPoller(handlerDB, gh)
 poller.Poll()
 
 // handler subscribe --resource "pr:owner/repo#42"
-watcher.Subscribe(handlerDB, "handler:"+sessionID, "pr", "owner/repo#42", url)
+watcher.Subscribe(handlerDB, "handler:"+sessionID,
+    watcher.Resource{Type: "pr", ID: "owner/repo#42", URL: url},
+    watcher.SubscribeOpts{TTL: sessionLeaseTTL})
 ```
 
 ### Query Migration
@@ -398,14 +460,17 @@ A one-time migration command (`handler setup --migrate-watcher`) with the follow
 
 **Migration steps:**
 1. Run `handler setup --migrate-watcher`
-2. This creates `watcher_*` tables via `db.Migrate()`
-3. Copies watcher events from `events` → `watcher_events` (filtered by `source IN ('github', 'jira')`)
+2. Creates `watcher_*` tables via `db.Migrate()`, which aborts if it finds an unexpected table in its namespace
+3. Copies watcher events from `events` → `watcher_events`, filtered by `source IN ('github', 'jira')`
 4. Copies `event_resources` rows for those events → `watcher_event_resources`
 5. Copies `resource_state` → `watcher_resource_state`
-6. Copies `subscriptions` → `watcher_subscriptions` (with `subscriber = "handler:" + session_id`)
-7. Copies `watcher_status` → `watcher_status` (same table name, library-owned now)
+6. Copies `subscriptions` → `watcher_subscriptions` (with `subscriber = "handler:" + session_id`), setting `expires_at` for sessions that are still active and soft-deleting the rest
+7. Copies handler's `watcher_status` → `watcher_poller_status`, leaving the original in place for rollback
 8. Copies `resource_relationships` → `watcher_resource_relationships`
 9. Copies credentials from `~/.agent-handler/config.yaml` → `~/.config/watcher/config.yaml`
+10. Sets the schema-version marker that switches handler's read path to the UNION ALL queries
+
+The source filter must be an explicit allowlist of watcher sources, not a negation. Handler's `events` table currently holds four sources — `agent` (475 rows), `handler` (492), `github` (1816), `jira` (573) — and only the last two carry `event_resources`. Verified against the live database: the `agent`/`handler` and `github`/`jira` partitions have zero overlap, so the split is clean, but `handler` is easy to overlook when writing the filter.
 
 **Post-migration verification:**
 1. `handler health` — check database health
@@ -429,11 +494,20 @@ A one-time migration command (`handler setup --migrate-watcher`) with the follow
 
 ### Backwards Compatibility During Development
 
-During the transition period, handler supports both code paths:
-- If `watcher_events` table exists and has data → use UNION ALL queries
-- If not → use legacy single-table queries
+During the transition period, handler supports both code paths, selected by the `watcher_schema_version` marker set in the final migration step:
+
+- Marker present → UNION ALL queries
+- Marker absent → legacy single-table queries
+
+The predicate must never be "does `watcher_events` contain rows." Immediately after migrating a database with no watcher history, that table is legitimately empty, so a row-count check would send reads down the legacy path while the poller writes to `watcher_events` — new events would land in a table nothing reads. The failure is silent and presents as "the watcher stopped working."
 
 This allows incremental development on a feature branch without breaking the installed production binary.
+
+### Cursor Advance Correctness
+
+Handler currently advances cursors to `time.Now()` formatted as RFC3339, which is second-granularity, rather than to the maximum `ts` of the events actually returned. Any event inserted between the read and the cursor write — or merely within the same wall-clock second — is skipped permanently, because the unread predicate is `e.ts > cursor`.
+
+This is a pre-existing bug rather than something the split introduces, but the migration touches every one of these call sites, so it is cheap to fix here: advance to `max(ts)` over the returned event set, and leave the cursor untouched when the set is empty.
 
 ## Worktree CLI Integration
 
@@ -448,9 +522,15 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 
 | Risk | Mitigation |
 |------|------------|
+| Extraction silently drops an accumulated edge-case fix | Port handler's watcher tests first; golden fixtures for the six behaviors listed in the regression suite. |
+| Dead subscribers keep resources polled forever | Subscription leases (`expires_at`) as a backstop; handler revokes on `SessionEnd` and `cleanup`. |
+| Library adopts a consumer's same-named table | `watcher_poller_status` avoids the one known collision; `Migrate()` aborts on any unexpected `watcher_*` table. |
+| Read path and write path disagree post-migration | Path selection keyed to `watcher_schema_version`, never to row counts. |
 | UNION ALL query performance | Negligible at handler's scale. Ensure matching indexes on `watcher_events`. |
 | UNION ALL column alignment drift | Go helper function builds queries; compile-time guarantee of column match. |
 | Schema versioning across consumers | `watcher_schema_version` table enables idempotent `Migrate()`. Consumers can report their version. |
+| `Migrate()` on a hot path takes write locks | Version check is a single SELECT; read-only callers error rather than migrate. |
+| Credentials in a shared config file | `0600` on write; `Load` refuses group- or world-readable files. |
 | SQLite write contention | Already exists in handler today. Library documents WAL mode requirement. |
 | Cursor clock skew between processes | Theoretically possible, practically irrelevant on a single machine. Same risk as today. |
 | Handler data migration failure | Full backup + rollback procedure documented above. Backwards-compatible code paths during transition. |
@@ -461,14 +541,15 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 
 - GitHub PR poller (GraphQL, batched, all change detection)
 - Jira issue poller (REST v3, changelog, comments, custom fields)
-- `watcher_*` database schema and idempotent migrations
+- `watcher_*` database schema and idempotent migrations, with namespace collision detection
 - Schema version tracking
-- Subscription management (subscribe, unsubscribe, soft-delete, active resource queries)
+- Subscription management (subscribe, unsubscribe, soft-delete, leases, active resource queries)
 - Resource state caching
 - Resource relationship tracking (`watcher_resource_relationships`)
 - Event emission with upsert support (CI bundling)
 - Dedup framework (by external_ts, by title, composite)
-- Shared config file with credential management and consumer DB registry
+- Extraction regression suite with golden fixtures
+- Shared config file with typed accessors, credential management, and consumer DB registry
 - `.worktree-resources.yaml` read/write helpers
 - Scheduler helpers (launchd/cron)
 - Test utilities (mock pollers, test DB, seed helpers)
@@ -486,14 +567,16 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 ### Phase 1: Build the Library
 
 1. Initialize `github.com/mturley/watcher` Go module
-2. Extract and adapt code from agent-handler's `watcher/` package
-3. Implement `db` package with schema, migrations, query helpers
-4. Implement `config` package with shared config file
-5. Implement `resources` package with YAML helpers
-6. Implement `scheduler` package
-7. Implement `testutil` package
-8. Write tests against mock pollers and test DBs
-9. Tag `v0.1.0` and push
+2. Port agent-handler's existing watcher tests and build the golden-fixture regression suite — before any adaptation, so the extraction has something to be measured against
+3. Extract and adapt code from agent-handler's `watcher/` package
+4. Implement `db` package with schema, migrations, collision detection, query helpers
+5. Implement `config` package with typed accessors and permission enforcement
+6. Implement `resources` package with YAML helpers
+7. Implement `scheduler` package
+8. Implement `testutil` package
+9. Write tests against mock pollers and test DBs
+10. Write comprehensive README documenting library purpose, installation, API, consumer integration, and configuration
+11. Tag `v0.1.0` and push
 
 ### Phase 2: Worktree CLI Integration
 
@@ -506,13 +589,15 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 
 1. Create a handler worktree for the integration work
 2. Add `github.com/mturley/watcher` dependency (use `replace` directive for local development)
-3. Add `db.Migrate()` call on startup
+3. Add `db.Migrate()` call on startup, with read-only callers using the non-migrating variant
 4. Rewrite watcher commands as thin wrappers around library calls
-5. Rewrite event queries to use UNION ALL (with backwards-compatible fallback)
-6. Implement data migration command
-7. Test thoroughly against a test database
-8. Remove `replace` directive, pin to library version
-9. Tag a handler release
+5. Wire lease management: `Renew` on session heartbeat, `Revoke` on `SessionEnd` and `cleanup`
+6. Rewrite event queries to use UNION ALL, gated on the schema-version marker
+7. Fix cursor advance to use `max(ts)` of returned events
+8. Implement data migration command
+9. Test thoroughly against a test database
+10. Remove `replace` directive, pin to library version
+11. Tag a handler release
 
 ### Phase 4: Production Migration
 
