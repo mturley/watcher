@@ -160,7 +160,15 @@ func Renew(db *sql.DB, subscriber string, ttl time.Duration) error
 func Revoke(db *sql.DB, subscriber string) error
 ```
 
-**Consumer responsibility.** The lease is a backstop, not the primary mechanism. Consumers that already know when a subscriber dies should call `Revoke` promptly; the lease only bounds the damage when that signal is missed. For handler this means: `Renew` on the existing session heartbeat, `Revoke` from `SessionEnd` and from `handler cleanup` when it archives a session, and a generous TTL so that a live-but-idle session is never dropped just because it stopped rendering its statusline.
+**Consumer responsibility.** The lease is a backstop, not the primary mechanism. Consumers that already know when a subscriber dies should call `Revoke` promptly; the lease only bounds the damage when that signal is missed. For handler this means `Renew` on the existing session heartbeat and `Revoke` from both archive paths — `SessionEnd` and `handler cleanup`.
+
+Note that these two paths disagree today: `SessionEnd` soft-deletes subscriptions, while `cleanup`'s `ArchiveSessions` only sets `status = 'archived'` and leaves subscriptions untouched. That inconsistency is invisible right now because the `JOIN sessions` filter excludes archived sessions either way. Once the join is gone, both paths must revoke explicitly.
+
+**Handler's TTL: 5 days.** Sessions routinely survive a closed laptop over a weekend and resume afterward, so the TTL has to clear that comfortably.
+
+A long TTL is safe here, for two reasons. Expiry cannot lose events, because change detection is cursor-based rather than diff-against-last-poll: a resource whose lease lapses and is later renewed emits everything that happened in the interim on the next poll. Expiry is also self-healing, because a resumed session re-registers, which flips it back to active and re-subscribes from `.worktree-resources`, reinstating the soft-deleted rows. The worst case is one delayed poll cycle if the watcher happens to run between the laptop waking and the user's first prompt.
+
+A long TTL is also cheap. The only cost of a stale subscription is polling a resource nobody is watching, and the rate-limit headroom that made the library approach viable in the first place applies here too. The lease exists to stop subscriptions accumulating indefinitely over months, not to be precise about the hour a session died — that precision comes from `Revoke`.
 
 ### `watcher_resource_relationships`
 
@@ -523,7 +531,7 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 | Risk | Mitigation |
 |------|------------|
 | Extraction silently drops an accumulated edge-case fix | Port handler's watcher tests first; golden fixtures for the six behaviors listed in the regression suite. |
-| Dead subscribers keep resources polled forever | Subscription leases (`expires_at`) as a backstop; handler revokes on `SessionEnd` and `cleanup`. |
+| Dead subscribers keep resources polled forever | `Revoke` on both handler archive paths is the primary mechanism; a 5-day lease bounds the cases that miss it. Over-polling is cheap; expiry cannot lose events. |
 | Library adopts a consumer's same-named table | `watcher_poller_status` avoids the one known collision; `Migrate()` aborts on any unexpected `watcher_*` table. |
 | Read path and write path disagree post-migration | Path selection keyed to `watcher_schema_version`, never to row counts. |
 | UNION ALL query performance | Negligible at handler's scale. Ensure matching indexes on `watcher_events`. |
@@ -591,7 +599,7 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 2. Add `github.com/mturley/watcher` dependency (use `replace` directive for local development)
 3. Add `db.Migrate()` call on startup, with read-only callers using the non-migrating variant
 4. Rewrite watcher commands as thin wrappers around library calls
-5. Wire lease management: `Renew` on session heartbeat, `Revoke` on `SessionEnd` and `cleanup`
+5. Wire lease management: `Renew` on session heartbeat with a 5-day TTL, `Revoke` on both archive paths (`SessionEnd` and `cleanup`, which currently disagree)
 6. Rewrite event queries to use UNION ALL, gated on the schema-version marker
 7. Fix cursor advance to use `max(ts)` of returned events
 8. Implement data migration command
