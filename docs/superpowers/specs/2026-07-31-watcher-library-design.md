@@ -409,7 +409,7 @@ The `testutil` package provides helpers for consumer test suites:
 
 ### How Handler Uses the Library
 
-Handler imports the library and runs `db.Migrate(handlerDB)` on startup, creating `watcher_*` tables alongside handler's existing tables in `handler.db`.
+Handler imports the library and runs the library's `Migrate(handlerDB)` on startup, creating `watcher_*` tables alongside handler's existing tables in `handler.db`. This runs in addition to handler's own `runMigrations()` hook; the two are kept disjoint (see Two Migration Systems below).
 
 Handler's watcher commands (`handler watcher run github`, `handler watcher auth`, etc.) become thin wrappers around library calls:
 
@@ -427,19 +427,34 @@ watcher.Subscribe(handlerDB, "handler:"+sessionID,
 
 ### Query Migration
 
-Handler's ~20 event queries that currently read from a single `events` table are rewritten to UNION ALL with `watcher_events`. The pattern:
+An earlier draft of this spec estimated "~20 event queries rewritten to UNION ALL." That estimate is now obsolete, in handler's favor. A handler refactor (commits `397ab49`..`6366959`, landed after this spec's first draft) centralized the inbox routing predicate into a single file, `db/inbox_scope.go`. Every unread query — `UnreadForSession`, `UnreadCountForSession`, `UnreadResourcesForSession`, `HumanUnreadCountForSession`, `AutoDeliveredCount`, and the newer `UnreadEventsOfType` — now composes three shared fragments rather than hand-rolling its own joins:
+
+- `inboxJoinSQL` — the `FROM events e` plus `LEFT JOIN`s to `event_recipients`, `event_resources`, and the session's live `subscriptions`
+- `inboxWhereSQL` — the routing predicate, including the `s.id IS NOT NULL` branch that admits subscription-routed (watcher) events
+- `inboxScopeArgs(session, cursor)` — the ordered argument slice
+
+Because the watcher-relevant routing lives in exactly one place, the migration is localized to that file. The `event_resources` / `subscriptions` joins in the watcher-routed branch are redirected to `watcher_event_resources` / `watcher_subscriptions`, and the branch reads from `watcher_events`. Every caller inherits the change. `DirectCountForSession` stays separate by design (a narrower direct-recipient-only predicate that never sees watcher events) and needs no change.
+
+The new definition of the shared fragments is the UNION of the two routing sources:
 
 ```sql
-SELECT id, ts, type, title, body FROM (
-  -- Agent events (recipients/broadcast routing)
+-- Composed inside inboxJoinSQL + inboxWhereSQL. Callers wrap this with their
+-- own SELECT / GROUP BY / ORDER BY, exactly as they do today.
+SELECT ... FROM (
+  -- Agent events (recipient / broadcast / role routing)
   SELECT e.id, e.ts, e.type, e.title, e.body
   FROM events e
   LEFT JOIN event_recipients er ON e.id = er.event_id
-  WHERE e.ts > :cursor AND (
-    e.broadcast = 1
-    OR (er.recipient_type = 'session' AND er.recipient_value = :session_id)
-    OR (er.recipient_type = 'branch' AND er.recipient_value = :branch)
-  )
+  WHERE e.ts > :cursor
+    AND e.type NOT IN ('watch_started', 'watcher_error')
+    AND NOT EXISTS (SELECT 1 FROM dismissed_events d
+                    WHERE d.session_id = :session_id AND d.event_id = e.id)
+    AND (
+      e.broadcast = 1
+      OR (er.recipient_type = 'session' AND er.recipient_value = :session_id)
+      OR (er.recipient_type = 'branch'  AND er.recipient_value IN (:branch, :repo_branch))
+      OR (er.recipient_type = 'role'    AND er.recipient_value = :role)
+    )
 
   UNION ALL
 
@@ -449,13 +464,36 @@ SELECT id, ts, type, title, body FROM (
   JOIN watcher_event_resources wer ON we.id = wer.event_id
   JOIN watcher_subscriptions ws ON ws.resource_type = wer.resource_type
     AND ws.resource_id = wer.resource_id
-  WHERE ws.subscriber = :subscriber AND we.ts > :cursor
+    AND ws.subscriber = :subscriber
+    AND ws.deleted_at IS NULL
+    AND (ws.expires_at IS NULL OR ws.expires_at > :now)
+  WHERE we.ts > :cursor
     AND we.type NOT IN ('watch_started', 'watcher_error')
+    AND NOT EXISTS (SELECT 1 FROM dismissed_events d
+                    WHERE d.session_id = :session_id AND d.event_id = we.id)
 ) combined
-ORDER BY ts DESC
 ```
 
-A Go helper function builds these UNION ALL queries to avoid misaligned column lists when handler's events table changes.
+The subscriber for the watcher half is `"handler:" + session_id`. A Go helper builds this UNION so the two halves' column lists stay aligned as handler's `events` table evolves.
+
+### Dismissal Interaction
+
+The same refactor added per-session explicit dismissal: a `dismissed_events(session_id, event_id, dismissed_at)` table, keyed `(session_id, event_id)`, that lets a user drop a single inbox event independently of the cursor. It is excluded via `dismissedExclusionSQL` — `NOT EXISTS (SELECT 1 FROM dismissed_events d WHERE d.session_id = ? AND d.event_id = e.id)`.
+
+This table is handler-owned and stays that way — it is not a `watcher_*` table and the library knows nothing about it. But it interacts with the split in a way that is easy to get wrong: `dismissed_events` stores a bare `event_id` with no source or table discriminator. Before the split, every dismissible event lived in `events`, so the exclusion only ever matched there. After the split, a dismissed PR-comment event lives in `watcher_events`. **The dismissal exclusion must therefore be applied to both halves of the UNION** — the `events` half and the `watcher_events` half — as shown in the SQL above. Wiring it to only the `events` half is the natural mistake, and it silently resurrects dismissed watcher events.
+
+This depends on one invariant: `event_id` values must be unique across `events` and `watcher_events`. Both tables use UUIDs, so this holds, but it is now a load-bearing requirement rather than an incidental fact — a dismissal keyed to an ID that existed in both tables would suppress the wrong event.
+
+### Two Migration Systems, Kept Separate
+
+The refactor also brought handler's own migration hook to life: `runMigrations()` in `db/db.go` now issues `CREATE TABLE IF NOT EXISTS dismissed_events` for databases created before that table existed. This is the first real use of that hook, and it is the established pattern for handler-owned schema evolution.
+
+After integration, two migration systems run against `handler.db`:
+
+- **Handler's `runMigrations()`** owns handler tables (`events`, `dismissed_events`, `subscriptions`, and the rest).
+- **The library's `Migrate()`** owns `watcher_*` tables exclusively.
+
+They must not overlap. The collision detection already specified for `Migrate()` — abort on any unexpected `watcher_*` table — is the guard on the library side. On the handler side, `runMigrations()` must never touch a `watcher_*` table; the library is the sole authority there. Handler calls both on startup: its own hook for its tables, the library's `Migrate()` for the watcher tables.
 
 ### Data Migration
 
@@ -534,6 +572,8 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 | Dead subscribers keep resources polled forever | `Revoke` on both handler archive paths is the primary mechanism; a 5-day lease bounds the cases that miss it. Over-polling is cheap; expiry cannot lose events. |
 | Library adopts a consumer's same-named table | `watcher_poller_status` avoids the one known collision; `Migrate()` aborts on any unexpected `watcher_*` table. |
 | Read path and write path disagree post-migration | Path selection keyed to `watcher_schema_version`, never to row counts. |
+| Dismissed watcher events silently reappear | Apply `dismissedExclusionSQL` to both halves of the inbox UNION, not just the `events` half. Relies on `event_id` uniqueness across `events` and `watcher_events` (both UUIDs). |
+| Handler and library migration hooks collide | `runMigrations()` owns handler tables only; `Migrate()` owns `watcher_*` only. Collision check aborts if either strays. |
 | UNION ALL query performance | Negligible at handler's scale. Ensure matching indexes on `watcher_events`. |
 | UNION ALL column alignment drift | Go helper function builds queries; compile-time guarantee of column match. |
 | Schema versioning across consumers | `watcher_schema_version` table enables idempotent `Migrate()`. Consumers can report their version. |
@@ -597,15 +637,16 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 
 1. Create a handler worktree for the integration work
 2. Add `github.com/mturley/watcher` dependency (use `replace` directive for local development)
-3. Add `db.Migrate()` call on startup, with read-only callers using the non-migrating variant
+3. Add the library's `Migrate()` call on startup alongside handler's existing `runMigrations()`, keeping the two hooks disjoint (handler tables vs `watcher_*`); read-only callers use the non-migrating variant
 4. Rewrite watcher commands as thin wrappers around library calls
 5. Wire lease management: `Renew` on session heartbeat with a 5-day TTL, `Revoke` on both archive paths (`SessionEnd` and `cleanup`, which currently disagree)
-6. Rewrite event queries to use UNION ALL, gated on the schema-version marker
-7. Fix cursor advance to use `max(ts)` of returned events
-8. Implement data migration command
-9. Test thoroughly against a test database
-10. Remove `replace` directive, pin to library version
-11. Tag a handler release
+6. Redirect the watcher-routed branch of `db/inbox_scope.go` (join + where + args) to the `watcher_*` tables via the UNION, gated on the schema-version marker
+7. Apply `dismissedExclusionSQL` to the watcher half of the UNION, not just the `events` half
+8. Fix cursor advance to use `max(ts)` of returned events
+9. Implement data migration command
+10. Test thoroughly against a test database
+11. Remove `replace` directive, pin to library version
+12. Tag a handler release
 
 ### Phase 4: Production Migration
 
