@@ -1,486 +1,429 @@
-//go:build golden
-
 package jira
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/mturley/watcher"
-	"github.com/mturley/watcher/config"
 	"github.com/mturley/watcher/db"
 	"github.com/mturley/watcher/testutil"
 )
 
-func TestPoll_FirstPoll(t *testing.T) {
-	// Create mock Jira server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify request
-		if r.Method != "GET" {
-			t.Errorf("Expected GET request, got %s", r.Method)
-		}
+// testLogger returns a logger that discards output.
+func testLogger() *log.Logger {
+	return log.New(io.Discard, "", 0)
+}
 
-		username, password, ok := r.BasicAuth()
-		if !ok || username != "test@example.com" || password != "test-token" {
-			t.Errorf("Expected basic auth test@example.com:test-token, got %s:%s", username, password)
-		}
+// jiraResource is the resource under test across cases.
+var jiraResource = watcher.Resource{
+	Type: "jira",
+	ID:   "RHOAIENG-123",
+	URL:  "https://redhat.atlassian.net/browse/RHOAIENG-123",
+}
 
-		// Return mock issue response
-		response := map[string]interface{}{
-			"key": "PROJ-123",
-			"fields": map[string]interface{}{
-				"summary": "Test Issue",
-				"status": map[string]interface{}{
-					"name": "In Progress",
-				},
-				"assignee": map[string]interface{}{
-					"displayName": "John Doe",
-				},
-				"labels":               []string{"bug", "priority"},
-				"customfield_12311140": "PROJ-100", // Epic link
-				"comment": map[string]interface{}{
-					"comments": []interface{}{
-						map[string]interface{}{
-							"author": map[string]interface{}{
-								"displayName": "Jane Smith",
-							},
-							"created": "2026-06-17T09:00:00.000+0000",
-							"body":    map[string]interface{}{}, // ADF body (we ignore it)
-						},
-					},
-				},
-			},
-			"changelog": map[string]interface{}{
-				"histories": []interface{}{
-					map[string]interface{}{
-						"author": map[string]interface{}{
-							"displayName": "John Doe",
-						},
-						"created": "2026-06-17T08:00:00.000+0000",
-						"items": []interface{}{
-							map[string]interface{}{
-								"field":      "status",
-								"fromString": "To Do",
-								"toString":   "In Progress",
-							},
-						},
-					},
-				},
-			},
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}))
-	defer server.Close()
-
-	// Create test database
-	tempDB := testutil.NewTestDB(t)
-
-	// Create test session
-	sessionID := uuid.New().String()
-	session := db.Session{
-		SessionID:    sessionID,
-		Harness:      "claude",
-		Repo:         "test-repo",
-		Branch:       "main",
-		Status:       "active",
-		InboxMode:    "manual",
-		LastActive:   "2026-06-17T06:00:00Z",
-		RegisteredAt: "2026-06-17T06:00:00Z",
-		JSONLPath:    "/tmp/test.jsonl",
-	}
-	if err := tempDB.UpsertSession(session); err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
-
-	// Create test subscription
-	sub := db.Subscription{
-		ID:           uuid.New().String(),
-		SessionID:    sessionID,
-		ResourceType: "jira",
-		ResourceID:   "PROJ-123",
-		ResourceURL:  strPtr("https://redhat.atlassian.net/browse/PROJ-123"),
-		CreatedAt:    "2026-06-17T06:00:00Z",
-	}
-	if err := tempDB.Subscribe(sub); err != nil {
-		t.Fatalf("Failed to create subscription: %v", err)
-	}
-
-	// Create test config
-	cfg := &config.Config{
-		Services: config.Services{
-			Jira: &config.JiraConfig{
-				URL:   server.URL,
-				Email: "test@example.com",
-				Token: "test-token",
-			},
-		},
-	}
-
-	// Create test resources
-	resources := []watcher.Resource{
-		{
-			Type: "jira",
-			ID:   "PROJ-123",
-			URL:  "https://redhat.atlassian.net/browse/PROJ-123",
-		},
-	}
-
-	// Create logger
-	logger := log.New(os.Stderr, "[test] ", log.LstdFlags)
-
-	// Run poller
-	if err := Poll(tempDB, cfg, resources, logger); err != nil {
-		t.Fatalf("Poll failed: %v", err)
-	}
-
-	// Verify events were written
-	events, err := tempDB.QueryEvents(db.EventFilter{
-		Source: strPtr("jira"),
-	})
-	if err != nil {
-		t.Fatalf("Failed to query events: %v", err)
-	}
-
-	if len(events) == 0 {
-		t.Fatal("Expected events to be written, but none were found")
-	}
-
-	// Verify watch_started event was emitted (first poll, no cursor)
-	foundWatchStarted := false
+// typeCounts tallies events by type.
+func typeCounts(events []watcher.Event) map[watcher.EventType]int {
+	out := make(map[watcher.EventType]int)
 	for _, e := range events {
-		if e.Type == "watch_started" {
-			foundWatchStarted = true
-			if e.Source != "jira" {
-				t.Errorf("Expected source 'jira', got %q", e.Source)
-			}
-			if e.Title != "Started watching issue: Test Issue" {
-				t.Errorf("Expected title 'Started watching issue: Test Issue', got %q", e.Title)
-			}
-		}
+		out[e.Type]++
+	}
+	return out
+}
+
+// TestProcessIssue_FirstPoll verifies the first poll (no cursor, no backfill)
+// emits only a watch_started marker (which EventsForResource excludes).
+func TestProcessIssue_FirstPoll(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
 	}
 
-	if !foundWatchStarted {
-		t.Error("Expected watch_started event, but it was not found")
+	issue := IssueData{
+		Key:     "RHOAIENG-123",
+		Summary: "Test Issue",
+		Status:  "In Progress",
+		Comments: []IssueComment{
+			{Author: "Jane Smith", CreatedAt: "2026-06-17T09:00:00.000+0000", Body: "hello"},
+		},
+		Changelog: []ChangelogEntry{
+			{Author: "John Doe", CreatedAt: "2026-06-17T08:00:00.000+0000", Field: "status", From: "To Do", To: "In Progress"},
+		},
+	}
+
+	n, err := processIssue(conn, JiraAuth{}, issue, jiraResource, false, testLogger())
+	if err != nil {
+		t.Fatalf("processIssue: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 event emitted (watch_started), got %d", n)
+	}
+
+	// watch_started is a bookkeeping type excluded by EventsForResource.
+	events, err := db.EventsForResource(conn, "jira", jiraResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("expected 0 consumer-visible events on first poll, got %d: %+v", len(events), events)
+	}
+
+	// A cursor should now be set so the next poll processes normally.
+	cursor, err := db.EventCursor(conn, "jira", "jira", jiraResource.ID)
+	if err != nil {
+		t.Fatalf("EventCursor: %v", err)
+	}
+	if cursor == "" {
+		t.Error("expected non-empty cursor after watch_started")
 	}
 }
 
-func TestPoll_SubsequentPoll(t *testing.T) {
-	// Create mock Jira server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := map[string]interface{}{
-			"key": "PROJ-123",
-			"fields": map[string]interface{}{
-				"summary": "Test Issue",
-				"status": map[string]interface{}{
-					"name": "In Progress",
-				},
-				"assignee": map[string]interface{}{
-					"displayName": "John Doe",
-				},
-				"labels": []string{"bug", "priority"},
-				"comment": map[string]interface{}{
-					"comments": []interface{}{
-						map[string]interface{}{
-							"author": map[string]interface{}{
-								"displayName": "Jane Smith",
-							},
-							"created": "2026-06-17T09:00:00.000+0000",
-							"body":    map[string]interface{}{},
-						},
-					},
-				},
-			},
-			"changelog": map[string]interface{}{
-				"histories": []interface{}{
-					map[string]interface{}{
-						"author": map[string]interface{}{
-							"displayName": "John Doe",
-						},
-						"created": "2026-06-17T10:00:00.000+0000",
-						"items": []interface{}{
-							map[string]interface{}{
-								"field":      "status",
-								"fromString": "In Progress",
-								"toString":   "Done",
-							},
-						},
-					},
-				},
-			},
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}))
-	defer server.Close()
-
-	// Create test database
-	tempDB := testutil.NewTestDB(t)
-
-	// Create test session
-	sessionID := uuid.New().String()
-	session := db.Session{
-		SessionID:    sessionID,
-		Harness:      "claude",
-		Repo:         "test-repo",
-		Branch:       "main",
-		Status:       "active",
-		InboxMode:    "manual",
-		LastActive:   "2026-06-17T06:00:00Z",
-		RegisteredAt: "2026-06-17T06:00:00Z",
-		JSONLPath:    "/tmp/test.jsonl",
-	}
-	if err := tempDB.UpsertSession(session); err != nil {
-		t.Fatalf("Failed to create session: %v", err)
+// TestProcessIssue_SubsequentPoll verifies that once a cursor exists, new
+// comments and changelog entries after the cursor are emitted with the
+// correct event types, titles, and author metadata.
+func TestProcessIssue_SubsequentPoll(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
 	}
 
-	// Create test subscription
-	sub := db.Subscription{
-		ID:           uuid.New().String(),
-		SessionID:    sessionID,
-		ResourceType: "jira",
-		ResourceID:   "PROJ-123",
-		ResourceURL:  strPtr("https://redhat.atlassian.net/browse/PROJ-123"),
-		CreatedAt:    "2026-06-17T06:00:00Z",
-	}
-	if err := tempDB.Subscribe(sub); err != nil {
-		t.Fatalf("Failed to create subscription: %v", err)
-	}
-
-	// Insert a prior event to establish a cursor
-	priorEvent := db.Event{
-		ID:         uuid.New().String(),
-		TS:         "2026-06-17T08:00:00Z",
-		ExternalTS: strPtr("2026-06-17T09:00:00.000+0000"),
-		Source:     "jira",
-		SessionID:  nil,
-		Type:       "watch_started",
-		Title:      "Started watching issue",
-		Body:       nil,
-		Author:     nil,
-		AuthorType: nil,
-		Broadcast:  false,
-		Tags:       nil,
-	}
-	priorResources := []db.EventResource{
-		{
-			ResourceType: "jira",
-			ResourceID:   "PROJ-123",
-			ResourceURL:  strPtr("https://redhat.atlassian.net/browse/PROJ-123"),
+	// Establish a cursor via a first poll (uses latest ts = 2026-06-17T08:00).
+	seed := IssueData{
+		Key: "RHOAIENG-123", Summary: "Test Issue", Status: "To Do",
+		Changelog: []ChangelogEntry{
+			{Author: "John Doe", CreatedAt: "2026-06-17T08:00:00.000+0000", Field: "status", From: "Backlog", To: "To Do"},
 		},
 	}
-	if err := tempDB.InsertEvent(priorEvent, nil, priorResources); err != nil {
-		t.Fatalf("Failed to insert prior event: %v", err)
+	if _, err := processIssue(conn, JiraAuth{}, seed, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("seed processIssue: %v", err)
 	}
 
-	// Create test config
-	cfg := &config.Config{
-		Services: config.Services{
-			Jira: &config.JiraConfig{
-				URL:   server.URL,
-				Email: "test@example.com",
-				Token: "test-token",
-			},
+	// Now newer activity arrives, all after the cursor.
+	issue := IssueData{
+		Key: "RHOAIENG-123", Summary: "Test Issue", Status: "Done",
+		Comments: []IssueComment{
+			{Author: "Jane Smith", CreatedAt: "2026-06-17T09:00:00.000+0000", Body: "Looks good"},
+		},
+		Changelog: []ChangelogEntry{
+			{Author: "John Doe", CreatedAt: "2026-06-17T10:00:00.000+0000", Field: "status", From: "In Progress", To: "Done"},
+			{Author: "John Doe", CreatedAt: "2026-06-17T10:30:00.000+0000", Field: "assignee", From: "", To: "Alice"},
+			{Author: "John Doe", CreatedAt: "2026-06-17T11:00:00.000+0000", Field: "description", From: "old", To: "new"},
+			{Author: "John Doe", CreatedAt: "2026-06-17T11:30:00.000+0000", Field: "labels", From: "bug", To: "bug urgent"},
 		},
 	}
-
-	// Create test resources
-	resources := []watcher.Resource{
-		{
-			Type: "jira",
-			ID:   "PROJ-123",
-			URL:  "https://redhat.atlassian.net/browse/PROJ-123",
-		},
+	if _, err := processIssue(conn, JiraAuth{}, issue, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("processIssue: %v", err)
 	}
 
-	// Create logger
-	logger := log.New(os.Stderr, "[test] ", log.LstdFlags)
-
-	// Run poller
-	if err := Poll(tempDB, cfg, resources, logger); err != nil {
-		t.Fatalf("Poll failed: %v", err)
-	}
-
-	// Verify new events were written (should see jira_status_change since it's after cursor)
-	events, err := tempDB.QueryEvents(db.EventFilter{
-		Source: strPtr("jira"),
-	})
+	events, err := db.EventsForResource(conn, "jira", jiraResource.ID)
 	if err != nil {
-		t.Fatalf("Failed to query events: %v", err)
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	types := typeCounts(events)
+	if types[watcher.EventTypeJiraComment] != 1 {
+		t.Errorf("expected 1 jira_comment, got %d", types[watcher.EventTypeJiraComment])
+	}
+	if types[watcher.EventTypeJiraStatusChange] != 1 {
+		t.Errorf("expected 1 jira_status_change, got %d", types[watcher.EventTypeJiraStatusChange])
+	}
+	if types[watcher.EventTypeJiraAssigned] != 1 {
+		t.Errorf("expected 1 jira_assigned, got %d", types[watcher.EventTypeJiraAssigned])
+	}
+	if types[watcher.EventTypeJiraDescChanged] != 1 {
+		t.Errorf("expected 1 jira_description_changed, got %d", types[watcher.EventTypeJiraDescChanged])
+	}
+	if types[watcher.EventTypeJiraLabelsChanged] != 1 {
+		t.Errorf("expected 1 jira_labels_changed, got %d", types[watcher.EventTypeJiraLabelsChanged])
 	}
 
-	// Should have at least 2 events: the prior watch_started and the new jira_status_change
-	if len(events) < 2 {
-		t.Fatalf("Expected at least 2 events, got %d", len(events))
-	}
-
-	// Verify jira_status_change event was emitted
-	foundStatusChange := false
+	// Verify the status change title and author metadata.
 	for _, e := range events {
-		if e.Type == "jira_status_change" {
-			foundStatusChange = true
-			if e.Title != "PROJ-123: In Progress → Done" {
-				t.Errorf("Expected title 'PROJ-123: In Progress → Done', got %q", e.Title)
+		if e.Type == watcher.EventTypeJiraStatusChange {
+			if e.Title != "RHOAIENG-123: In Progress → Done" {
+				t.Errorf("expected status change title 'RHOAIENG-123: In Progress → Done', got %q", e.Title)
 			}
 			if e.Author == nil || *e.Author != "John Doe" {
-				t.Errorf("Expected author 'John Doe', got %v", e.Author)
+				t.Errorf("expected author 'John Doe', got %v", e.Author)
+			}
+			if e.AuthorType == nil || *e.AuthorType != "human" {
+				t.Errorf("expected author_type 'human', got %v", e.AuthorType)
 			}
 		}
 	}
+}
 
-	if !foundStatusChange {
-		t.Error("Expected jira_status_change event, but it was not found")
+// TestProcessIssue_ADFCommentExtraction is a regression test: a comment whose
+// body was an ADF document must surface as extracted plain text via the
+// jira_comment event. (Extraction happens in the client; here we assert the
+// poller carries the already-extracted body through unchanged.)
+func TestProcessIssue_ADFCommentExtraction(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Simulate the ADF extraction the client performs: a nested ADF document
+	// reduced to plain text.
+	adfBody := map[string]interface{}{
+		"type":    "doc",
+		"version": 1,
+		"content": []interface{}{
+			map[string]interface{}{
+				"type": "paragraph",
+				"content": []interface{}{
+					map[string]interface{}{"type": "text", "text": "Hello "},
+					map[string]interface{}{"type": "text", "text": "world"},
+				},
+			},
+		},
+	}
+	extracted := extractADFText(adfBody)
+	if extracted == "" || extracted != "Hello world" {
+		t.Fatalf("client ADF extraction produced unexpected text: %q", extracted)
+	}
+
+	// Seed a cursor so the comment is emitted (not swallowed by first-poll).
+	if _, err := processIssue(conn, JiraAuth{}, IssueData{
+		Key: "RHOAIENG-123", Summary: "Test Issue", Status: "Open",
+		Changelog: []ChangelogEntry{
+			{Author: "x", CreatedAt: "2026-06-17T00:00:00.000+0000", Field: "status", From: "a", To: "b"},
+		},
+	}, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("seed processIssue: %v", err)
+	}
+
+	issue := IssueData{
+		Key: "RHOAIENG-123", Summary: "Test Issue", Status: "Open",
+		Comments: []IssueComment{
+			{Author: "Jane Smith", CreatedAt: "2026-06-17T09:00:00.000+0000", Body: extracted},
+		},
+	}
+	if _, err := processIssue(conn, JiraAuth{}, issue, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("processIssue: %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "jira", jiraResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	found := false
+	for _, e := range events {
+		if e.Type == watcher.EventTypeJiraComment {
+			found = true
+			if e.Body == nil || *e.Body != "Hello world" {
+				t.Errorf("expected jira_comment body 'Hello world' (extracted ADF text), got %v", e.Body)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected a jira_comment event, none found")
 	}
 }
 
-func TestDeduplication(t *testing.T) {
-	// Create mock Jira server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := map[string]interface{}{
-			"key": "PROJ-123",
-			"fields": map[string]interface{}{
-				"summary": "Test Issue",
-				"status": map[string]interface{}{
-					"name": "In Progress",
-				},
-				"labels": []string{},
-				"comment": map[string]interface{}{
-					"comments": []interface{}{
-						map[string]interface{}{
-							"author": map[string]interface{}{
-								"displayName": "Jane Smith",
-							},
-							"created": "2026-06-17T09:00:00.000+0000",
-							"body":    map[string]interface{}{},
-						},
-					},
-				},
-			},
-			"changelog": map[string]interface{}{
-				"histories": []interface{}{},
-			},
-		}
+// TestProcessIssue_EpicLinkRelationship is a regression test: an issue with an
+// epic-link custom field must record a watcher_resource_relationships row
+// linking the issue (child) to its epic (parent) with relationship "epic".
+func TestProcessIssue_EpicLinkRelationship(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
 
+	issue := IssueData{
+		Key: "RHOAIENG-123", Summary: "Test Issue", Status: "Open",
+		CustomFields: map[string]interface{}{
+			"epic_key": "RHOAIENG-100",
+		},
+	}
+	if _, err := processIssue(conn, JiraAuth{}, issue, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("processIssue: %v", err)
+	}
+
+	var childType, childID, parentType, parentID, relationship, source string
+	err := conn.QueryRow(`
+		SELECT child_type, child_id, parent_type, parent_id, relationship, source
+		FROM watcher_resource_relationships
+		WHERE child_id = ? AND parent_id = ?
+	`, "RHOAIENG-123", "RHOAIENG-100").Scan(&childType, &childID, &parentType, &parentID, &relationship, &source)
+	if err != nil {
+		t.Fatalf("expected an epic relationship row, query failed: %v", err)
+	}
+	if childType != "jira" || childID != "RHOAIENG-123" {
+		t.Errorf("unexpected child: %s/%s", childType, childID)
+	}
+	if parentType != "jira" || parentID != "RHOAIENG-100" {
+		t.Errorf("unexpected parent: %s/%s", parentType, parentID)
+	}
+	if relationship != "epic" {
+		t.Errorf("expected relationship 'epic', got %q", relationship)
+	}
+	if source != "jira" {
+		t.Errorf("expected source 'jira', got %q", source)
+	}
+}
+
+// TestProcessIssue_Dedup verifies that re-processing the same issue data does
+// not emit duplicate events.
+func TestProcessIssue_Dedup(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Seed a cursor before the comment timestamp.
+	if _, err := processIssue(conn, JiraAuth{}, IssueData{
+		Key: "RHOAIENG-123", Summary: "Test Issue", Status: "Open",
+		Changelog: []ChangelogEntry{
+			{Author: "x", CreatedAt: "2026-06-17T00:00:00.000+0000", Field: "status", From: "a", To: "b"},
+		},
+	}, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("seed processIssue: %v", err)
+	}
+
+	issue := IssueData{
+		Key: "RHOAIENG-123", Summary: "Test Issue", Status: "Open",
+		Comments: []IssueComment{
+			{Author: "Jane Smith", CreatedAt: "2026-06-17T09:00:00.000+0000", Body: "hi"},
+		},
+	}
+	if _, err := processIssue(conn, JiraAuth{}, issue, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("processIssue #1: %v", err)
+	}
+	if _, err := processIssue(conn, JiraAuth{}, issue, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("processIssue #2: %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "jira", jiraResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if got := typeCounts(events)[watcher.EventTypeJiraComment]; got != 1 {
+		t.Errorf("expected exactly 1 jira_comment after dedup, got %d", got)
+	}
+}
+
+// TestProcessIssue_BotAuthorType verifies that a comment by a configured bot
+// username is labeled author_type "bot".
+func TestProcessIssue_BotAuthorType(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	cfg := JiraAuth{BotUsernames: []string{"Automation Bot"}}
+
+	// Seed a cursor.
+	if _, err := processIssue(conn, cfg, IssueData{
+		Key: "RHOAIENG-123", Summary: "Test", Status: "Open",
+		Changelog: []ChangelogEntry{
+			{Author: "x", CreatedAt: "2026-06-17T00:00:00.000+0000", Field: "status", From: "a", To: "b"},
+		},
+	}, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("seed processIssue: %v", err)
+	}
+
+	issue := IssueData{
+		Key: "RHOAIENG-123", Summary: "Test", Status: "Open",
+		Comments: []IssueComment{
+			{Author: "Automation Bot", CreatedAt: "2026-06-17T09:00:00.000+0000", Body: "auto"},
+		},
+	}
+	if _, err := processIssue(conn, cfg, issue, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("processIssue: %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "jira", jiraResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	for _, e := range events {
+		if e.Type == watcher.EventTypeJiraComment {
+			if e.AuthorType == nil || *e.AuthorType != "bot" {
+				t.Errorf("expected author_type 'bot', got %v", e.AuthorType)
+			}
+		}
+	}
+}
+
+// TestFetchIssue_ChangelogPagination is a client-level regression test for the
+// changelog pagination fix. A fake Jira server returns the changelog across two
+// pages (isLast=false then isLast=true). FetchIssue must return ALL entries
+// from both pages, proving the old expand=changelog 100-entry cap is gone.
+func TestFetchIssue_ChangelogPagination(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		switch {
+		case r.URL.Path == "/rest/api/3/issue/RHOAIENG-123":
+			// Fields-only issue GET.
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"key": "RHOAIENG-123",
+				"fields": map[string]interface{}{
+					"summary": "Paginated Issue",
+					"status":  map[string]interface{}{"name": "Open"},
+				},
+			})
+		case r.URL.Path == "/rest/api/3/issue/RHOAIENG-123/changelog":
+			startAt := r.URL.Query().Get("startAt")
+			if startAt == "" || startAt == "0" {
+				// Page 1: 100 entries, not last.
+				json.NewEncoder(w).Encode(changelogPage(0, 150, false, 100))
+			} else {
+				// Page 2: remaining 50 entries, last.
+				json.NewEncoder(w).Encode(changelogPage(100, 150, true, 50))
+			}
+		case r.URL.Path == "/rest/api/3/issue/RHOAIENG-123/comment":
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"startAt": 0, "maxResults": 100, "total": 0, "comments": []interface{}{},
+			})
+		default:
+			http.Error(w, "not found: "+r.URL.Path, http.StatusNotFound)
+		}
 	}))
 	defer server.Close()
 
-	// Create test database
-	tempDB := testutil.NewTestDB(t)
-
-	// Create test session
-	sessionID := uuid.New().String()
-	session := db.Session{
-		SessionID:    sessionID,
-		Harness:      "claude",
-		Repo:         "test-repo",
-		Branch:       "main",
-		Status:       "active",
-		InboxMode:    "manual",
-		LastActive:   "2026-06-17T06:00:00Z",
-		RegisteredAt: "2026-06-17T06:00:00Z",
-		JSONLPath:    "/tmp/test.jsonl",
-	}
-	if err := tempDB.UpsertSession(session); err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
-
-	// Create test subscription
-	sub := db.Subscription{
-		ID:           uuid.New().String(),
-		SessionID:    sessionID,
-		ResourceType: "jira",
-		ResourceID:   "PROJ-123",
-		ResourceURL:  strPtr("https://redhat.atlassian.net/browse/PROJ-123"),
-		CreatedAt:    "2026-06-17T06:00:00Z",
-	}
-	if err := tempDB.Subscribe(sub); err != nil {
-		t.Fatalf("Failed to create subscription: %v", err)
-	}
-
-	// Insert a prior comment event (same timestamp as the comment we'll fetch)
-	priorEvent := db.Event{
-		ID:         uuid.New().String(),
-		TS:         "2026-06-17T08:00:00Z",
-		ExternalTS: strPtr("2026-06-17T09:00:00.000+0000"),
-		Source:     "jira",
-		SessionID:  nil,
-		Type:       "jira_comment",
-		Title:      "Comment by Jane Smith on PROJ-123",
-		Body:       nil,
-		Author:     strPtr("Jane Smith"),
-		AuthorType: strPtr("human"),
-		Broadcast:  false,
-		Tags:       nil,
-	}
-	priorResources := []db.EventResource{
-		{
-			ResourceType: "jira",
-			ResourceID:   "PROJ-123",
-			ResourceURL:  strPtr("https://redhat.atlassian.net/browse/PROJ-123"),
-		},
-	}
-	if err := tempDB.InsertEvent(priorEvent, nil, priorResources); err != nil {
-		t.Fatalf("Failed to insert prior event: %v", err)
-	}
-
-	// Create test config
-	cfg := &config.Config{
-		Services: config.Services{
-			Jira: &config.JiraConfig{
-				URL:   server.URL,
-				Email: "test@example.com",
-				Token: "test-token",
-			},
-		},
-	}
-
-	// Create test resources
-	resources := []watcher.Resource{
-		{
-			Type: "jira",
-			ID:   "PROJ-123",
-			URL:  "https://redhat.atlassian.net/browse/PROJ-123",
-		},
-	}
-
-	// Create logger
-	logger := log.New(os.Stderr, "[test] ", log.LstdFlags)
-
-	// Run poller twice
-	if err := Poll(tempDB, cfg, resources, logger); err != nil {
-		t.Fatalf("First poll failed: %v", err)
-	}
-	if err := Poll(tempDB, cfg, resources, logger); err != nil {
-		t.Fatalf("Second poll failed: %v", err)
-	}
-
-	// Verify only one jira_comment event exists (deduplication worked)
-	events, err := tempDB.QueryEvents(db.EventFilter{
-		Source: strPtr("jira"),
-		Type:   strPtr("jira_comment"),
-	})
+	client := &Client{BaseURL: server.URL, Email: "e@x.com", Token: "t"}
+	issue, err := client.FetchIssue("RHOAIENG-123", nil)
 	if err != nil {
-		t.Fatalf("Failed to query events: %v", err)
+		t.Fatalf("FetchIssue: %v", err)
 	}
 
-	if len(events) != 1 {
-		t.Errorf("Expected exactly 1 jira_comment event (deduplication), got %d", len(events))
+	// 150 histories, each with exactly 1 item -> 150 changelog entries.
+	if len(issue.Changelog) != 150 {
+		t.Errorf("expected 150 changelog entries across both pages, got %d", len(issue.Changelog))
+	}
+	// Verify the last entry (from page 2) is present, proving nothing was dropped.
+	last := issue.Changelog[len(issue.Changelog)-1]
+	if last.To != "status-149" {
+		t.Errorf("expected last changelog entry To='status-149', got %q", last.To)
 	}
 }
 
-// strPtr is a helper that returns a pointer to a string.
-func strPtr(s string) *string {
-	if s == "" {
-		return nil
+// changelogPage builds a fake /changelog page response containing histories
+// for indices [start, total), capped at count entries, with the given isLast.
+func changelogPage(start, total int, isLast bool, count int) map[string]interface{} {
+	var values []interface{}
+	for i := start; i < start+count && i < total; i++ {
+		values = append(values, map[string]interface{}{
+			"author":  map[string]interface{}{"displayName": "John Doe"},
+			"created": fmt.Sprintf("2026-06-17T%02d:00:00.000+0000", i%24),
+			"items": []interface{}{
+				map[string]interface{}{
+					"field":      "status",
+					"fromString": "prev",
+					"toString":   fmt.Sprintf("status-%d", i),
+				},
+			},
+		})
 	}
-	return &s
+	return map[string]interface{}{
+		"startAt":    start,
+		"maxResults": count,
+		"total":      total,
+		"isLast":     isLast,
+		"values":     values,
+	}
 }
