@@ -229,3 +229,72 @@ func TestEventsForSubscriberSince(t *testing.T) {
 		t.Fatalf("got event %+v, want e-new", events[0])
 	}
 }
+
+func TestEventsForSubscriberSinceExcludesRevokedSubscription(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "owner/repo#11"}
+	if err := Subscribe(c, "sub1", r, SubscribeOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+
+	since := "2026-01-15T12:00:00Z"
+	tsAfter := "2026-01-15T13:00:00Z"
+	if err := InsertEvent(c, watcher.Event{ID: "e-new", TS: tsAfter, Source: "github", Type: watcher.EventTypePRComment, Title: "new"}, r); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Revoke(c, "sub1"); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := EventsForSubscriberSince(c, "sub1", since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("got %+v, want no events after revoke (lease no longer live)", events)
+	}
+
+	// The event itself still exists and is still visible via the
+	// resource-scoped query; only subscriber-scoped delivery is gated
+	// on a live subscription.
+	resourceEvents, err := EventsForResource(c, r.Type, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resourceEvents) != 1 || resourceEvents[0].ID != "e-new" {
+		t.Fatalf("got %+v, want the event to still exist via EventsForResource", resourceEvents)
+	}
+}
+
+func TestEventsForSubscriberSinceExcludesExpiredLease(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "owner/repo#12"}
+	if err := Subscribe(c, "sub1", r, SubscribeOpts{TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	if _, err := c.Exec(`UPDATE watcher_subscriptions SET expires_at = ? WHERE subscriber = ? AND resource_id = ?`, past, "sub1", r.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	since := "2026-01-15T12:00:00Z"
+	tsAfter := "2026-01-15T13:00:00Z"
+	if err := InsertEvent(c, watcher.Event{ID: "e-new", TS: tsAfter, Source: "github", Type: watcher.EventTypePRComment, Title: "new"}, r); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := EventsForSubscriberSince(c, "sub1", since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("got %+v, want no events for an expired lease", events)
+	}
+}

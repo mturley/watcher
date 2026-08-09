@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -145,17 +146,34 @@ func ActiveResources(conn *sql.DB, resourceType string) ([]watcher.Resource, err
 	return out, nil
 }
 
+// bookkeepingExclusionClause builds a "NOT IN (?, ?, ...)" SQL fragment
+// sized to len(bookkeepingEventTypes), plus the matching args, so that
+// adding a bookkeeping type to that slice automatically extends every
+// query that calls this helper without any other code changes.
+func bookkeepingExclusionClause() (string, []any) {
+	placeholders := make([]string, len(bookkeepingEventTypes))
+	args := make([]any, len(bookkeepingEventTypes))
+	for i, t := range bookkeepingEventTypes {
+		placeholders[i] = "?"
+		args[i] = t
+	}
+	clause := "e.type NOT IN (" + strings.Join(placeholders, ", ") + ")"
+	return clause, args
+}
+
 // EventsForResource returns all non-bookkeeping events recorded for the
 // given resource, ordered by ts ascending.
 func EventsForResource(conn *sql.DB, resourceType, resourceID string) ([]watcher.Event, error) {
+	exclClause, exclArgs := bookkeepingExclusionClause()
+	args := append([]any{resourceType, resourceID}, exclArgs...)
 	rows, err := conn.Query(`
 		SELECT e.id, e.ts, e.external_ts, e.source, e.type, e.title, e.body, e.author, e.author_type, e.tags
 		FROM watcher_events e
 		JOIN watcher_event_resources er ON er.event_id = e.id
 		WHERE er.resource_type = ? AND er.resource_id = ?
-		  AND e.type NOT IN (?, ?)
+		  AND `+exclClause+`
 		ORDER BY e.ts ASC
-	`, resourceType, resourceID, bookkeepingEventTypes[0], bookkeepingEventTypes[1])
+	`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query events for resource: %w", err)
 	}
@@ -169,6 +187,8 @@ func EventsForResource(conn *sql.DB, resourceType, resourceID string) ([]watcher
 // by ts ascending.
 func EventsForSubscriberSince(conn *sql.DB, subscriber, since string) ([]watcher.Event, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
+	exclClause, exclArgs := bookkeepingExclusionClause()
+	args := append([]any{subscriber, now, since}, exclArgs...)
 	rows, err := conn.Query(`
 		SELECT DISTINCT e.id, e.ts, e.external_ts, e.source, e.type, e.title, e.body, e.author, e.author_type, e.tags
 		FROM watcher_events e
@@ -177,9 +197,9 @@ func EventsForSubscriberSince(conn *sql.DB, subscriber, since string) ([]watcher
 		WHERE s.subscriber = ? AND s.deleted_at IS NULL
 		  AND (s.expires_at IS NULL OR s.expires_at > ?)
 		  AND e.ts > ?
-		  AND e.type NOT IN (?, ?)
+		  AND `+exclClause+`
 		ORDER BY e.ts ASC
-	`, subscriber, now, since, bookkeepingEventTypes[0], bookkeepingEventTypes[1])
+	`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query events for subscriber: %w", err)
 	}
