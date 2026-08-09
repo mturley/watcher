@@ -146,6 +146,22 @@ func ActiveResources(conn *sql.DB, resourceType string) ([]watcher.Resource, err
 	return out, nil
 }
 
+// BackfillFor reports whether any live (not soft-deleted) subscription for
+// the given resource requests backfill. Used by pollers to decide, on the
+// first poll of a resource, whether to emit historical events or just a
+// watch_started marker.
+func BackfillFor(conn *sql.DB, resourceType, resourceID string) (bool, error) {
+	var backfill sql.NullInt64
+	err := conn.QueryRow(`
+		SELECT MAX(backfill) FROM watcher_subscriptions
+		WHERE resource_type = ? AND resource_id = ? AND deleted_at IS NULL
+	`, resourceType, resourceID).Scan(&backfill)
+	if err != nil {
+		return false, fmt.Errorf("failed to query backfill flag: %w", err)
+	}
+	return backfill.Valid && backfill.Int64 == 1, nil
+}
+
 // bookkeepingExclusionClause builds a "NOT IN (?, ?, ...)" SQL fragment
 // sized to len(bookkeepingEventTypes), plus the matching args, so that
 // adding a bookkeeping type to that slice automatically extends every
