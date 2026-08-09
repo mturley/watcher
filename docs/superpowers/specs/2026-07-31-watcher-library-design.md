@@ -21,7 +21,7 @@ github.com/mturley/watcher/
 ├── github/        # GitHub GraphQL poller
 ├── jira/          # Jira REST v3 poller
 ├── slack/         # Slack poller (future, not in v1)
-├── resources/     # .worktree-resources.yaml read/write helpers
+├── resources/     # .worktree-resources helpers (deferred — see Scope; not built in v1)
 ├── scheduler/     # launchd/cron plist generation
 ├── testutil/      # Mock pollers, in-memory test DB helpers
 └── watcher.go     # Top-level types (Event, Resource, Subscription) and framework
@@ -362,7 +362,9 @@ Consumers embed the auth flow in their own setup commands (e.g. `handler watcher
 
 ## `.worktree-resources.yaml` Format
 
-The library provides a `resources` package for reading and writing `.worktree-resources.yaml` files — the convention for declaring which external resources matter in a git worktree.
+> **Status: deferred / not in near-term scope.** The `resources` YAML package described here is **not** part of the handler extraction. The file itself is slated for replacement by CLI-based communication once worktree owns its resources in a database — see [Future: Resource Integration via Worktree CLI](#future-resource-integration-via-worktree-cli). During the handler extraction, handler keeps reading the **existing plain-text `.worktree-resources`** format unchanged; no YAML migration is done. This section is retained for two reasons: the **Resource ID formats** subsection below is a stable contract regardless of how resources are stored, and the YAML shape may still inform the CLI model's data. Treat the `resources` package API at the end of this section as illustrative, not committed.
+
+The (deferred) `resources` package would read and write `.worktree-resources.yaml` files — a convention for declaring which external resources matter in a git worktree.
 
 ```yaml
 primary:
@@ -397,7 +399,7 @@ Each resource type has a canonical `id` — a stable, normalized key that tools 
 | `jira` | issue key | `RHOAIENG-12345` |
 | `slack` | `slack:CHANNEL:THREAD_TS` | `slack:C0EXAMPLE2:1700000000.000005` |
 
-The Slack ID is colon-delimited: the literal prefix `slack`, the channel ID (`C…`), and the thread's root timestamp (`conversations.replies`' `thread_ts`, the dotted `1700000000.000005` form). This matches the `channel:threadTs` identity that slack-mini already uses internally as its tab key, so slack-mini can open a thread directly from a `.worktree-resources.yaml` entry, and a future handler Slack watcher can subscribe to the same key.
+The Slack ID is colon-delimited: the literal prefix `slack`, the channel ID (`C…`), and the thread's root timestamp (`conversations.replies`' `thread_ts`, the dotted `1700000000.000005` form). This matches the `channel:threadTs` identity that slack-mini already uses internally as its tab key, so any tool holding this ID can open the thread, and a future handler Slack watcher can subscribe to the same key. The format is a stable contract independent of how resources are stored (file today, worktree's DB later).
 
 Note that the Slack `id` and `url` encode the timestamp differently, by necessity: the `id` keeps the dotted `thread_ts` that the Slack API expects, while the permalink `url` uses Slack's `p<digits>` form with the dot removed. Tools derive one from the other; both are stored so neither has to be reconstructed.
 
@@ -616,12 +618,31 @@ The worktree CLI (`github.com/mturley/worktree`) is a full library consumer, not
 2. **Resource content cache.** Worktree wants `watcher_resource_state` not just for current-state display but as a cache of resource content it can index for search. This is a first-class reason worktree wants a database at all, independent of the timeline.
 3. **Backfill on subscribe.** Worktree subscribes with `Backfill: true` so a newly-tracked worktree shows history from before it was created, not just activity going forward.
 4. **Per-resource read-state**, kept in worktree's own tables (see Read-State Is a Consumer Concern) — a cursor per `(worktree, resource)` with a Slack-thread-style divider and "mark as read." The library provides the events; worktree owns the cursor.
-5. **`.worktree-resources.yaml` helpers**: replace `internal/resources/` with the `watcher/resources` package.
+5. **Resources in worktree's DB, not a file.** Worktree stores which resources belong to a worktree in its own database, as the source of truth — replacing the `.worktree-resources` file (see Future: Resource Integration via Worktree CLI). This is what lets worktree dynamically add resources it auto-discovers (links found in a Slack thread or Jira issue).
 6. **Shared credentials**: read GitHub/Jira/Slack credentials from `~/.config/watcher/config.yaml`, with fallback to the worktree-specific config for users who only have the worktree CLI.
 
 Worktree's subscriber identifier is namespaced per worktree (e.g. `worktree:odh-dashboard/fix-login`) and its subscriptions are permanent (`TTL: 0`) — a worktree's resources matter until the worktree is deleted, at which point worktree calls `Revoke`.
 
 **slack-mini stays out.** slack-mini remains an independent, DB-free live viewer; it does not consume the library. If the worktree UI later wants slack-mini's thread-viewer component, that component can render from worktree's ledger data rather than fetching live — but that is a future decision, not a v1 dependency.
+
+## Future: Resource Integration via Worktree CLI
+
+**Not designed here — captured as direction only. Full design happens in the worktree phase.**
+
+Today the integration point between worktree and handler is the `.worktree-resources` file: worktree writes it, handler reads it on session start to auto-subscribe. That works while "what resources matter" is a static snapshot, but it breaks down once worktree's database is the source of truth and that set changes dynamically (worktree auto-discovering secondary resources linked from a Slack thread or Jira issue). A file that independent tools read and write becomes a stale, race-prone cache the moment an authority exists that changes on its own.
+
+The intended replacement: **worktree's database is the source of truth for a worktree's resources, and handler queries worktree over its CLI** instead of reading a file. Sketch of the interactions:
+
+- On session registration, handler asks the worktree CLI (if present) for the primary resources of the session's directory, and auto-subscribes to them.
+- When a resource is watched/unwatched from handler, handler tells worktree, so worktree can subscribe the whole worktree (not just the one session) and reflect the change in its own store.
+- Worktree can add resources on its own (auto-discovery) without any file for handler to re-read; handler picks them up on its next query.
+
+Two things this must get right, both deferred to the real design:
+
+1. **Dependency direction inverts.** The file is passive — neither tool depends on the other running. This model creates a runtime dependency from handler → worktree. Handler must degrade cleanly when the worktree CLI is absent (fall back to no auto-subscription, or to reading a file during a transition), so handler still works standalone.
+2. **It depends on worktree's auto-discovery design**, which does not exist yet. That is why this is a note, not a spec: designing the protocol before knowing how discovered resources are represented would be premature.
+
+Until this lands, the plain-text `.worktree-resources` file stays in use, unchanged.
 
 ## Known Risks and Mitigations
 
@@ -659,12 +680,13 @@ Worktree's subscriber identifier is namespaced per worktree (e.g. `worktree:odh-
 - Dedup framework (by external_ts, by title, composite)
 - Extraction regression suite with golden fixtures
 - Shared config file with typed accessors, credential management, and consumer DB registry
-- `.worktree-resources.yaml` read/write helpers
+- Resource ID format contract (`pr`, `jira`, `slack`) — used by subscriptions regardless of how resources are stored
 - Scheduler helpers (launchd/cron)
 - Test utilities (mock pollers, test DB, seed helpers)
 
 ### Out of Scope (future work)
 
+- `.worktree-resources` YAML package — deferred. The file is slated for replacement by CLI-based communication (worktree DB as source of truth); handler keeps reading the existing plain-text file during extraction. See Future: Resource Integration via Worktree CLI.
 - Slack poller (resource-ID format is standardized now; the poller itself comes when handler wants Slack in the inbox or worktree wants Slack in the timeline)
 - Cross-system discovery CLI
 - Any CLI or web UI in the watcher project itself
@@ -679,34 +701,24 @@ Note: the library is being extracted now (not deferred until a second consumer m
 1. Initialize `github.com/mturley/watcher` Go module
 2. Port agent-handler's existing watcher tests and build the golden-fixture regression suite — before any adaptation, so the extraction has something to be measured against
 3. Extract and adapt code from agent-handler's `watcher/` package
-4. Implement `db` package with schema, migrations, collision detection, query helpers
+4. Implement `db` package with schema, migrations, collision detection, query helpers (including backfill and the per-resource / per-subscriber event queries)
 5. Implement `config` package with typed accessors and permission enforcement
-6. Implement `resources` package with YAML helpers
-7. Implement `scheduler` package
-8. Implement `testutil` package
-9. Write tests against mock pollers and test DBs
-10. Write comprehensive README documenting library purpose, installation, API, consumer integration, and configuration
-11. Tag `v0.1.0` and push
+6. Implement `scheduler` package
+7. Implement `testutil` package
+8. Write tests against mock pollers and test DBs
+9. Write comprehensive README documenting library purpose, installation, API, consumer integration, and configuration
+10. Tag `v0.1.0` and push
 
-### Phase 2: Worktree CLI Integration
+(The `.worktree-resources` YAML package is intentionally omitted — deferred, see Scope.)
 
-1. Manually migrate existing `.worktree-resources` files to `.worktree-resources.yaml`
-2. Update worktree CLI to import `watcher/resources`
-3. Update worktree CLI to read credentials from shared config (with fallback)
-4. Add a worktree database; run the library's `Migrate()` to create `watcher_*` tables and worktree's own per-resource cursor table
-5. Run pollers against the worktree DB; subscribe worktree's resources with `Backfill: true`, `TTL: 0`, `Revoke` on worktree deletion
-6. Build the interlaced-timeline UI reading `watcher_events`, with per-resource unread dividers and "mark as read"
-7. Use `watcher_resource_state` as the searchable content cache
-8. Tag a worktree CLI release
+**Phase order: handler first, then worktree.** The handler extraction comes before the worktree integration, deliberately. Handler is the source of the code being extracted, so getting handler working end-to-end against the library *is* the validation that the extraction preserved all the accumulated fixes. Building worktree on an already-proven library is far lower-risk than discovering extraction regressions while simultaneously designing a brand-new consumer.
 
-The order of Phase 2 vs. Phase 3 (handler) is not fixed; both build on the same `v0.1.0` library and can proceed independently. Worktree is lower-risk because it is greenfield — no data migration, no production database to protect — so it is a good first real exercise of the library API before the handler cutover.
-
-### Phase 3: Agent-Handler Integration
+### Phase 2: Agent-Handler Integration
 
 1. Create a handler worktree for the integration work
 2. Add `github.com/mturley/watcher` dependency (use `replace` directive for local development)
 3. Add the library's `Migrate()` call on startup alongside handler's existing `runMigrations()`, keeping the two hooks disjoint (handler tables vs `watcher_*`); read-only callers use the non-migrating variant
-4. Rewrite watcher commands as thin wrappers around library calls
+4. Rewrite watcher commands as thin wrappers around library calls; handler subscribes with `Backfill: false`
 5. Wire lease management: `Renew` on session heartbeat with a 5-day TTL, `Revoke` on both archive paths (`SessionEnd` and `cleanup`, which currently disagree)
 6. Redirect the watcher-routed branch of `db/inbox_scope.go` (join + where + args) to the `watcher_*` tables via the UNION, gated on the schema-version marker
 7. Apply `dismissedExclusionSQL` to the watcher half of the UNION, not just the `events` half
@@ -716,7 +728,9 @@ The order of Phase 2 vs. Phase 3 (handler) is not fixed; both build on the same 
 11. Remove `replace` directive, pin to library version
 12. Tag a handler release
 
-### Phase 4: Production Migration
+Handler continues reading the **existing plain-text `.worktree-resources`** file throughout this phase — the file format is frozen, not migrated (see Scope).
+
+### Phase 3: Production Migration (handler)
 
 1. Back up handler database
 2. Stop watchers
@@ -726,6 +740,20 @@ The order of Phase 2 vs. Phase 3 (handler) is not fixed; both build on the same 
 6. Start watchers
 7. Monitor for one day
 8. Clean up old tables (optional)
+
+Only after this is stable do we move to worktree.
+
+### Phase 4: Worktree CLI Integration
+
+Worktree needs its own design pass before implementation (its DB schema, the interlaced-timeline UI, per-resource cursors, and the resource-integration model that replaces `.worktree-resources` — see the future-work note below). The library-facing steps once that design exists:
+
+1. Update worktree CLI to read credentials from shared config (with fallback)
+2. Add a worktree database; run the library's `Migrate()` to create `watcher_*` tables and worktree's own per-resource cursor table
+3. Run pollers against the worktree DB; subscribe worktree's resources with `Backfill: true`, `TTL: 0`, `Revoke` on worktree deletion
+4. Build the interlaced-timeline UI reading `watcher_events`, with per-resource unread dividers and "mark as read"
+5. Use `watcher_resource_state` as the searchable content cache
+6. Design and implement the CLI-based resource integration with handler (worktree DB as source of truth), replacing the `.worktree-resources` file
+7. Tag a worktree CLI release
 
 ### Version Tagging Convention
 
