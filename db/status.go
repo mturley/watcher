@@ -1,6 +1,10 @@
 package db
 
-import "database/sql"
+import (
+	"database/sql"
+	"fmt"
+	"time"
+)
 
 // PollerStatus tracks the last success/error state of a poller.
 type PollerStatus struct {
@@ -22,7 +26,7 @@ func GetPollerStatus(conn *sql.DB, name string) (*PollerStatus, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query poller status: %w", err)
 	}
 	if lastSuccess.Valid {
 		ps.LastSuccess = lastSuccess.String
@@ -38,22 +42,30 @@ func GetPollerStatus(conn *sql.DB, name string) (*PollerStatus, error) {
 
 // RecordPollerSuccess records that the named poller succeeded just now.
 func RecordPollerSuccess(conn *sql.DB, name string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := conn.Exec(`
 		INSERT INTO watcher_poller_status (name, last_success)
-		VALUES (?, datetime('now'))
-		ON CONFLICT(name) DO UPDATE SET last_success = datetime('now')
-	`, name)
-	return err
+		VALUES (?, ?)
+		ON CONFLICT(name) DO UPDATE SET last_success = ?
+	`, name, now, now)
+	if err != nil {
+		return fmt.Errorf("failed to record poller success: %w", err)
+	}
+	return nil
 }
 
 // RecordPollerError records that the named poller errored just now with the given message.
 func RecordPollerError(conn *sql.DB, name, message string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := conn.Exec(`
 		INSERT INTO watcher_poller_status (name, last_error, last_error_message)
-		VALUES (?, datetime('now'), ?)
-		ON CONFLICT(name) DO UPDATE SET last_error = datetime('now'), last_error_message = ?
-	`, name, message, message)
-	return err
+		VALUES (?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET last_error = ?, last_error_message = ?
+	`, name, now, message, now, message)
+	if err != nil {
+		return fmt.Errorf("failed to record poller error: %w", err)
+	}
+	return nil
 }
 
 // HasPollerError returns true if the poller's last_error is more recent than last_success.

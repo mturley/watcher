@@ -30,7 +30,7 @@ func Poll(conn *sql.DB, cfg JiraAuth, resources []watcher.Resource, logger *log.
 	}
 
 	client := &Client{
-		BaseURL: cfg.URL,
+		BaseURL: normalizeBaseURL(cfg.URL),
 		Email:   cfg.Email,
 		Token:   cfg.Token,
 	}

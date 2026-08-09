@@ -349,6 +349,74 @@ func TestProcessIssue_BotAuthorType(t *testing.T) {
 	}
 }
 
+// TestProcessIssue_Backfill verifies that a first poll with backfill enabled
+// emits all history (comments and changelog entries) rather than only a
+// watch_started marker. This is the symmetric case to
+// TestProcessIssue_FirstPoll, which asserts the contrasting backfill=false
+// behavior (watch_started only). This must fail if processIssue is changed
+// to return early on first poll regardless of the backfill flag.
+func TestProcessIssue_Backfill(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	backfill, err := db.BackfillFor(conn, "jira", jiraResource.ID)
+	if err != nil {
+		t.Fatalf("BackfillFor: %v", err)
+	}
+	if !backfill {
+		t.Fatal("expected BackfillFor to report true")
+	}
+
+	issue := IssueData{
+		Key:     "RHOAIENG-123",
+		Summary: "Test Issue",
+		Status:  "In Progress",
+		Comments: []IssueComment{
+			{Author: "Jane Smith", CreatedAt: "2026-06-17T09:00:00.000+0000", Body: "hello"},
+		},
+		Changelog: []ChangelogEntry{
+			{Author: "John Doe", CreatedAt: "2026-06-17T08:00:00.000+0000", Field: "status", From: "To Do", To: "In Progress"},
+		},
+	}
+
+	n, err := processIssue(conn, JiraAuth{}, issue, jiraResource, backfill, testLogger())
+	if err != nil {
+		t.Fatalf("processIssue: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected 2 events emitted from backfill (comment + status change), got %d", n)
+	}
+
+	events, err := db.EventsForResource(conn, "jira", jiraResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	types := typeCounts(events)
+	if types[watcher.EventTypeJiraComment] != 1 {
+		t.Errorf("expected 1 jira_comment from backfill, got %d", types[watcher.EventTypeJiraComment])
+	}
+	if types[watcher.EventTypeJiraStatusChange] != 1 {
+		t.Errorf("expected 1 jira_status_change from backfill, got %d", types[watcher.EventTypeJiraStatusChange])
+	}
+
+	// EventsForResource excludes bookkeeping types, so query the raw table
+	// directly to confirm no watch_started was emitted alongside the
+	// backfilled history.
+	var watchStartedCount int
+	if err := conn.QueryRow(`
+		SELECT COUNT(*) FROM watcher_events e
+		JOIN watcher_event_resources er ON er.event_id = e.id
+		WHERE er.resource_type = ? AND er.resource_id = ? AND e.type = ?
+	`, "jira", jiraResource.ID, string(watcher.EventTypeWatchStarted)).Scan(&watchStartedCount); err != nil {
+		t.Fatalf("query watch_started count: %v", err)
+	}
+	if watchStartedCount != 0 {
+		t.Errorf("expected no watch_started event when backfilling, got %d", watchStartedCount)
+	}
+}
+
 // TestFetchIssue_ChangelogPagination is a client-level regression test for the
 // changelog pagination fix. A fake Jira server returns the changelog across two
 // pages (isLast=false then isLast=true). FetchIssue must return ALL entries
@@ -399,6 +467,27 @@ func TestFetchIssue_ChangelogPagination(t *testing.T) {
 	last := issue.Changelog[len(issue.Changelog)-1]
 	if last.To != "status-149" {
 		t.Errorf("expected last changelog entry To='status-149', got %q", last.To)
+	}
+}
+
+// TestNormalizeBaseURL is a regression test: a bare host (as documented in
+// the README config example, e.g. "redhat.atlassian.net") must get an
+// "https://" scheme prepended, since request URLs are built via
+// fmt.Sprintf("%s/rest/api/3/...", BaseURL) and a schemeless host produces a
+// malformed request. An already-schemed URL must be left unchanged.
+func TestNormalizeBaseURL(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"redhat.atlassian.net", "https://redhat.atlassian.net"},
+		{"https://redhat.atlassian.net", "https://redhat.atlassian.net"},
+		{"http://localhost:8080", "http://localhost:8080"},
+	}
+	for _, c := range cases {
+		if got := normalizeBaseURL(c.in); got != c.want {
+			t.Errorf("normalizeBaseURL(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 

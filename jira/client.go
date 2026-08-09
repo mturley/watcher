@@ -57,6 +57,18 @@ const changelogPageSize = 100
 // dedicated /comment endpoint.
 const commentPageSize = 100
 
+// normalizeBaseURL ensures a Jira base URL has an explicit scheme. Config
+// allows a bare host (e.g. "redhat.atlassian.net", per the README example),
+// but request URLs are built via fmt.Sprintf("%s/rest/api/3/...", BaseURL),
+// which produces a malformed request without a scheme. If the value already
+// contains "://" it is left unchanged.
+func normalizeBaseURL(host string) string {
+	if strings.Contains(host, "://") {
+		return host
+	}
+	return "https://" + host
+}
+
 // FetchIssue fetches issue data from Jira API v3.
 //
 // The issue's fields (summary/status/priority/assignee/labels/customfields)
