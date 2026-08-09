@@ -350,14 +350,28 @@ related:
     id: "mturley/odh-dashboard#7700"
     url: https://github.com/mturley/odh-dashboard/pull/7700
   - type: slack
-    id: "C0123ABC/p1234567890"
-    url: https://redhat.slack.com/archives/C0123ABC/p1234567890
+    id: "slack:C0EXAMPLE2:1700000000.000005"
+    url: https://redhat.slack.com/archives/C0EXAMPLE2/p1700000000000005
     label: "Review discussion thread"
 ```
 
 Primary resources are what the worktree exists for. Related resources are watched for context. Both are subscribed to equally by consumers — the distinction is metadata.
 
 The `label` field is optional, useful for resources with opaque IDs (like Slack threads).
+
+#### Resource ID formats
+
+Each resource type has a canonical `id` — a stable, normalized key that tools match on — and an accompanying `url` that is the human-facing link. Tools key on `id`; the `url` is for the person reading the file.
+
+| Type | `id` format | Example |
+|------|-------------|---------|
+| `pr` | `owner/repo#number` | `mturley/odh-dashboard#7705` |
+| `jira` | issue key | `RHOAIENG-12345` |
+| `slack` | `slack:CHANNEL:THREAD_TS` | `slack:C0EXAMPLE2:1700000000.000005` |
+
+The Slack ID is colon-delimited: the literal prefix `slack`, the channel ID (`C…`), and the thread's root timestamp (`conversations.replies`' `thread_ts`, the dotted `1700000000.000005` form). This matches the `channel:threadTs` identity that slack-mini already uses internally as its tab key, so slack-mini can open a thread directly from a `.worktree-resources.yaml` entry, and a future handler Slack watcher can subscribe to the same key.
+
+Note that the Slack `id` and `url` encode the timestamp differently, by necessity: the `id` keeps the dotted `thread_ts` that the Slack API expects, while the permalink `url` uses Slack's `p<digits>` form with the dot removed. Tools derive one from the other; both are stored so neither has to be reconstructed.
 
 **Unknown resource types are not an error.** The example above contains a `slack` entry while the Slack poller is out of scope for v1, and that is the normal case rather than a contrived one: these files are written by hand and by tools that may be newer than the poller set. `Load` returns unknown types unchanged, and pollers ignore resource types they do not handle. A consumer may subscribe to a resource nothing currently polls; it simply receives no events until a poller exists.
 
