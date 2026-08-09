@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -26,19 +27,31 @@ func Migrate(conn *sql.DB) error {
 		return err
 	}
 
-	if _, err := conn.Exec(schemaDDL); err != nil {
+	tx, err := conn.Begin()
+	if err != nil {
+		return fmt.Errorf("watcher: starting migration transaction: %w", err)
+	}
+
+	if _, err := tx.Exec(schemaDDL); err != nil {
+		tx.Rollback()
 		return fmt.Errorf("watcher: creating schema: %w", err)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := conn.Exec(`DELETE FROM watcher_schema_version`); err != nil {
+	if _, err := tx.Exec(`DELETE FROM watcher_schema_version`); err != nil {
+		tx.Rollback()
 		return fmt.Errorf("watcher: clearing schema version: %w", err)
 	}
-	if _, err := conn.Exec(
+	if _, err := tx.Exec(
 		`INSERT INTO watcher_schema_version (version, migrated_at) VALUES (?, ?)`,
 		CurrentSchemaVersion, now,
 	); err != nil {
+		tx.Rollback()
 		return fmt.Errorf("watcher: setting schema version: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("watcher: committing migration: %w", err)
 	}
 
 	return nil
@@ -48,23 +61,18 @@ func Migrate(conn *sql.DB) error {
 // or 0 if the database has not been migrated yet (the
 // watcher_schema_version table is absent or empty).
 func SchemaVersion(conn *sql.DB) (int, error) {
-	exists, err := tableExists(conn, "watcher_schema_version")
-	if err != nil {
-		return 0, err
-	}
-	if !exists {
-		return 0, nil
-	}
-
 	var version int
-	err = conn.QueryRow(`SELECT version FROM watcher_schema_version LIMIT 1`).Scan(&version)
+	err := conn.QueryRow(`SELECT version FROM watcher_schema_version LIMIT 1`).Scan(&version)
+	if err == nil {
+		return version, nil
+	}
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
-	if err != nil {
-		return 0, fmt.Errorf("watcher: reading schema version: %w", err)
+	if strings.Contains(err.Error(), "no such table") {
+		return 0, nil
 	}
-	return version, nil
+	return 0, fmt.Errorf("watcher: reading schema version: %w", err)
 }
 
 // checkForCollisions verifies that any managed table already present in
