@@ -27,9 +27,22 @@ github.com/mturley/watcher/
 └── watcher.go     # Top-level types (Event, Resource, Subscription) and framework
 ```
 
+### What the Library Owns, and What It Doesn't
+
+The library is a durable, shared, per-resource **event and state store**, plus the polling logic that fills it. It owns four things: fetching from the source APIs (with all the accumulated change-detection fixes), the current cached state of each resource, the historical event stream per resource, and relationships between resources.
+
+It deliberately does **not** own read-state. "What is unread" is always the consuming tool's question, answered against the consumer's own cursor storage, layered on top of the library's `watcher_events`. This is the single most important boundary in the design, because the consumers genuinely disagree about what unread means:
+
+- **agent-handler** uses one global cursor per session plus explicit per-event dismissal (`dismissed_events`), and on subscribe wants only events going forward — a new PR subscription must not flood the session inbox with the PR's entire backlog.
+- **the worktree UI** wants a cursor *per resource* — a Slack-thread-style divider line with a "mark as read" button that advances only that resource's history — and on subscribe wants the full historical timeline backfilled, initially unread but scrollable.
+
+Both are just different predicates over the same `watcher_events` rows, exactly as handler's `inbox_scope.go` already layers its routing predicate over the events table. The library provides the events and the backfill; each consumer keeps its own cursor tables and defines its own "unread."
+
+This is why "should the DB be optional / ledger-free mode" turned out to be the wrong question. Every current consumer that uses the library wants durability — handler for its inbox, worktree for a backfilled searchable timeline and content cache. The tool that is genuinely ephemeral (slack-mini, a live thread viewer) simply does not use the library; it fetches from Slack directly and keeps a fingerprint in memory. The split is between *ledger consumers* and *viewers*, not between two modes of one library.
+
 ### Consumer Integration Model
 
-Each consuming project (handler, worktree CLI, future tools) imports the library as a Go module dependency. The library creates its own `watcher_*` tables inside the consumer's SQLite database. Consumers own their database, their subscription lifecycle, and their notification model.
+Each consuming project (handler, worktree CLI, future tools) imports the library as a Go module dependency. The library creates its own `watcher_*` tables inside the consumer's SQLite database. Consumers own their database, their subscription lifecycle, their read-state, and their notification model.
 
 ```
 ┌─────────────────────┐     ┌─────────────────────┐
@@ -150,7 +163,8 @@ Leases make liveness a first-class library concern without leaking consumer sema
 func Subscribe(db *sql.DB, subscriber string, r Resource, opts SubscribeOpts) error
 
 type SubscribeOpts struct {
-    TTL time.Duration // zero means permanent (expires_at = NULL)
+    TTL      time.Duration // zero means permanent (expires_at = NULL)
+    Backfill bool          // fetch history from before the subscription; see First-Poll Behavior
 }
 
 // Renew extends every live lease held by this subscriber.
@@ -250,6 +264,20 @@ Named `watcher_poller_status` rather than `watcher_status` deliberately: agent-h
 6. New events are written via `db.EmitEvent(...)` or `db.UpsertEvent(...)` (for CI bundling)
 7. Resource state is cached via `db.UpsertResourceState(...)`
 8. Resource relationships discovered during polling (e.g. Jira epic links) are written via `db.LinkResources(...)`
+
+### First-Poll Behavior: Backfill vs. Clean Start
+
+The first poll after a resource is subscribed is special, and what it should do depends on the consumer — so it is controlled by `SubscribeOpts.Backfill`, not fixed by the library.
+
+- **`Backfill: false` (handler's default).** The poller records the current `external_ts` high-water mark, emits a single `watch_started` bookkeeping event, and emits no history. Only genuinely new activity produces events thereafter. This is what keeps a new PR subscription from dumping the PR's entire comment history into a session's inbox.
+
+- **`Backfill: true` (worktree's default).** The poller fetches the resource's full historical activity and emits it as ordinary events with their true `external_ts`, so the consumer can present a complete timeline from before the watch began. These events are real `watcher_events` rows; whether they read as "unread" is the consumer's decision (worktree starts them all behind the resource's cursor, so they appear as history the user can scroll and then mark read).
+
+Backfill is feasible for all three sources, with source-specific caveats the pollers must handle:
+
+- **GitHub:** the Issues **Timeline API** (`/issues/{n}/timeline`) is the most complete ordered event source; pair it with the comments/reviews/commits list endpoints for full bodies. CI check history is retrievable per commit SHA but subject to GitHub's ~90-day run/log retention, so older commits may have no recoverable CI.
+- **Jira:** use the dedicated paginated `/issue/{key}/changelog` endpoint. Do **not** use `expand=changelog`, which silently caps at the 100 most recent entries and would drop the oldest history on active issues. Comments paginate fully. Note the known blind spots — issue creation, worklogs, watchers, and votes do not appear in the changelog.
+- **Slack:** `conversations.replies` returns the whole thread via cursor pagination, but Free-plan workspaces expose only ~90 days of history (older messages are unrecoverable, not merely paged away), and newly-created non-Marketplace apps are throttled hard. Backfill must degrade gracefully when history is truncated rather than treating a short thread as complete.
 
 ### Deduplication
 
@@ -403,7 +431,8 @@ Porting handler's existing watcher tests is therefore the **first** task of Phas
 | Batch-submitted review comments sharing one `createdAt` | Timestamp dedup collapses them; requires title-based dedup |
 | CI bundle upsert across multiple poll cycles for one commit SHA | Naive append produces one event per check run |
 | New-commit detection via SHA comparison against cached state | Not detectable from timestamps alone |
-| First-poll `watch_started` suppression | Without it, subscribing to an old PR floods the inbox with its entire history |
+| First-poll `watch_started` suppression when `Backfill: false` | Without it, subscribing to an old PR floods the inbox with its entire history |
+| First-poll backfill when `Backfill: true` emits full history with true `external_ts` | Wrong timestamps or missing history break the worktree timeline; Jira `expand=changelog` cap and Slack retention are the trap cases |
 | Jira ADF comment body extraction | Comment bodies are structured documents, not strings |
 | Jira epic-link discovery → relationship row | Only automated writer of the relationships table |
 
@@ -418,6 +447,16 @@ The `testutil` package provides helpers for consumer test suites:
 - `testutil.MockJiraPoller(responses)` — same for Jira
 - `testutil.SeedEvents(db, events)` — insert test events for query testing
 - `testutil.SeedSubscriptions(db, subs)` — insert test subscriptions
+
+## Read-State Is a Consumer Concern
+
+The library stores events; it never decides which events a user has seen. Each consumer keeps its own read-state tables and composes its own "unread" predicate over `watcher_events`, the way handler's `inbox_scope.go` already composes its routing predicate over `events`. The library must expose the raw material for both models below and impose neither.
+
+**Handler's model: one cursor per session, plus explicit dismissal.** A single high-water timestamp per session (`session_cursors`) marks everything older as seen; individual events can additionally be dismissed without moving the cursor (`dismissed_events`). Both tables are handler-owned. Handler subscribes with `Backfill: false`, so the cursor starts at subscription time and history never enters the inbox. This model already exists and is unchanged by the extraction except that the unread query's watcher half reads from `watcher_events` (see Query Migration).
+
+**Worktree's model: one cursor per resource, with a divider.** Worktree keeps a cursor per `(worktree, resource)` pair in its own table — the last event in that resource's history the user has marked read. The UI renders each resource's timeline with an unread divider at the cursor and a "mark as read" button that advances only that resource's cursor, exactly like unread state in a single Slack thread. Worktree subscribes with `Backfill: true`, so the timeline includes pre-subscription history, all initially below the cursor (unread but scrollable). None of this lives in the library; worktree reads `watcher_events` for a resource and applies its own per-resource cursor.
+
+The takeaway for the library API: queries that return events must be expressible as "all events for resource R" and "all events for subscriber S since timestamp T" — never "all *unread* events," because unread is not the library's to define.
 
 ## Agent-Handler Integration
 
@@ -571,12 +610,18 @@ This is a pre-existing bug rather than something the split introduces, but the m
 
 ## Worktree CLI Integration
 
-The worktree CLI (`github.com/mturley/worktree`) adopts the library for two things:
+The worktree CLI (`github.com/mturley/worktree`) is a full library consumer, not just a reader of the resource file. It is growing a UI that shows, per worktree, an interlaced timeline of GitHub / Jira / Slack activity for that worktree's resources — architecturally similar to slack-mini, but a *ledger* view rather than a live-only viewer. It adopts the library for:
 
-1. **`.worktree-resources.yaml` helpers**: Replace `internal/resources/` with `watcher/resources` package import
-2. **Shared credentials**: Read Jira credentials from `~/.config/watcher/config.yaml` instead of `~/.config/worktree/config.yaml` (with fallback to the worktree-specific config for users who don't have the watcher library's config)
+1. **Polling and events.** Worktree runs the library's pollers against its own database and reads `watcher_events` to build the interlaced timeline. This is the reason to extract the library now: the accumulated change-detection logic (CI bundling, review-comment title dedup, Jira ADF extraction, epic-link discovery) would otherwise be duplicated and would drift.
+2. **Resource content cache.** Worktree wants `watcher_resource_state` not just for current-state display but as a cache of resource content it can index for search. This is a first-class reason worktree wants a database at all, independent of the timeline.
+3. **Backfill on subscribe.** Worktree subscribes with `Backfill: true` so a newly-tracked worktree shows history from before it was created, not just activity going forward.
+4. **Per-resource read-state**, kept in worktree's own tables (see Read-State Is a Consumer Concern) — a cursor per `(worktree, resource)` with a Slack-thread-style divider and "mark as read." The library provides the events; worktree owns the cursor.
+5. **`.worktree-resources.yaml` helpers**: replace `internal/resources/` with the `watcher/resources` package.
+6. **Shared credentials**: read GitHub/Jira/Slack credentials from `~/.config/watcher/config.yaml`, with fallback to the worktree-specific config for users who only have the worktree CLI.
 
-The worktree CLI does not run pollers or manage subscriptions in v1. It writes `.worktree-resources.yaml` files that handler (or future tools) read and act on.
+Worktree's subscriber identifier is namespaced per worktree (e.g. `worktree:odh-dashboard/fix-login`) and its subscriptions are permanent (`TTL: 0`) — a worktree's resources matter until the worktree is deleted, at which point worktree calls `Revoke`.
+
+**slack-mini stays out.** slack-mini remains an independent, DB-free live viewer; it does not consume the library. If the worktree UI later wants slack-mini's thread-viewer component, that component can render from worktree's ledger data rather than fetching live — but that is a future decision, not a v1 dependency.
 
 ## Known Risks and Mitigations
 
@@ -606,7 +651,9 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 - `watcher_*` database schema and idempotent migrations, with namespace collision detection
 - Schema version tracking
 - Subscription management (subscribe, unsubscribe, soft-delete, leases, active resource queries)
-- Resource state caching
+- First-poll behavior selectable per subscription: clean start (`watch_started`) or historical backfill
+- Event queries that support both consumer read-state models: "events for resource R" and "events for subscriber S since T" (never "unread" — that is the consumer's)
+- Resource state caching (usable as a searchable content cache by consumers)
 - Resource relationship tracking (`watcher_resource_relationships`)
 - Event emission with upsert support (CI bundling)
 - Dedup framework (by external_ts, by title, composite)
@@ -618,11 +665,12 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 
 ### Out of Scope (future work)
 
-- Slack poller
+- Slack poller (resource-ID format is standardized now; the poller itself comes when handler wants Slack in the inbox or worktree wants Slack in the timeline)
 - Cross-system discovery CLI
 - Any CLI or web UI in the watcher project itself
-- Agent-handler integration (separate effort after library is stable)
-- Worktree CLI integration (separate effort)
+- Consumer *integrations* (agent-handler and worktree) are their own phases after the library stabilizes, though the library API is designed for both from the start
+
+Note: the library is being extracted now (not deferred until a second consumer materializes) because worktree is a committed second consumer with real, differentiated needs — backfill, a searchable content cache, and per-resource read-state — that the fetch/event/cache core directly serves. The earlier "handler is the only consumer, so don't extract" position was reconsidered once worktree's timeline UI settled on the ledger model.
 
 ## Release and Integration Roadmap
 
@@ -644,8 +692,14 @@ The worktree CLI does not run pollers or manage subscriptions in v1. It writes `
 
 1. Manually migrate existing `.worktree-resources` files to `.worktree-resources.yaml`
 2. Update worktree CLI to import `watcher/resources`
-3. Update worktree CLI to read Jira credentials from shared config (with fallback)
-4. Tag a worktree CLI release
+3. Update worktree CLI to read credentials from shared config (with fallback)
+4. Add a worktree database; run the library's `Migrate()` to create `watcher_*` tables and worktree's own per-resource cursor table
+5. Run pollers against the worktree DB; subscribe worktree's resources with `Backfill: true`, `TTL: 0`, `Revoke` on worktree deletion
+6. Build the interlaced-timeline UI reading `watcher_events`, with per-resource unread dividers and "mark as read"
+7. Use `watcher_resource_state` as the searchable content cache
+8. Tag a worktree CLI release
+
+The order of Phase 2 vs. Phase 3 (handler) is not fixed; both build on the same `v0.1.0` library and can proceed independently. Worktree is lower-risk because it is greenfield — no data migration, no production database to protect — so it is a good first real exercise of the library API before the handler cutover.
 
 ### Phase 3: Agent-Handler Integration
 
