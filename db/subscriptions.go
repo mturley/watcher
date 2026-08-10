@@ -154,6 +154,34 @@ func Revoke(conn *sql.DB, subscriber string) error {
 	return nil
 }
 
+// RenewPrefix extends the lease on all live subscriptions whose subscriber
+// starts with subscriberPrefix.
+func RenewPrefix(conn *sql.DB, subscriberPrefix string, ttl time.Duration) error {
+	expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
+	_, err := conn.Exec(`
+		UPDATE watcher_subscriptions SET expires_at = ?
+		WHERE subscriber LIKE ? AND deleted_at IS NULL
+	`, expiresAt, subscriberPrefix+"%")
+	if err != nil {
+		return fmt.Errorf("failed to renew subscriptions by prefix: %w", err)
+	}
+	return nil
+}
+
+// RevokePrefix soft-deletes all live subscriptions whose subscriber starts
+// with subscriberPrefix. It does not set the user tombstone flag.
+func RevokePrefix(conn *sql.DB, subscriberPrefix string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := conn.Exec(`
+		UPDATE watcher_subscriptions SET deleted_at = ?
+		WHERE subscriber LIKE ? AND deleted_at IS NULL
+	`, now, subscriberPrefix+"%")
+	if err != nil {
+		return fmt.Errorf("failed to revoke subscriptions by prefix: %w", err)
+	}
+	return nil
+}
+
 // Unsubscribe soft-deletes subscriber's subscription to resource r.
 func Unsubscribe(conn *sql.DB, subscriber string, r watcher.Resource) error {
 	now := time.Now().UTC().Format(time.RFC3339)

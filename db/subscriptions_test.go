@@ -480,3 +480,36 @@ func TestSubscribersOf(t *testing.T) {
 		t.Fatalf("want 2 subscribers, got %d", len(subs))
 	}
 }
+
+func TestRevokePrefix(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil { t.Fatal(err) }
+	if err := Subscribe(c, "handler:session:s1", watcher.Resource{Type: "pr", ID: "o/r#1"}, SubscribeOpts{}); err != nil { t.Fatal(err) }
+	if err := Subscribe(c, "handler:session:s1", watcher.Resource{Type: "jira", ID: "X-1"}, SubscribeOpts{}); err != nil { t.Fatal(err) }
+	if err := Subscribe(c, "handler:session:s2", watcher.Resource{Type: "pr", ID: "o/r#2"}, SubscribeOpts{}); err != nil { t.Fatal(err) }
+	if err := RevokePrefix(c, "handler:session:s1"); err != nil { t.Fatal(err) }
+	if got, _ := ActiveSubscriptions(c, "handler:session:s1", false); len(got) != 0 {
+		t.Fatalf("s1 should be fully revoked, got %d", len(got))
+	}
+	if got, _ := ActiveSubscriptions(c, "handler:session:s2", false); len(got) != 1 {
+		t.Fatalf("s2 must be untouched, got %d", len(got))
+	}
+}
+
+func TestRenewPrefix(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil { t.Fatal(err) }
+	// subscribe with a short TTL then renew via prefix with a long one
+	if err := Subscribe(c, "handler:session:s1", watcher.Resource{Type: "pr", ID: "o/r#1"}, SubscribeOpts{TTL: time.Minute}); err != nil { t.Fatal(err) }
+	if err := RenewPrefix(c, "handler:session:", time.Hour); err != nil { t.Fatal(err) }
+	all, _ := AllSubscriptions(c, "handler:session:s1", false)
+	if len(all) != 1 || all[0].ExpiresAt == nil {
+		t.Fatalf("expected one row with expires_at set, got %+v", all)
+	}
+	// expires_at should be well in the future (parse and compare)
+	exp, err := time.Parse(time.RFC3339, *all[0].ExpiresAt)
+	if err != nil { t.Fatal(err) }
+	if time.Until(exp) < 30*time.Minute {
+		t.Fatalf("RenewPrefix did not extend the lease: %s", *all[0].ExpiresAt)
+	}
+}
