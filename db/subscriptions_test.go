@@ -370,6 +370,75 @@ func TestListSubscriptionsPrefix(t *testing.T) {
 	}
 }
 
+func TestSubscribeReinstatesNonUserTombstone(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Unsubscribe(c, "sub", r); err != nil {
+		t.Fatal(err)
+	} // non-user soft-delete
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := ActiveSubscriptions(c, "sub", false)
+	if len(active) != 1 {
+		t.Fatalf("non-user tombstone should reinstate on Subscribe: got %d active", len(active))
+	}
+}
+
+func TestSubscribeDoesNotReinstateUserTombstone(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := UserUnsubscribe(c, "sub", r); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := ActiveSubscriptions(c, "sub", false)
+	if len(active) != 0 {
+		t.Fatalf("user tombstone must NOT reinstate on Subscribe: got %d active", len(active))
+	}
+	// but Reinstate forces it back
+	if err := Reinstate(c, "sub", r); err != nil {
+		t.Fatal(err)
+	}
+	active, _ = ActiveSubscriptions(c, "sub", false)
+	if len(active) != 1 {
+		t.Fatalf("Reinstate must force-revive user tombstone: got %d active", len(active))
+	}
+}
+
+func TestSubscribeIfAbsentNoOpOnLive(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1", URL: "first"}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	// IfAbsent with a different URL must NOT overwrite the live row
+	if err := Subscribe(c, "sub", watcher.Resource{Type: "pr", ID: "o/r#1", URL: "second"}, SubscribeOpts{IfAbsent: true}); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := ActiveSubscriptions(c, "sub", false)
+	if len(active) != 1 || active[0].Resource.URL != "first" {
+		t.Fatalf("IfAbsent should not disturb the live row: %+v", active)
+	}
+}
+
 func TestSubscribersOf(t *testing.T) {
 	c := mem(t)
 	if err := Migrate(c); err != nil {
