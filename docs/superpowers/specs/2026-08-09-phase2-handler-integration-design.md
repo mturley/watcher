@@ -123,7 +123,7 @@ Mapping of handler operations:
 |---|---|
 | `subscriptions.session_id` FK | subscriber `handler:session:<id>` (parsed back out; no FK) |
 | `SubscribeIfNew(s)` | `Subscribe{IfAbsent:true}` |
-| `Subscribe(s)` (reinstate-aware) | `Subscribe{}` |
+| `Subscribe(s)` (explicit user re-watch — must FORCE-revive) | `Reinstate(...)` then `Subscribe{TTL}` — overrides a prior user-unwatch (corrected during 2b execution; a bare `Subscribe{}` would silently no-op on a user tombstone) |
 | `Unsubscribe(...)` (`unsubscribed_by='user'`) | `UserUnsubscribe(...)` |
 | `Reinstate(...)` | `Reinstate(...)` |
 | `RestoreSubscriptionsForSession(id)` | reinstate over prefix `handler:session:<id>`, honoring `unsubscribed_by_user` |
