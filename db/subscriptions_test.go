@@ -298,3 +298,95 @@ func TestEventsForSubscriberSinceExcludesExpiredLease(t *testing.T) {
 		t.Fatalf("got %+v, want no events for an expired lease", events)
 	}
 }
+
+func TestListSubscriptionsActiveVsAll(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r1 := watcher.Resource{Type: "pr", ID: "o/r#1", URL: "u1"}
+	r2 := watcher.Resource{Type: "pr", ID: "o/r#2", URL: "u2"}
+	if err := Subscribe(c, "handler:session:s1", r1, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "handler:session:s1", r2, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	// soft-delete r2
+	if err := Unsubscribe(c, "handler:session:s1", r2); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := ActiveSubscriptions(c, "handler:session:s1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].Resource.ID != "o/r#1" {
+		t.Fatalf("active: want [o/r#1], got %+v", active)
+	}
+	all, err := AllSubscriptions(c, "handler:session:s1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("all: want 2 rows, got %d", len(all))
+	}
+	// the deleted one must carry metadata
+	var deleted *Subscription
+	for i := range all {
+		if all[i].Resource.ID == "o/r#2" {
+			deleted = &all[i]
+		}
+	}
+	if deleted == nil || deleted.DeletedAt == nil {
+		t.Fatalf("deleted row should have DeletedAt set: %+v", deleted)
+	}
+}
+
+func TestListSubscriptionsPrefix(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "handler:session:s1", watcher.Resource{Type: "pr", ID: "o/r#1"}, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "handler:session:s2", watcher.Resource{Type: "pr", ID: "o/r#2"}, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ActiveSubscriptions(c, "handler:session:", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("prefix active: want 2, got %d", len(got))
+	}
+	exact, err := ActiveSubscriptions(c, "handler:session:s1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exact) != 1 {
+		t.Fatalf("exact active: want 1, got %d", len(exact))
+	}
+}
+
+func TestSubscribersOf(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	if err := Subscribe(c, "handler:session:s1", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "handler:session:s2", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	subs, err := SubscribersOf(c, "pr", "o/r#1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subs) != 2 {
+		t.Fatalf("want 2 subscribers, got %d", len(subs))
+	}
+}

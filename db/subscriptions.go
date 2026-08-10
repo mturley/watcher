@@ -223,6 +223,104 @@ func EventsForSubscriberSince(conn *sql.DB, subscriber, since string) ([]watcher
 	return scanEvents(rows)
 }
 
+// Subscription is a row of watcher_subscriptions with lifecycle metadata.
+type Subscription struct {
+	ID                 string
+	Subscriber         string
+	Resource           watcher.Resource
+	CreatedAt          string
+	ExpiresAt          *string
+	Backfill           bool
+	DeletedAt          *string
+	UnsubscribedByUser bool
+}
+
+// subscriberPredicate returns the WHERE fragment and arg for matching a
+// subscriber exactly or by prefix.
+func subscriberPredicate(subscriberOrPrefix string, prefix bool) (string, any) {
+	if prefix {
+		return "subscriber LIKE ?", subscriberOrPrefix + "%"
+	}
+	return "subscriber = ?", subscriberOrPrefix
+}
+
+const subscriptionColumns = `id, subscriber, resource_type, resource_id, resource_url, created_at, expires_at, backfill, deleted_at, unsubscribed_by_user`
+
+func scanSubscriptions(rows *sql.Rows) ([]Subscription, error) {
+	var out []Subscription
+	for rows.Next() {
+		var s Subscription
+		var url, expiresAt, deletedAt sql.NullString
+		var backfill, unsubUser int
+		if err := rows.Scan(&s.ID, &s.Subscriber, &s.Resource.Type, &s.Resource.ID,
+			&url, &s.CreatedAt, &expiresAt, &backfill, &deletedAt, &unsubUser); err != nil {
+			return nil, fmt.Errorf("failed to scan subscription: %w", err)
+		}
+		if url.Valid {
+			s.Resource.URL = url.String
+		}
+		if expiresAt.Valid {
+			s.ExpiresAt = &expiresAt.String
+		}
+		if deletedAt.Valid {
+			s.DeletedAt = &deletedAt.String
+		}
+		s.Backfill = backfill == 1
+		s.UnsubscribedByUser = unsubUser == 1
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating subscriptions: %w", err)
+	}
+	return out, nil
+}
+
+// ActiveSubscriptions returns live (not soft-deleted, not lease-expired)
+// subscriptions matching subscriber exactly, or by prefix when prefix is true.
+func ActiveSubscriptions(conn *sql.DB, subscriberOrPrefix string, prefix bool) ([]Subscription, error) {
+	pred, arg := subscriberPredicate(subscriberOrPrefix, prefix)
+	now := time.Now().UTC().Format(time.RFC3339)
+	rows, err := conn.Query(`SELECT `+subscriptionColumns+`
+		FROM watcher_subscriptions
+		WHERE `+pred+` AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+		ORDER BY created_at`, arg, now)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active subscriptions: %w", err)
+	}
+	defer rows.Close()
+	return scanSubscriptions(rows)
+}
+
+// AllSubscriptions returns every subscription (including soft-deleted and
+// lease-expired) matching subscriber exactly, or by prefix when prefix is true.
+// Callers inspect DeletedAt / ExpiresAt / UnsubscribedByUser to see why a row
+// is inactive.
+func AllSubscriptions(conn *sql.DB, subscriberOrPrefix string, prefix bool) ([]Subscription, error) {
+	pred, arg := subscriberPredicate(subscriberOrPrefix, prefix)
+	rows, err := conn.Query(`SELECT `+subscriptionColumns+`
+		FROM watcher_subscriptions
+		WHERE `+pred+`
+		ORDER BY created_at`, arg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query all subscriptions: %w", err)
+	}
+	defer rows.Close()
+	return scanSubscriptions(rows)
+}
+
+// SubscribersOf returns all subscriptions (any state) for a given resource.
+func SubscribersOf(conn *sql.DB, resourceType, resourceID string) ([]Subscription, error) {
+	rows, err := conn.Query(`SELECT `+subscriptionColumns+`
+		FROM watcher_subscriptions
+		WHERE resource_type = ? AND resource_id = ?
+		ORDER BY created_at`, resourceType, resourceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query subscribers of resource: %w", err)
+	}
+	defer rows.Close()
+	return scanSubscriptions(rows)
+}
+
 // scanEvents scans rows in the id, ts, external_ts, source, type, title,
 // body, author, author_type, tags column order into watcher.Event values.
 func scanEvents(rows *sql.Rows) ([]watcher.Event, error) {
