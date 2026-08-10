@@ -50,3 +50,31 @@ func TestMigrateAbortsOnAlienWatcherTable(t *testing.T) {
 		t.Fatal("expected Migrate to abort on a pre-existing watcher_events with unexpected schema")
 	}
 }
+
+func TestMigrateAddsUnsubscribedByUserColumn(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := c.Query(`PRAGMA table_info(watcher_subscriptions)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if name == "unsubscribed_by_user" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("watcher_subscriptions missing unsubscribed_by_user column")
+	}
+}
