@@ -84,6 +84,11 @@ type JiraBehavior struct {
 	// BotUsernames lists Jira usernames to classify as bots when
 	// attributing comment/changelog authors.
 	BotUsernames []string `yaml:"bot_usernames,omitempty"`
+	// CustomFields maps friendly names (e.g. "epic_key", "story_points") to
+	// Jira custom field IDs (e.g. "customfield_10014"), letting the poller
+	// fetch and cache extra issue data. These are configuration, not
+	// credentials, so they live here in config.yaml rather than auth.yaml.
+	CustomFields map[string]string `yaml:"custom_fields,omitempty"`
 }
 
 // JiraBotUsernames returns the configured bot usernames, or nil if no
@@ -93,6 +98,15 @@ func (c *ConfigFile) JiraBotUsernames() []string {
 		return nil
 	}
 	return c.Jira.BotUsernames
+}
+
+// JiraCustomFields returns the configured Jira custom-field map, or nil if no
+// Jira behavior block (or no custom_fields entry) is configured.
+func (c *ConfigFile) JiraCustomFields() map[string]string {
+	if c.Jira == nil {
+		return nil
+	}
+	return c.Jira.CustomFields
 }
 
 // ConfigDefaultPath returns the default behavior config file path,

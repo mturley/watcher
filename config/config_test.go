@@ -118,6 +118,52 @@ func TestLoadConfigJiraBotUsernames(t *testing.T) {
 	}
 }
 
+func TestLoadConfigJiraCustomFieldsMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	// A config.yaml with only bot_usernames has no custom_fields.
+	yamlContent := "jira:\n  bot_usernames:\n    - bot1\n"
+	if err := os.WriteFile(path, []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := cfg.JiraCustomFields(); got != nil {
+		t.Fatalf("JiraCustomFields() = %v, want nil when custom_fields absent", got)
+	}
+}
+
+func TestLoadConfigJiraCustomFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	yamlContent := "jira:\n  custom_fields:\n    epic_key: customfield_10014\n    story_points: customfield_10028\n"
+	if err := os.WriteFile(path, []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got := cfg.JiraCustomFields()
+	if got["epic_key"] != "customfield_10014" || got["story_points"] != "customfield_10028" {
+		t.Fatalf("JiraCustomFields() = %v, want epic_key=customfield_10014 story_points=customfield_10028", got)
+	}
+}
+
+// JiraCustomFields is nil-safe when there is no Jira behavior block at all.
+func TestJiraCustomFieldsNilBlock(t *testing.T) {
+	var cfg ConfigFile
+	if got := cfg.JiraCustomFields(); got != nil {
+		t.Fatalf("JiraCustomFields() on empty ConfigFile = %v, want nil", got)
+	}
+}
+
 func TestLoadConfigIgnoresWorldReadablePermissions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

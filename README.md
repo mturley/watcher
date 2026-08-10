@@ -261,15 +261,22 @@ jira:
   bot_usernames:
     - dependabot
     - jira-automation
+  custom_fields:
+    epic_key: customfield_10014
+    story_points: customfield_10028
 ```
 
 `bot_usernames` lists Jira usernames to classify as bots when
-attributing comment/changelog authors. Use `cfg.JiraBotUsernames()` for
-a nil-safe accessor:
+attributing comment/changelog authors. `custom_fields` maps friendly
+names to Jira custom field IDs so the poller can fetch and cache extra
+issue data (epic link, story points, blocked status, etc.). Both are
+configuration rather than credentials, which is why they live here in
+`config.yaml` and not in `auth.yaml`. Nil-safe accessors:
 
 ```go
 cfg, err := config.LoadConfig(config.ConfigDefaultPath())
-bots := cfg.JiraBotUsernames() // []string, or nil if unset
+bots := cfg.JiraBotUsernames()   // []string, or nil if unset
+fields := cfg.JiraCustomFields() // map[string]string, or nil if unset
 ```
 
 ## Resource ID formats
