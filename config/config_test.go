@@ -67,6 +67,13 @@ func TestLoadRefusesGroupWorldReadable(t *testing.T) {
 	}
 }
 
+func TestDefaultPathUsesAuthYAML(t *testing.T) {
+	t.Setenv("WATCHER_HOME", "/tmp/wh")
+	if got := DefaultPath(); got != "/tmp/wh/auth.yaml" {
+		t.Fatalf("DefaultPath = %q, want /tmp/wh/auth.yaml", got)
+	}
+}
+
 func TestRegisterConsumerRoundTrip(t *testing.T) {
 	cfg := &Config{}
 	cfg.RegisterConsumer("handler", "~/.agent-handler/handler.db")

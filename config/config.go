@@ -69,18 +69,18 @@ type SlackCreds struct {
 	Token string
 }
 
-// DefaultPath returns the default configuration file path,
-// "~/.config/watcher/config.yaml". Honors WATCHER_HOME (used by tests)
+// DefaultPath returns the default credentials file path,
+// "~/.config/watcher/auth.yaml". Honors WATCHER_HOME (used by tests)
 // to override the base directory.
 func DefaultPath() string {
 	if dir := os.Getenv("WATCHER_HOME"); dir != "" {
-		return filepath.Join(dir, "config.yaml")
+		return filepath.Join(dir, "auth.yaml")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".config", "watcher", "config.yaml")
+	return filepath.Join(home, ".config", "watcher", "auth.yaml")
 }
 
 // Load reads and parses the config file at path.
