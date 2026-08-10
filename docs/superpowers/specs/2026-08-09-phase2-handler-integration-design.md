@@ -188,7 +188,7 @@ One-time command `handler setup --migrate-watcher`.
 1. `watcher.Migrate(handlerDB)` — create `watcher_*` (aborts on unexpected collision).
 2. Copy `events WHERE source IN ('github','jira')` → `watcher_events` (+ their `event_resources` → `watcher_event_resources`). `agent`/`handler` sources stay in `events`. (The `source` filter is an explicit allowlist — handler is a third source that must NOT move.)
 3. Copy `resource_state` → `watcher_resource_state`.
-4. Copy `subscriptions` → `watcher_subscriptions`: subscriber `handler:session:<session_id>`; map `deleted_at`; `unsubscribed_by='user'` → `unsubscribed_by_user=1`; `expires_at`=now+5d for rows whose session is active, else leave to age out.
+4. Copy `subscriptions` → `watcher_subscriptions`: subscriber `handler:session:<session_id>`; map `deleted_at`; `unsubscribed_by='user'` → `unsubscribed_by_user=1`; `expires_at`=now+5d for rows whose session is active, else set to an already-expired timestamp (`now`) so the lease ages out immediately. **Do NOT use `expires_at`=NULL for non-active sessions** — NULL means *permanent / never expires* in the library's live-lease predicates (`expires_at IS NULL OR expires_at > now`), which is the opposite of aging out and would keep orphaned/archived sessions' subscriptions live forever (endless polling).
 5. Copy `resource_relationships` → `watcher_resource_relationships`.
 6. Copy handler's `watcher_status` → `watcher_poller_status` (leave original in place for rollback).
 7. Migrate credentials `~/.agent-handler/config.yaml` → `~/.config/watcher/auth.yaml`.
