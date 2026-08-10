@@ -391,6 +391,27 @@ func TestSubscribeReinstatesNonUserTombstone(t *testing.T) {
 	}
 }
 
+func TestSubscribeIfAbsentReinstatesNonUserTombstone(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Unsubscribe(c, "sub", r); err != nil {
+		t.Fatal(err)
+	} // non-user soft-delete
+	if err := Subscribe(c, "sub", r, SubscribeOpts{IfAbsent: true}); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := ActiveSubscriptions(c, "sub", false)
+	if len(active) != 1 {
+		t.Fatalf("IfAbsent should reinstate a non-user tombstone (no live row = absent): got %d active", len(active))
+	}
+}
+
 func TestSubscribeDoesNotReinstateUserTombstone(t *testing.T) {
 	c := mem(t)
 	if err := Migrate(c); err != nil {
