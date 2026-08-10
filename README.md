@@ -23,11 +23,13 @@ See the full design rationale in
 ## Install
 
 ```bash
-go get github.com/mturley/watcher@v0.1.0
+go get github.com/mturley/watcher@v0.2.0
 ```
 
-(`v0.1.0` is the intended first tag for this library; if you're building
-against a pre-release commit, use the commit SHA or a branch instead.)
+(if you're building against a pre-release commit, use the commit SHA or
+a branch instead.)
+
+**Note on upgrading from v0.1:** There is no in-place v0.1→v0.2 database upgrade path. If you have an existing v0.1 watcher database, you must delete it and let `db.Migrate` create a fresh v0.2 schema (the schema added a column and migration aborts if the table structure doesn't match).
 
 ## Quickstart
 
@@ -151,11 +153,61 @@ Source-specific caveats:
 - **Slack**: not yet implemented (see Status below). The `slack:...`
   resource ID format is reserved but there is no poller yet.
 
+## Subscription lifecycle
+
+A subscription is keyed by `(subscriber, resource_type, resource_id)`;
+`db` maintains at most one row per key and tracks its state through a
+tombstone model rather than deleting rows outright:
+
+- **`db.Subscribe(conn, subscriber, resource, db.SubscribeOpts{TTL, Backfill, IfAbsent})`**
+  creates a subscription, or reinstates/refreshes an existing one, with
+  one exception: if the existing row was soft-deleted via
+  `UserUnsubscribe` (`unsubscribed_by_user = 1`), `Subscribe` leaves it
+  tombstoned — only `Reinstate` can revive a user-removed subscription.
+  A non-user tombstone (from `Unsubscribe`, `Revoke`/`RevokePrefix`, or
+  lease expiry) is reinstated normally.
+  `SubscribeOpts.IfAbsent`, when true, makes `Subscribe` a no-op if a
+  *live* row already exists (it won't refresh `url`/`expires_at`/
+  `backfill`), but a non-user tombstone still counts as "absent" and
+  gets reinstated even with `IfAbsent` set.
+- **`db.Unsubscribe(conn, subscriber, resource)`** soft-deletes the
+  subscription (revivable by a later `Subscribe` or `Reinstate`).
+- **`db.UserUnsubscribe(conn, subscriber, resource)`** soft-deletes the
+  subscription *and* sets `unsubscribed_by_user`, protecting it from
+  being silently reinstated by `Subscribe` — use this when the removal
+  reflects explicit user intent (e.g. an "unsubscribe" button) as
+  opposed to internal bookkeeping.
+- **`db.Reinstate(conn, subscriber, resource)`** clears both
+  `deleted_at` and `unsubscribed_by_user`, unconditionally reviving the
+  subscription regardless of how it was removed.
+- **`db.Renew(conn, subscriber, ttl)`** / **`db.RenewPrefix(conn, subscriberPrefix, ttl)`**
+  extend the lease (`expires_at`) on all of a subscriber's live
+  subscriptions, matching the subscriber exactly or by prefix
+  (`subscriber LIKE prefix||'%'`) respectively.
+- **`db.Revoke(conn, subscriber)`** / **`db.RevokePrefix(conn, subscriberPrefix)`**
+  soft-delete all of a subscriber's live subscriptions (exact or
+  prefix match); neither sets the user tombstone flag.
+- **`db.ActiveSubscriptions(conn, subscriberOrPrefix, prefix bool)`**
+  returns only live, non-expired subscriptions (subscriber exact match
+  when `prefix` is false, prefix match when true) as `[]db.Subscription`.
+- **`db.AllSubscriptions(conn, subscriberOrPrefix, prefix bool)`**
+  returns every subscription for that subscriber/prefix, including
+  soft-deleted and lease-expired ones. Each `db.Subscription` carries
+  `DeletedAt *string`, `ExpiresAt *string`, and `UnsubscribedByUser bool`
+  alongside `ID`, `Subscriber`, `Resource`, `CreatedAt`, and `Backfill`,
+  so a consumer can show *why* a subscription is inactive (explicitly
+  unsubscribed by the user vs. revoked vs. lease-expired) instead of
+  just that it's gone.
+- **`db.SubscribersOf(conn, resourceType, resourceID)`** is the reverse
+  lookup: every subscription (any state) for a given resource, useful
+  for "who's watching this" tooling.
+
 ## Config
 
-Config is a single shared YAML file, by default at
-`~/.config/watcher/config.yaml`, loaded with `config.Load` and written
-with `(*Config).Save` (which enforces `0600` permissions since it holds
+Config is a single shared YAML credentials file, by default at
+`~/.config/watcher/auth.yaml` (`config.DefaultPath()`, overridable via
+the `WATCHER_HOME` env var), loaded with `config.Load` and written with
+`(*Config).Save` (which enforces `0600` permissions since it holds
 credentials — `Load` refuses to read a group/world-readable file).
 
 ```yaml
@@ -215,11 +267,45 @@ you supply the full argv, e.g. `[]string{"/usr/local/bin/mytool", "poll",
 on Linux. `scheduler.Uninstall`, `Start`, `Stop`, `IsInstalled`, and
 `IsRunning` round out lifecycle management.
 
+## Run modes
+
+There are three ways to drive polling, depending on how your consumer
+is deployed:
+
+- **One-off `Poll`** (`github.Poll`, `jira.Poll`): call it yourself,
+  e.g. from a CLI subcommand invoked by cron/launchd, or once at
+  startup. This is the building block the other two modes wrap.
+- **Foreground `Loop`**: for a long-running process (a `watch loop`
+  command, or a goroutine inside a server), use the library's own
+  in-process scheduler instead of OS-level scheduling:
+
+  ```go
+  err := watcher.Loop(ctx, 5*time.Minute, func(ctx context.Context) error {
+      resources, err := db.ActiveResources(conn, "pr")
+      if err != nil {
+          return err
+      }
+      return github.Poll(conn, token, resources, logger)
+  })
+  ```
+
+  `Loop(ctx, interval, pollFn)` runs `pollFn` immediately, then again
+  every `interval`, until `ctx` is cancelled (at which point it returns
+  `ctx.Err()`). A `pollFn` error does not stop the loop — a transient
+  poll failure shouldn't end watching — so log or record errors inside
+  `pollFn` if you need to observe them.
+- **OS scheduler** (`scheduler.Install`, see above): let launchd/cron
+  invoke your own poll command on an interval, for consumers that
+  don't want a long-running process.
+
 ## Status / scope
 
-`v0.1.0` is the extraction of agent-handler's watcher subsystem into a
-standalone, consumer-agnostic library. Deliberately out of scope for
-this release:
+`v0.1.0` was the extraction of agent-handler's watcher subsystem into a
+standalone, consumer-agnostic library. `v0.2.0` generalizes the
+subscription lifecycle (tombstones, `IfAbsent`, `UserUnsubscribe`/
+`Reinstate`, prefix-based renew/revoke), renames the config file to
+`auth.yaml`, and adds the foreground `Loop` runner. Deliberately out of
+scope so far:
 
 - Slack polling (resource ID format reserved, no poller implemented)
 - A cross-system discovery CLI/UI
@@ -228,3 +314,5 @@ this release:
 
 See the design spec for the full rationale and future-work list:
 [`docs/superpowers/specs/2026-07-31-watcher-library-design.md`](docs/superpowers/specs/2026-07-31-watcher-library-design.md).
+The v0.2 subscription-lifecycle generalization is documented in
+[`docs/superpowers/specs/2026-08-09-phase2-handler-integration-design.md`](docs/superpowers/specs/2026-08-09-phase2-handler-integration-design.md).

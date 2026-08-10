@@ -298,3 +298,251 @@ func TestEventsForSubscriberSinceExcludesExpiredLease(t *testing.T) {
 		t.Fatalf("got %+v, want no events for an expired lease", events)
 	}
 }
+
+func TestListSubscriptionsActiveVsAll(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r1 := watcher.Resource{Type: "pr", ID: "o/r#1", URL: "u1"}
+	r2 := watcher.Resource{Type: "pr", ID: "o/r#2", URL: "u2"}
+	if err := Subscribe(c, "handler:session:s1", r1, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "handler:session:s1", r2, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	// soft-delete r2
+	if err := Unsubscribe(c, "handler:session:s1", r2); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := ActiveSubscriptions(c, "handler:session:s1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].Resource.ID != "o/r#1" {
+		t.Fatalf("active: want [o/r#1], got %+v", active)
+	}
+	all, err := AllSubscriptions(c, "handler:session:s1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("all: want 2 rows, got %d", len(all))
+	}
+	// the deleted one must carry metadata
+	var deleted *Subscription
+	for i := range all {
+		if all[i].Resource.ID == "o/r#2" {
+			deleted = &all[i]
+		}
+	}
+	if deleted == nil || deleted.DeletedAt == nil {
+		t.Fatalf("deleted row should have DeletedAt set: %+v", deleted)
+	}
+}
+
+func TestListSubscriptionsPrefix(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "handler:session:s1", watcher.Resource{Type: "pr", ID: "o/r#1"}, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "handler:session:s2", watcher.Resource{Type: "pr", ID: "o/r#2"}, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ActiveSubscriptions(c, "handler:session:", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("prefix active: want 2, got %d", len(got))
+	}
+	exact, err := ActiveSubscriptions(c, "handler:session:s1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exact) != 1 {
+		t.Fatalf("exact active: want 1, got %d", len(exact))
+	}
+}
+
+func TestSubscribeReinstatesNonUserTombstone(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Unsubscribe(c, "sub", r); err != nil {
+		t.Fatal(err)
+	} // non-user soft-delete
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := ActiveSubscriptions(c, "sub", false)
+	if len(active) != 1 {
+		t.Fatalf("non-user tombstone should reinstate on Subscribe: got %d active", len(active))
+	}
+}
+
+func TestSubscribeIfAbsentReinstatesNonUserTombstone(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Unsubscribe(c, "sub", r); err != nil {
+		t.Fatal(err)
+	} // non-user soft-delete
+	if err := Subscribe(c, "sub", r, SubscribeOpts{IfAbsent: true}); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := ActiveSubscriptions(c, "sub", false)
+	if len(active) != 1 {
+		t.Fatalf("IfAbsent should reinstate a non-user tombstone (no live row = absent): got %d active", len(active))
+	}
+}
+
+func TestSubscribeDoesNotReinstateUserTombstone(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := UserUnsubscribe(c, "sub", r); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := ActiveSubscriptions(c, "sub", false)
+	if len(active) != 0 {
+		t.Fatalf("user tombstone must NOT reinstate on Subscribe: got %d active", len(active))
+	}
+	// but Reinstate forces it back
+	if err := Reinstate(c, "sub", r); err != nil {
+		t.Fatal(err)
+	}
+	active, _ = ActiveSubscriptions(c, "sub", false)
+	if len(active) != 1 {
+		t.Fatalf("Reinstate must force-revive user tombstone: got %d active", len(active))
+	}
+}
+
+func TestSubscribeIfAbsentNoOpOnLive(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1", URL: "first"}
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	// IfAbsent with a different URL must NOT overwrite the live row
+	if err := Subscribe(c, "sub", watcher.Resource{Type: "pr", ID: "o/r#1", URL: "second"}, SubscribeOpts{IfAbsent: true}); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := ActiveSubscriptions(c, "sub", false)
+	if len(active) != 1 || active[0].Resource.URL != "first" {
+		t.Fatalf("IfAbsent should not disturb the live row: %+v", active)
+	}
+}
+
+func TestSubscribeRefreshNormalizesUserFlag(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	// Create a live row directly with the abnormal state: unsubscribed_by_user = 1
+	// while deleted_at is NULL (a live row)
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	// Manually set unsubscribed_by_user = 1 while keeping the row live
+	if _, err := c.Exec(`UPDATE watcher_subscriptions SET unsubscribed_by_user = 1 WHERE subscriber = ? AND resource_id = ?`, "sub", r.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Verify the abnormal state exists
+	all, _ := AllSubscriptions(c, "sub", false)
+	if len(all) != 1 || !all[0].UnsubscribedByUser {
+		t.Fatalf("test setup: expected live row with unsubscribed_by_user = 1, got %+v", all)
+	}
+
+	// Call Subscribe again (refresh) - should normalize the flag
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the flag is now normalized to 0
+	all, _ = AllSubscriptions(c, "sub", false)
+	if len(all) != 1 || all[0].UnsubscribedByUser {
+		t.Fatalf("Subscribe refresh should normalize unsubscribed_by_user to 0, got %+v", all)
+	}
+}
+
+func TestSubscribersOf(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	if err := Subscribe(c, "handler:session:s1", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe(c, "handler:session:s2", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	subs, err := SubscribersOf(c, "pr", "o/r#1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subs) != 2 {
+		t.Fatalf("want 2 subscribers, got %d", len(subs))
+	}
+}
+
+func TestRevokePrefix(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil { t.Fatal(err) }
+	if err := Subscribe(c, "handler:session:s1", watcher.Resource{Type: "pr", ID: "o/r#1"}, SubscribeOpts{}); err != nil { t.Fatal(err) }
+	if err := Subscribe(c, "handler:session:s1", watcher.Resource{Type: "jira", ID: "X-1"}, SubscribeOpts{}); err != nil { t.Fatal(err) }
+	if err := Subscribe(c, "handler:session:s2", watcher.Resource{Type: "pr", ID: "o/r#2"}, SubscribeOpts{}); err != nil { t.Fatal(err) }
+	if err := RevokePrefix(c, "handler:session:s1"); err != nil { t.Fatal(err) }
+	if got, _ := ActiveSubscriptions(c, "handler:session:s1", false); len(got) != 0 {
+		t.Fatalf("s1 should be fully revoked, got %d", len(got))
+	}
+	if got, _ := ActiveSubscriptions(c, "handler:session:s2", false); len(got) != 1 {
+		t.Fatalf("s2 must be untouched, got %d", len(got))
+	}
+}
+
+func TestRenewPrefix(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil { t.Fatal(err) }
+	// subscribe with a short TTL then renew via prefix with a long one
+	if err := Subscribe(c, "handler:session:s1", watcher.Resource{Type: "pr", ID: "o/r#1"}, SubscribeOpts{TTL: time.Minute}); err != nil { t.Fatal(err) }
+	if err := RenewPrefix(c, "handler:session:", time.Hour); err != nil { t.Fatal(err) }
+	all, _ := AllSubscriptions(c, "handler:session:s1", false)
+	if len(all) != 1 || all[0].ExpiresAt == nil {
+		t.Fatalf("expected one row with expires_at set, got %+v", all)
+	}
+	// expires_at should be well in the future (parse and compare)
+	exp, err := time.Parse(time.RFC3339, *all[0].ExpiresAt)
+	if err != nil { t.Fatal(err) }
+	if time.Until(exp) < 30*time.Minute {
+		t.Fatalf("RenewPrefix did not extend the lease: %s", *all[0].ExpiresAt)
+	}
+}

@@ -33,7 +33,7 @@ var managedColumns = map[string][]string{
 	},
 	"watcher_subscriptions": {
 		"id", "subscriber", "resource_type", "resource_id", "resource_url",
-		"created_at", "expires_at", "backfill", "deleted_at",
+		"created_at", "expires_at", "backfill", "deleted_at", "unsubscribed_by_user",
 	},
 	"watcher_resource_relationships": {
 		"id", "child_type", "child_id", "child_url", "parent_type",
@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS watcher_subscriptions (
 	created_at TEXT NOT NULL,
 	expires_at TEXT,
 	backfill INTEGER NOT NULL DEFAULT 0,
-	deleted_at TEXT
+	deleted_at TEXT,
+	unsubscribed_by_user INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS watcher_resource_relationships (
