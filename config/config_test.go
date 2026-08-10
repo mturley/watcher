@@ -118,6 +118,38 @@ func TestLoadConfigJiraBotUsernames(t *testing.T) {
 	}
 }
 
+func TestLoadConfigIgnoresWorldReadablePermissions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	yamlContent := "jira:\n  bot_usernames:\n    - bot1\n    - bot2\n"
+	if err := os.WriteFile(path, []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: expected no error for world-readable config.yaml, got %v", err)
+	}
+	want := []string{"bot1", "bot2"}
+	if got := cfg.JiraBotUsernames(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("JiraBotUsernames() = %v, want %v", got, want)
+	}
+}
+
+func TestLoadConfigSurfacesParseError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	if err := os.WriteFile(path, []byte("jira: [not-a-map]\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("expected error for malformed config.yaml, got nil")
+	}
+}
+
 func TestConfigDefaultPathHonorsWatcherHome(t *testing.T) {
 	t.Setenv("WATCHER_HOME", "/tmp/wh")
 	if got := ConfigDefaultPath(); got != "/tmp/wh/config.yaml" {

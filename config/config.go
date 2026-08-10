@@ -1,7 +1,10 @@
 // Package config reads and writes the watcher library's shared
 // configuration file: service credentials, Jira custom field IDs, and a
 // registry of consumer databases. See the design spec's "Shared
-// Configuration" section for the YAML shape.
+// Configuration" section for the YAML shape. The package also owns a
+// separate behavior config file (config.yaml) holding non-secret
+// behavior settings, such as Jira bot usernames, that need not be
+// protected by the same permission checks as credentials.
 package config
 
 import (
