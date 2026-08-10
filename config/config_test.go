@@ -74,6 +74,57 @@ func TestDefaultPathUsesAuthYAML(t *testing.T) {
 	}
 }
 
+func TestLoadConfigMissingFileReturnsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil ConfigFile")
+	}
+	if cfg.Jira != nil {
+		t.Fatalf("expected nil Jira behavior block, got %+v", cfg.Jira)
+	}
+	if got := cfg.JiraBotUsernames(); got != nil {
+		t.Fatalf("expected nil bot usernames, got %v", got)
+	}
+}
+
+func TestLoadConfigJiraBotUsernames(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	yamlContent := "jira:\n  bot_usernames:\n    - bot1\n    - bot2\n"
+	if err := os.WriteFile(path, []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Jira == nil {
+		t.Fatal("expected non-nil Jira behavior block")
+	}
+	want := []string{"bot1", "bot2"}
+	if strings.Join(cfg.Jira.BotUsernames, ",") != strings.Join(want, ",") {
+		t.Fatalf("Jira.BotUsernames = %v, want %v", cfg.Jira.BotUsernames, want)
+	}
+	if got := cfg.JiraBotUsernames(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("JiraBotUsernames() = %v, want %v", got, want)
+	}
+}
+
+func TestConfigDefaultPathHonorsWatcherHome(t *testing.T) {
+	t.Setenv("WATCHER_HOME", "/tmp/wh")
+	if got := ConfigDefaultPath(); got != "/tmp/wh/config.yaml" {
+		t.Fatalf("ConfigDefaultPath = %q, want /tmp/wh/config.yaml", got)
+	}
+}
+
 func TestRegisterConsumerRoundTrip(t *testing.T) {
 	cfg := &Config{}
 	cfg.RegisterConsumer("handler", "~/.agent-handler/handler.db")

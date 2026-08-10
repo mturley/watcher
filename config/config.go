@@ -69,6 +69,66 @@ type SlackCreds struct {
 	Token string
 }
 
+// ConfigFile is the top-level shape of the watcher library's separate
+// behavior config file ("config.yaml"), as distinct from the
+// credentials-holding auth.yaml handled by Config/Load/Save above.
+type ConfigFile struct {
+	Jira *JiraBehavior `yaml:"jira,omitempty"`
+}
+
+// JiraBehavior holds non-auth Jira behavior settings.
+type JiraBehavior struct {
+	// BotUsernames lists Jira usernames to classify as bots when
+	// attributing comment/changelog authors.
+	BotUsernames []string `yaml:"bot_usernames,omitempty"`
+}
+
+// JiraBotUsernames returns the configured bot usernames, or nil if no
+// Jira behavior block is configured.
+func (c *ConfigFile) JiraBotUsernames() []string {
+	if c.Jira == nil {
+		return nil
+	}
+	return c.Jira.BotUsernames
+}
+
+// ConfigDefaultPath returns the default behavior config file path,
+// "~/.config/watcher/config.yaml". Honors WATCHER_HOME (used by tests)
+// to override the base directory, exactly like DefaultPath does for
+// auth.yaml.
+func ConfigDefaultPath() string {
+	if dir := os.Getenv("WATCHER_HOME"); dir != "" {
+		return filepath.Join(dir, "config.yaml")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "watcher", "config.yaml")
+}
+
+// LoadConfig reads and parses the behavior config file at path. If the
+// file does not exist, LoadConfig returns an empty, zero-value
+// *ConfigFile (not an error), mirroring Load's missing-file behavior
+// for auth.yaml. Unlike Load, LoadConfig does not enforce file
+// permissions since config.yaml holds no credentials.
+func LoadConfig(path string) (*ConfigFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &ConfigFile{}, nil
+		}
+		return nil, fmt.Errorf("failed to read config %s: %w", path, err)
+	}
+
+	var cfg ConfigFile
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config %s: %w", path, err)
+	}
+
+	return &cfg, nil
+}
+
 // DefaultPath returns the default credentials file path,
 // "~/.config/watcher/auth.yaml". Honors WATCHER_HOME (used by tests)
 // to override the base directory.

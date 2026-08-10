@@ -247,6 +247,31 @@ entry, epic-link relationships are silently skipped. This mapping is a
 deferred, per-instance concern — there's no way to discover it
 generically from the API.
 
+### Behavior config (config.yaml)
+
+Separate from `auth.yaml`, the library also reads an optional behavior
+config file, by default at `~/.config/watcher/config.yaml`
+(`config.ConfigDefaultPath()`, also overridable via `WATCHER_HOME`),
+loaded with `config.LoadConfig`. Unlike `auth.yaml`, it holds no
+credentials, so it isn't subject to the same permission checks, and a
+missing file simply loads as empty defaults (not an error).
+
+```yaml
+jira:
+  bot_usernames:
+    - dependabot
+    - jira-automation
+```
+
+`bot_usernames` lists Jira usernames to classify as bots when
+attributing comment/changelog authors. Use `cfg.JiraBotUsernames()` for
+a nil-safe accessor:
+
+```go
+cfg, err := config.LoadConfig(config.ConfigDefaultPath())
+bots := cfg.JiraBotUsernames() // []string, or nil if unset
+```
+
 ## Resource ID formats
 
 | Type    | ID format                    | Example                            |
