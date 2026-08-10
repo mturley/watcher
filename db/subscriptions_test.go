@@ -460,6 +460,39 @@ func TestSubscribeIfAbsentNoOpOnLive(t *testing.T) {
 	}
 }
 
+func TestSubscribeRefreshNormalizesUserFlag(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "o/r#1"}
+	// Create a live row directly with the abnormal state: unsubscribed_by_user = 1
+	// while deleted_at is NULL (a live row)
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	// Manually set unsubscribed_by_user = 1 while keeping the row live
+	if _, err := c.Exec(`UPDATE watcher_subscriptions SET unsubscribed_by_user = 1 WHERE subscriber = ? AND resource_id = ?`, "sub", r.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Verify the abnormal state exists
+	all, _ := AllSubscriptions(c, "sub", false)
+	if len(all) != 1 || !all[0].UnsubscribedByUser {
+		t.Fatalf("test setup: expected live row with unsubscribed_by_user = 1, got %+v", all)
+	}
+
+	// Call Subscribe again (refresh) - should normalize the flag
+	if err := Subscribe(c, "sub", r, SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the flag is now normalized to 0
+	all, _ = AllSubscriptions(c, "sub", false)
+	if len(all) != 1 || all[0].UnsubscribedByUser {
+		t.Fatalf("Subscribe refresh should normalize unsubscribed_by_user to 0, got %+v", all)
+	}
+}
+
 func TestSubscribersOf(t *testing.T) {
 	c := mem(t)
 	if err := Migrate(c); err != nil {

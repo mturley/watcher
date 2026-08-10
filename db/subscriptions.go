@@ -90,7 +90,7 @@ func Subscribe(conn *sql.DB, subscriber string, r watcher.Resource, opts Subscri
 	// live (non-IfAbsent) → refresh; or non-user tombstone → reinstate
 	if _, err := conn.Exec(`
 		UPDATE watcher_subscriptions
-		SET resource_url = ?, expires_at = ?, backfill = ?, deleted_at = NULL
+		SET resource_url = ?, expires_at = ?, backfill = ?, deleted_at = NULL, unsubscribed_by_user = 0
 		WHERE id = ?
 	`, strPtr(r.URL), expiresAt, backfill, existingID); err != nil {
 		return fmt.Errorf("failed to reinstate/update subscription: %w", err)

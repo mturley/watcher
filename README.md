@@ -29,6 +29,8 @@ go get github.com/mturley/watcher@v0.2.0
 (if you're building against a pre-release commit, use the commit SHA or
 a branch instead.)
 
+**Note on upgrading from v0.1:** There is no in-place v0.1→v0.2 database upgrade path. If you have an existing v0.1 watcher database, you must delete it and let `db.Migrate` create a fresh v0.2 schema (the schema added a column and migration aborts if the table structure doesn't match).
+
 ## Quickstart
 
 ```go
