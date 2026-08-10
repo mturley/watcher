@@ -9,7 +9,7 @@ import (
 
 func TestSaveLoadRoundTripGitHubToken(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
+	path := filepath.Join(dir, "auth.yaml")
 
 	cfg := &Config{
 		Services: Services{
@@ -52,7 +52,7 @@ func TestJiraNotConfigured(t *testing.T) {
 
 func TestLoadRefusesGroupWorldReadable(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
+	path := filepath.Join(dir, "auth.yaml")
 
 	if err := os.WriteFile(path, []byte("services: {}\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -91,7 +91,7 @@ func TestRegisterConsumerRoundTrip(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
+	path := filepath.Join(dir, "auth.yaml")
 	if err := cfg.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
