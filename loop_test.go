@@ -46,7 +46,11 @@ func TestLoopContinuesAfterPollError(t *testing.T) {
 			return errors.New("transient") // every poll errors
 		})
 	}()
-	<-done
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Loop did not stop after cancel")
+	}
 	if calls.Load() < 3 {
 		t.Fatalf("Loop should keep ticking despite errors, got %d calls", calls.Load())
 	}
