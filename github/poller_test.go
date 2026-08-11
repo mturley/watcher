@@ -1,6 +1,7 @@
 package github
 
 import (
+	"database/sql"
 	"io"
 	"log"
 	"strings"
@@ -387,13 +388,23 @@ func TestProcessPR_PendingCIBundleRefreshesOnSetChange(t *testing.T) {
 	if types[watcher.EventTypeCIPending] != 1 {
 		t.Fatalf("expected ci_pending after first poll, got %+v", types)
 	}
-	firstTS := findCIEventTS(t, events)
 	firstTitle := findCIEventTitle(t, events)
+
+	// Directly mutate the stored bundle's title in the DB to a sentinel
+	// value before poll 2. This makes the no-churn assertion genuinely
+	// discriminating: comparing ts (second-resolution, same-second polls)
+	// or comparing recomputed title/body (identical inputs recompute to
+	// the identical string either way) can't tell "skipped" from "regressed
+	// to always-refresh" apart. But if poll 2 calls UpsertCIBundle at all,
+	// it will overwrite the sentinel with the freshly computed title — so
+	// asserting the sentinel survives poll 2 proves UpsertCIBundle did NOT
+	// run, i.e. the pendingChanged guard correctly skipped it.
+	const sentinelTitle = "SENTINEL-DO-NOT-OVERWRITE"
+	sentinelizeCIBundle(t, conn, sha, sentinelTitle)
 
 	// Poll 2: SAME pending set for the same commit. hasNewChecks is false
 	// (nothing completed), cursor is no longer empty, and the pending
-	// fingerprint is unchanged, so the bundle must NOT be refreshed — the
-	// event row's ts and title must stay exactly the same (no churn).
+	// fingerprint is unchanged, so the bundle must NOT be refreshed.
 	pending2 := PRData{
 		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
 		UpdatedAt: "2026-06-17T09:05:00Z",
@@ -414,11 +425,8 @@ func TestProcessPR_PendingCIBundleRefreshesOnSetChange(t *testing.T) {
 	if got := ciEventCount(events); got != 1 {
 		t.Fatalf("expected still 1 CI event after unchanged pending poll, got %d", got)
 	}
-	if got := findCIEventTS(t, events); got != firstTS {
-		t.Errorf("expected unchanged pending set to NOT refresh the bundle (ts should stay %q), got %q", firstTS, got)
-	}
-	if got := findCIEventTitle(t, events); got != firstTitle {
-		t.Errorf("expected unchanged pending set to NOT refresh the bundle (title should stay %q), got %q", firstTitle, got)
+	if got := findCIEventTitle(t, events); got != sentinelTitle {
+		t.Errorf("expected unchanged pending set to NOT refresh the bundle (title should still be sentinel %q), got %q — UpsertCIBundle ran when it shouldn't have", sentinelTitle, got)
 	}
 
 	// Poll 3: CHANGED pending set (a new check "lint" appears) for the same
@@ -455,6 +463,9 @@ func TestProcessPR_PendingCIBundleRefreshesOnSetChange(t *testing.T) {
 	}
 	newTitle := findCIEventTitle(t, events)
 	newBody := findCIEventBody(t, events)
+	if newTitle == sentinelTitle {
+		t.Errorf("expected the changed pending set to overwrite the sentinel title, but it survived: %q — UpsertCIBundle did not run when it should have", newTitle)
+	}
 	if newTitle == firstTitle {
 		t.Errorf("expected the title to reflect the new pending set (3/3 pending vs 2/2), got unchanged title %q", newTitle)
 	}
@@ -463,20 +474,43 @@ func TestProcessPR_PendingCIBundleRefreshesOnSetChange(t *testing.T) {
 	}
 	// Note: we don't assert that ts advanced here — UpsertCIBundle stamps
 	// ts with second-resolution RFC3339, so two polls in the same test run
-	// can legitimately land in the same second. The title/body change above
-	// is sufficient proof that UpsertCIBundle ran its UPDATE path again.
+	// can legitimately land in the same second. The title content change
+	// above (overwriting the sentinel) is sufficient proof that
+	// UpsertCIBundle ran its UPDATE path again.
 }
 
-// findCIEventTS returns the ts of the (single) CI bundle event.
-func findCIEventTS(t *testing.T, events []watcher.Event) string {
+// sentinelizeCIBundle directly overwrites the title of the CI bundle event
+// for the given commit SHA on prResource, bypassing UpsertCIBundle. This
+// gives the no-churn test a real discriminator: if a later poll calls
+// UpsertCIBundle at all, it will overwrite this sentinel back to a
+// freshly computed title. Comparing recomputed values (ts, or title/body
+// derived from identical inputs) can't distinguish "skipped" from
+// "regressed to always-refresh", but the sentinel can.
+func sentinelizeCIBundle(t *testing.T, conn *sql.DB, commitSHA, sentinelTitle string) {
 	t.Helper()
-	for _, e := range events {
-		if isCIEventType(e.Type) {
-			return e.TS
-		}
+	tag := "commit:" + commitSHA
+	res, err := conn.Exec(`
+		UPDATE watcher_events
+		SET title = ?
+		WHERE id IN (
+			SELECT e.id FROM watcher_events e
+			JOIN watcher_event_resources er ON e.id = er.event_id
+			WHERE e.source = 'github'
+			  AND e.type IN ('ci_passed', 'ci_failed', 'ci_pending', 'ci_partial_failure')
+			  AND er.resource_type = ? AND er.resource_id = ?
+			  AND e.tags = ?
+		)
+	`, sentinelTitle, prResource.Type, prResource.ID, tag)
+	if err != nil {
+		t.Fatalf("sentinelizeCIBundle: %v", err)
 	}
-	t.Fatal("no CI bundle event found")
-	return ""
+	n, err := res.RowsAffected()
+	if err != nil {
+		t.Fatalf("sentinelizeCIBundle RowsAffected: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("sentinelizeCIBundle: expected to update exactly 1 row, updated %d", n)
+	}
 }
 
 // findCIEventTitle returns the title of the (single) CI bundle event.

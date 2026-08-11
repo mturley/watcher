@@ -263,7 +263,12 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 	prevState, _ := db.GetResourceState(conn, "pr", resource.ID)
 	var prevStateMap map[string]interface{}
 	if prevState != nil {
-		_ = json.Unmarshal([]byte(prevState.StateJSON), &prevStateMap)
+		if json.Unmarshal([]byte(prevState.StateJSON), &prevStateMap) != nil {
+			// Malformed state_json: treat as "no prior state" rather than
+			// risking a partially-populated map (matches the old inline
+			// check's behavior of skipping cleanly on unmarshal error).
+			prevStateMap = nil
+		}
 	}
 
 	// Fetch remaining check contexts if paginated
@@ -589,6 +594,14 @@ func buildPRStateJSON(prData PRData) string {
 // purely-pending CI bundle would otherwise never refresh). Returns "" when
 // there are no pending checks, so callers can distinguish "nothing pending"
 // from "pending set unchanged".
+//
+// Each sorted name is encoded as "<len>:<name>" and segments are joined
+// with "\n". GitHub check names can contain commas, spaces, and even
+// newlines, so a plain delimiter-joined string (e.g. comma-separated)
+// could let two different check sets collide onto the same fingerprint
+// (e.g. {"a,b"} vs {"a", "b"}). Length-prefixing each name makes the
+// encoding unambiguous regardless of what characters appear in a name,
+// since the length tells the reader exactly where each name ends.
 func pendingCIFingerprint(prData PRData) string {
 	var names []string
 	for _, cr := range prData.CheckRuns {
@@ -600,5 +613,9 @@ func pendingCIFingerprint(prData PRData) string {
 		return ""
 	}
 	sort.Strings(names)
-	return prData.Commits.LatestSHA + "|" + strings.Join(names, ",")
+	segments := make([]string, len(names))
+	for i, n := range names {
+		segments[i] = fmt.Sprintf("%d:%s", len(n), n)
+	}
+	return prData.Commits.LatestSHA + "|" + strings.Join(segments, "\n")
 }
