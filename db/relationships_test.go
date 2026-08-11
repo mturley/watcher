@@ -47,3 +47,34 @@ func TestSiblingResources(t *testing.T) {
 		t.Fatalf("SiblingResources(NOPE) = %v, want empty", none)
 	}
 }
+
+// TestLinkResourcesUniqueIndexPreventsDuplicate directly exercises the
+// unique index added to close the TOCTOU race in GitHub issue #1: even
+// without the ON CONFLICT DO NOTHING clause helping, a second identical
+// insert attempt through LinkResources must not create a duplicate row.
+func TestLinkResourcesUniqueIndexPreventsDuplicate(t *testing.T) {
+	conn := mem(t)
+	if err := Migrate(conn); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	child := watcher.Resource{Type: "jira", ID: "TASK-2"}
+	parent := watcher.Resource{Type: "jira", ID: "EPIC-2"}
+
+	for i := 0; i < 2; i++ {
+		if err := LinkResources(conn, child, parent, "epic", "test"); err != nil {
+			t.Fatalf("LinkResources call %d: %v", i, err)
+		}
+	}
+
+	var count int
+	if err := conn.QueryRow(`
+		SELECT COUNT(*) FROM watcher_resource_relationships
+		WHERE child_type = ? AND child_id = ? AND parent_type = ? AND parent_id = ? AND relationship = ?
+	`, child.Type, child.ID, parent.Type, parent.ID, "epic").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1 (unique index should prevent duplicate)", count)
+	}
+}

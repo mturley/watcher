@@ -6,7 +6,17 @@ package db
 
 // CurrentSchemaVersion is the schema version this build of the library
 // expects. Migrate creates/upgrades the database to this version.
-const CurrentSchemaVersion = 1
+//
+// Bumped to 2 to add the unique index on watcher_resource_relationships
+// below (see idx_watcher_resource_relationships_unique). This bump is
+// required even though the index is purely additive and schemaDDL is
+// idempotent: Migrate short-circuits and skips re-running schemaDDL
+// entirely when the recorded version already equals CurrentSchemaVersion,
+// so a database already at version 1 would never pick up the new index
+// without this bump. managedColumns is unaffected (indexes aren't part
+// of the collision check), so the bump doesn't interact with
+// checkForCollisions.
+const CurrentSchemaVersion = 2
 
 // managedTables is the exact set of tables Migrate owns.
 var managedTables = []string{
@@ -120,4 +130,5 @@ CREATE INDEX IF NOT EXISTS idx_watcher_event_resources_event_id ON watcher_event
 CREATE INDEX IF NOT EXISTS idx_watcher_event_resources_resource ON watcher_event_resources (resource_type, resource_id);
 CREATE INDEX IF NOT EXISTS idx_watcher_subscriptions_resource ON watcher_subscriptions (resource_type, resource_id, deleted_at, expires_at);
 CREATE INDEX IF NOT EXISTS idx_watcher_subscriptions_subscriber ON watcher_subscriptions (subscriber);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_watcher_resource_relationships_unique ON watcher_resource_relationships (child_type, child_id, parent_type, parent_id, relationship);
 `
