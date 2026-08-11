@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"time"
 
@@ -52,6 +53,16 @@ func UpsertCIBundle(conn *sql.DB, commitSHA string, t watcher.EventType, title, 
 		}
 		return cause
 	}
+	// commitFailed handles a failed COMMIT. The connection's transaction
+	// state is unknown at that point (it may still be mid-transaction),
+	// so best-effort ROLLBACK it and then poison the pinned *sql.Conn so
+	// database/sql discards it from the pool on Close instead of handing
+	// a possibly-still-in-transaction connection to the next caller.
+	commitFailed := func(commitErr error) error {
+		_, _ = c.ExecContext(ctx, "ROLLBACK")
+		_ = c.Raw(func(driverConn any) error { return driver.ErrBadConn })
+		return fmt.Errorf("failed to commit transaction: %w", commitErr)
+	}
 
 	var existingID string
 	err = c.QueryRowContext(ctx, `
@@ -75,7 +86,7 @@ func UpsertCIBundle(conn *sql.DB, commitSHA string, t watcher.EventType, title, 
 			return rollback(fmt.Errorf("failed to update CI bundle: %w", err))
 		}
 		if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
-			return fmt.Errorf("failed to commit transaction: %w", err)
+			return commitFailed(err)
 		}
 		return nil
 	}
@@ -97,7 +108,7 @@ func UpsertCIBundle(conn *sql.DB, commitSHA string, t watcher.EventType, title, 
 	}
 
 	if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return commitFailed(err)
 	}
 
 	return nil

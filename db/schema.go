@@ -16,6 +16,16 @@ package db
 // without this bump. managedColumns is unaffected (indexes aren't part
 // of the collision check), so the bump doesn't interact with
 // checkForCollisions.
+//
+// CAUTION: CREATE UNIQUE INDEX IF NOT EXISTS still fails on data
+// conflicts, not just on an already-existing index. If a database
+// somehow accumulated duplicate watcher_resource_relationships rows for
+// the same (child_type, child_id, parent_type, parent_id, relationship)
+// before upgrading to v2 (shouldn't happen — the pre-v2 LinkResources
+// prevented duplicates via a preceding SELECT, race conditions aside),
+// the v1->v2 migration will fail loudly and leave the database at v1
+// rather than silently corrupting data. Such duplicates must be removed
+// by hand before Migrate can proceed.
 const CurrentSchemaVersion = 2
 
 // managedTables is the exact set of tables Migrate owns.

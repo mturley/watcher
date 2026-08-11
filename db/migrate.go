@@ -23,6 +23,10 @@ func Migrate(conn *sql.DB) error {
 		return nil
 	}
 
+	if err := ensureAdditiveColumns(conn); err != nil {
+		return err
+	}
+
 	if err := checkForCollisions(conn); err != nil {
 		return err
 	}
@@ -73,6 +77,65 @@ func SchemaVersion(conn *sql.DB) (int, error) {
 		return 0, nil
 	}
 	return 0, fmt.Errorf("watcher: reading schema version: %w", err)
+}
+
+// additiveColumns lists columns that were added to a managed table's
+// schema (both managedColumns and schemaDDL's CREATE TABLE) without a
+// corresponding CurrentSchemaVersion bump at the time they were
+// introduced — e.g. unsubscribed_by_user was added to
+// watcher_subscriptions in this way. Because schemaDDL only ever issues
+// CREATE TABLE IF NOT EXISTS (it cannot ALTER an existing table),
+// databases that were already migrated before such a column existed
+// have a narrower table than managedColumns now expects.
+//
+// ensureAdditiveColumns reconciles this gap with an explicit ALTER
+// TABLE ADD COLUMN, and MUST run before checkForCollisions: otherwise a
+// legitimately-historical (but now stale) table shape would be reported
+// as an "unexpected schema" collision and Migrate would refuse to run,
+// even though the only problem is a column this package itself knows
+// how to add. Only columns listed here are auto-added; a table with any
+// other mismatch is still rejected by checkForCollisions as before, so
+// TestMigrateAbortsOnAlienWatcherTable-style protection against
+// genuinely alien tables is unaffected.
+var additiveColumns = map[string]map[string]string{
+	"watcher_subscriptions": {
+		"unsubscribed_by_user": "INTEGER NOT NULL DEFAULT 0",
+	},
+}
+
+// ensureAdditiveColumns adds any column in additiveColumns that is
+// missing from an existing managed table. It is a no-op for tables that
+// don't exist yet (schemaDDL will create them with the column already
+// present) and for columns that are already present.
+func ensureAdditiveColumns(conn *sql.DB) error {
+	for table, cols := range additiveColumns {
+		exists, err := tableExists(conn, table)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+
+		actual, err := tableColumns(conn, table)
+		if err != nil {
+			return err
+		}
+		have := make(map[string]bool, len(actual))
+		for _, c := range actual {
+			have[c] = true
+		}
+
+		for col, def := range cols {
+			if have[col] {
+				continue
+			}
+			if _, err := conn.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, col, def)); err != nil {
+				return fmt.Errorf("watcher: adding column %q to table %q: %w", col, table, err)
+			}
+		}
+	}
+	return nil
 }
 
 // checkForCollisions verifies that any managed table already present in
