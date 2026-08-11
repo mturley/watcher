@@ -3,6 +3,7 @@ package github
 import (
 	"io"
 	"log"
+	"strings"
 	"testing"
 
 	"github.com/mturley/watcher"
@@ -342,6 +343,175 @@ func TestProcessPR_CIBundleUpsert(t *testing.T) {
 	if types[watcher.EventTypeCIPending] != 0 {
 		t.Errorf("expected no lingering ci_pending event, got %d", types[watcher.EventTypeCIPending])
 	}
+}
+
+// TestProcessPR_PendingCIBundleRefreshesOnSetChange is a regression test for
+// GitHub issue #2: a purely-pending CI bundle (no completed checks) must be
+// recorded on first poll, must NOT be refreshed on a later poll where the
+// pending set is unchanged (to avoid churn), and MUST be refreshed in place
+// when the pending set changes.
+func TestProcessPR_PendingCIBundleRefreshesOnSetChange(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	const sha = "deadbeef1234"
+
+	// Poll 1: purely-pending CI (no completed checks at all) on the very
+	// first poll for this resource (cursor == "", backfill enabled so
+	// processing falls through instead of short-circuiting to
+	// watch_started), so the existing "cursor == ''" trigger records the
+	// bundle — this is the "first/backfill poll" the issue describes.
+	pending1 := PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T09:00:00Z",
+		Commits:   CommitInfo{LatestSHA: sha, LatestDate: "2026-06-17T08:00:00Z"},
+		CheckRuns: []CheckRun{
+			{Name: "build", Status: "IN_PROGRESS"},
+			{Name: "test", Status: "QUEUED"},
+		},
+	}
+	if _, err := processPR(conn, pending1, prResource, "test-token", true, testLogger()); err != nil {
+		t.Fatalf("processPR pending1: %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if got := ciEventCount(events); got != 1 {
+		t.Fatalf("expected 1 CI event after first pending poll, got %d", got)
+	}
+	types := typeCounts(events)
+	if types[watcher.EventTypeCIPending] != 1 {
+		t.Fatalf("expected ci_pending after first poll, got %+v", types)
+	}
+	firstTS := findCIEventTS(t, events)
+	firstTitle := findCIEventTitle(t, events)
+
+	// Poll 2: SAME pending set for the same commit. hasNewChecks is false
+	// (nothing completed), cursor is no longer empty, and the pending
+	// fingerprint is unchanged, so the bundle must NOT be refreshed — the
+	// event row's ts and title must stay exactly the same (no churn).
+	pending2 := PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T09:05:00Z",
+		Commits:   CommitInfo{LatestSHA: sha, LatestDate: "2026-06-17T08:00:00Z"},
+		CheckRuns: []CheckRun{
+			{Name: "build", Status: "IN_PROGRESS"},
+			{Name: "test", Status: "QUEUED"},
+		},
+	}
+	if _, err := processPR(conn, pending2, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR pending2: %v", err)
+	}
+
+	events, err = db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if got := ciEventCount(events); got != 1 {
+		t.Fatalf("expected still 1 CI event after unchanged pending poll, got %d", got)
+	}
+	if got := findCIEventTS(t, events); got != firstTS {
+		t.Errorf("expected unchanged pending set to NOT refresh the bundle (ts should stay %q), got %q", firstTS, got)
+	}
+	if got := findCIEventTitle(t, events); got != firstTitle {
+		t.Errorf("expected unchanged pending set to NOT refresh the bundle (title should stay %q), got %q", firstTitle, got)
+	}
+
+	// Poll 3: CHANGED pending set (a new check "lint" appears) for the same
+	// commit. The pending fingerprint now differs from what was cached, so
+	// the bundle MUST be refreshed in place: still exactly one CI event for
+	// the resource (UPDATE, not INSERT), but its title/body reflect the new
+	// set.
+	pending3 := PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T09:10:00Z",
+		Commits:   CommitInfo{LatestSHA: sha, LatestDate: "2026-06-17T08:00:00Z"},
+		CheckRuns: []CheckRun{
+			{Name: "build", Status: "IN_PROGRESS"},
+			{Name: "test", Status: "QUEUED"},
+			{Name: "lint", Status: "IN_PROGRESS"},
+		},
+	}
+	if _, err := processPR(conn, pending3, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR pending3: %v", err)
+	}
+
+	events, err = db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	// Still exactly one CI bundle event: the change must UPDATE the existing
+	// row (via UpsertCIBundle's match-by-commit-tag), not insert a new one.
+	if got := ciEventCount(events); got != 1 {
+		t.Fatalf("expected still 1 CI event after changed pending poll (updated in place), got %d", got)
+	}
+	types = typeCounts(events)
+	if types[watcher.EventTypeCIPending] != 1 {
+		t.Fatalf("expected the refreshed bundle to still be ci_pending, got %+v", types)
+	}
+	newTitle := findCIEventTitle(t, events)
+	newBody := findCIEventBody(t, events)
+	if newTitle == firstTitle {
+		t.Errorf("expected the title to reflect the new pending set (3/3 pending vs 2/2), got unchanged title %q", newTitle)
+	}
+	if !strings.Contains(newBody, "lint") {
+		t.Errorf("expected the refreshed body to mention the new pending check %q, got %q", "lint", newBody)
+	}
+	// Note: we don't assert that ts advanced here — UpsertCIBundle stamps
+	// ts with second-resolution RFC3339, so two polls in the same test run
+	// can legitimately land in the same second. The title/body change above
+	// is sufficient proof that UpsertCIBundle ran its UPDATE path again.
+}
+
+// findCIEventTS returns the ts of the (single) CI bundle event.
+func findCIEventTS(t *testing.T, events []watcher.Event) string {
+	t.Helper()
+	for _, e := range events {
+		if isCIEventType(e.Type) {
+			return e.TS
+		}
+	}
+	t.Fatal("no CI bundle event found")
+	return ""
+}
+
+// findCIEventTitle returns the title of the (single) CI bundle event.
+func findCIEventTitle(t *testing.T, events []watcher.Event) string {
+	t.Helper()
+	for _, e := range events {
+		if isCIEventType(e.Type) {
+			return e.Title
+		}
+	}
+	t.Fatal("no CI bundle event found")
+	return ""
+}
+
+// findCIEventBody returns the body of the (single) CI bundle event.
+func findCIEventBody(t *testing.T, events []watcher.Event) string {
+	t.Helper()
+	for _, e := range events {
+		if isCIEventType(e.Type) {
+			if e.Body == nil {
+				return ""
+			}
+			return *e.Body
+		}
+	}
+	t.Fatal("no CI bundle event found")
+	return ""
+}
+
+func isCIEventType(t watcher.EventType) bool {
+	switch t {
+	case watcher.EventTypeCIPassed, watcher.EventTypeCIFailed, watcher.EventTypeCIPending, watcher.EventTypeCIPartialFailure:
+		return true
+	}
+	return false
 }
 
 // typeCounts tallies events by type.

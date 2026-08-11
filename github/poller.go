@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -257,6 +258,14 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 		logger.Printf("Emitted pr_review_comment for %s by %s on %s", resource.ID, reviewComment.Author, reviewComment.Path)
 	}
 
+	// Read previous resource state once, used both by the CI-pending-refresh
+	// check below and by the new-commits detection further down.
+	prevState, _ := db.GetResourceState(conn, "pr", resource.ID)
+	var prevStateMap map[string]interface{}
+	if prevState != nil {
+		_ = json.Unmarshal([]byte(prevState.StateJSON), &prevStateMap)
+	}
+
 	// Fetch remaining check contexts if paginated
 	if prData.CheckRunsHasMore && prData.CheckRunsEndCursor != "" {
 		moreRuns, err := FetchRemainingCheckContexts(token, prData.Owner, prData.Repo, prData.Number, prData.CheckRunsEndCursor)
@@ -277,7 +286,18 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 			}
 		}
 
-		if hasNewChecks || cursor == "" {
+		// A purely-pending CI state never produces a newly-completed check,
+		// so hasNewChecks stays false and the bundle would otherwise only be
+		// recorded once (on the first/backfill poll) and never refresh while
+		// checks remain pending (GitHub issue #2). Detect that the set of
+		// pending checks changed since the last poll and treat that as a
+		// trigger too, so the bundle stays live without re-emitting on every
+		// poll when nothing has actually changed.
+		curFP := pendingCIFingerprint(prData)
+		prevFP, _ := prevStateMap["ci_pending_fingerprint"].(string)
+		pendingChanged := curFP != "" && curFP != prevFP
+
+		if hasNewChecks || cursor == "" || pendingChanged {
 			passed, failed, pending := 0, 0, 0
 			var latestTS string
 			var failedNames, pendingNames, passedNames []string
@@ -386,32 +406,27 @@ skipCIBundle:
 	}
 
 	// Detect new commits by comparing latest SHA against previous state
-	if prData.Commits.LatestSHA != "" {
-		prevState, _ := db.GetResourceState(conn, "pr", resource.ID)
-		if prevState != nil {
-			var prev map[string]interface{}
-			if json.Unmarshal([]byte(prevState.StateJSON), &prev) == nil {
-				prevSHA, _ := prev["latest_commit_sha"].(string)
-				if prevSHA != "" && prevSHA != prData.Commits.LatestSHA {
-					dup, err := db.IsDuplicate(conn, db.DedupCheck{
-						Source:       "github",
-						ResourceType: resource.Type,
-						ResourceID:   resource.ID,
-						Type:         watcher.EventTypePRNewCommits,
-						ExternalTS:   &prData.Commits.LatestDate,
-					})
-					if err != nil {
-						logger.Printf("WARNING: failed to check new commits duplicate: %v", err)
-					} else if !dup {
-						title := fmt.Sprintf("New commits pushed to PR #%d", prData.Number)
-						body := formatNewCommitsBody(prData, prevSHA)
-						if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, nil, nil, resource); err != nil {
-							logger.Printf("WARNING: failed to emit new commits event: %v", err)
-						} else {
-							eventCount++
-							logger.Printf("Emitted pr_new_commits for %s", resource.ID)
-						}
-					}
+	// (reuses prevStateMap read near the top of this function).
+	if prData.Commits.LatestSHA != "" && prevStateMap != nil {
+		prevSHA, _ := prevStateMap["latest_commit_sha"].(string)
+		if prevSHA != "" && prevSHA != prData.Commits.LatestSHA {
+			dup, err := db.IsDuplicate(conn, db.DedupCheck{
+				Source:       "github",
+				ResourceType: resource.Type,
+				ResourceID:   resource.ID,
+				Type:         watcher.EventTypePRNewCommits,
+				ExternalTS:   &prData.Commits.LatestDate,
+			})
+			if err != nil {
+				logger.Printf("WARNING: failed to check new commits duplicate: %v", err)
+			} else if !dup {
+				title := fmt.Sprintf("New commits pushed to PR #%d", prData.Number)
+				body := formatNewCommitsBody(prData, prevSHA)
+				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, nil, nil, resource); err != nil {
+					logger.Printf("WARNING: failed to emit new commits event: %v", err)
+				} else {
+					eventCount++
+					logger.Printf("Emitted pr_new_commits for %s", resource.ID)
 				}
 			}
 		}
@@ -561,7 +576,29 @@ func buildPRStateJSON(prData PRData) string {
 		"has_new_commits_since_review": hasNewCommitsSinceReview(prData),
 		"ci_status":                    deriveCIStatus(prData.CheckRuns),
 		"latest_commit_sha":            prData.Commits.LatestSHA,
+		"ci_pending_fingerprint":       pendingCIFingerprint(prData),
 	}
 	data, _ := json.Marshal(state)
 	return string(data)
+}
+
+// pendingCIFingerprint computes a stable fingerprint of the currently
+// pending (IN_PROGRESS or QUEUED) check runs for the latest commit, so
+// callers can detect when the set of pending checks changes between polls
+// even though no check has newly completed (see GitHub issue #2: a
+// purely-pending CI bundle would otherwise never refresh). Returns "" when
+// there are no pending checks, so callers can distinguish "nothing pending"
+// from "pending set unchanged".
+func pendingCIFingerprint(prData PRData) string {
+	var names []string
+	for _, cr := range prData.CheckRuns {
+		if cr.Status == "IN_PROGRESS" || cr.Status == "QUEUED" {
+			names = append(names, cr.Name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	return prData.Commits.LatestSHA + "|" + strings.Join(names, ",")
 }
