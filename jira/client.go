@@ -25,6 +25,7 @@ type IssueData struct {
 	Priority     string
 	IssueType    string
 	Assignee     *string
+	Reporter     *string
 	Labels       []string
 	CreatedAt    string
 	UpdatedAt    string
@@ -77,7 +78,7 @@ func normalizeBaseURL(host string) string {
 // expand=changelog silently caps at the 100 most recent entries, dropping the
 // oldest history on active issues.
 func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (*IssueData, error) {
-	fields := "summary,status,assignee,labels,priority,issuetype,created,updated"
+	fields := "summary,status,assignee,reporter,labels,priority,issuetype,created,updated"
 	for _, fieldID := range customFieldIDs {
 		fields += "," + fieldID
 	}
@@ -106,6 +107,9 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 			Assignee *struct {
 				DisplayName string `json:"displayName"`
 			} `json:"assignee"`
+			Reporter *struct {
+				DisplayName string `json:"displayName"`
+			} `json:"reporter"`
 			Labels  []string `json:"labels"`
 			Created string   `json:"created"`
 			Updated string   `json:"updated"`
@@ -145,6 +149,9 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 
 	if raw.Fields.Assignee != nil {
 		issue.Assignee = &raw.Fields.Assignee.DisplayName
+	}
+	if raw.Fields.Reporter != nil {
+		issue.Reporter = &raw.Fields.Reporter.DisplayName
 	}
 
 	// Extract custom fields

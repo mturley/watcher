@@ -160,18 +160,30 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 		return eventCount, nil
 	}
 
-	// Process reviews
+	// Process reviews. APPROVED and CHANGES_REQUESTED map to their own
+	// event types; every other submitted review state (COMMENTED, and
+	// defensively any future state) is emitted as a review event too, so
+	// top-level review summaries — e.g. CodeRabbit and other bots, which
+	// submit COMMENTED reviews rather than APPROVED/CHANGES_REQUESTED —
+	// reach subscribers instead of being silently dropped. DISMISSED and
+	// PENDING reviews are skipped (no submittedAt / not surfaced to users).
 	for _, review := range prData.Reviews {
 		if review.SubmittedAt <= cursor {
 			continue
 		}
+		if review.State == "DISMISSED" || review.State == "PENDING" {
+			continue
+		}
 
-		// Skip duplicate events
+		eventType := reviewEventType(review.State)
+
+		// Skip duplicate events (dedup by the review's submittedAt, which
+		// is unique per review).
 		dup, err := db.IsDuplicate(conn, db.DedupCheck{
 			Source:       "github",
 			ResourceType: resource.Type,
 			ResourceID:   resource.ID,
-			Type:         reviewEventType(review.State),
+			Type:         eventType,
 			ExternalTS:   &review.SubmittedAt,
 		})
 		if err != nil {
@@ -181,22 +193,21 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 			continue
 		}
 
-		// Emit event based on review state
-		if review.State == "APPROVED" {
-			title := fmt.Sprintf("PR approved by %s", review.Author)
-			if err := emitEvent(conn, watcher.EventTypePRApproved, title, &review.Body, review.SubmittedAt, &review.Author, &review.AuthorType, resource); err != nil {
-				return eventCount, fmt.Errorf("failed to emit pr_approved event: %w", err)
-			}
-			eventCount++
-			logger.Printf("Emitted pr_approved for %s by %s", resource.ID, review.Author)
-		} else if review.State == "CHANGES_REQUESTED" {
-			title := fmt.Sprintf("Changes requested by %s", review.Author)
-			if err := emitEvent(conn, watcher.EventTypePRReviewComment, title, &review.Body, review.SubmittedAt, &review.Author, &review.AuthorType, resource); err != nil {
-				return eventCount, fmt.Errorf("failed to emit pr_review_comment event: %w", err)
-			}
-			eventCount++
-			logger.Printf("Emitted pr_review_comment for %s by %s", resource.ID, review.Author)
+		var title string
+		switch review.State {
+		case "APPROVED":
+			title = fmt.Sprintf("PR approved by %s", review.Author)
+		case "CHANGES_REQUESTED":
+			title = fmt.Sprintf("Changes requested by %s", review.Author)
+		default: // COMMENTED and any other submitted state
+			title = fmt.Sprintf("PR review by %s", review.Author)
 		}
+
+		if err := emitEvent(conn, eventType, title, &review.Body, review.SubmittedAt, &review.Author, &review.AuthorType, resource); err != nil {
+			return eventCount, fmt.Errorf("failed to emit %s event: %w", eventType, err)
+		}
+		eventCount++
+		logger.Printf("Emitted %s for %s by %s", eventType, resource.ID, review.Author)
 	}
 
 	// Process comments
@@ -228,9 +239,13 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 	}
 
 	// Process review comments (inline code comments).
-	// Batch-submitted reviews have multiple comments with the same createdAt.
-	// Use title-based dedup (which includes the file path) instead of
-	// timestamp-only dedup.
+	// Dedup on BOTH title and createdAt: neither alone is safe. Title
+	// alone (author+path) collapses distinct comments by the same author
+	// on the same file across different reviews (e.g. a bot re-commenting
+	// on a file it already flagged), permanently suppressing the later
+	// ones. Timestamp alone collapses distinct comments within one
+	// batch-submitted review, which all share a createdAt. Requiring both
+	// to match distinguishes both cases.
 	for _, reviewComment := range prData.ReviewComments {
 		if reviewComment.CreatedAt <= cursor {
 			continue
@@ -243,6 +258,7 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 			ResourceID:   resource.ID,
 			Type:         watcher.EventTypePRReviewComment,
 			Title:        &title,
+			ExternalTS:   &reviewComment.CreatedAt,
 		})
 		if err != nil {
 			return eventCount, fmt.Errorf("failed to check review comment duplicate: %w", err)
@@ -447,6 +463,9 @@ skipCIBundle:
 	return eventCount, nil
 }
 
+// reviewEventType maps a PR review state to an event type. APPROVED gets
+// its own type; CHANGES_REQUESTED, COMMENTED, and any other submitted
+// state map to the generic review-comment type.
 func reviewEventType(state string) watcher.EventType {
 	if state == "APPROVED" {
 		return watcher.EventTypePRApproved
@@ -576,6 +595,7 @@ func formatNewCommitsBody(prData PRData, prevSHA string) string {
 func buildPRStateJSON(prData PRData) string {
 	state := map[string]interface{}{
 		"title":                        prData.Title,
+		"author":                       prData.Author,
 		"state":                        prData.State,
 		"review_decision":              derivePRReviewDecision(prData.Reviews),
 		"has_new_commits_since_review": hasNewCommitsSinceReview(prData),

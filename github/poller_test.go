@@ -2,6 +2,7 @@ package github
 
 import (
 	"database/sql"
+	"encoding/json"
 	"io"
 	"log"
 	"strings"
@@ -265,6 +266,122 @@ func TestProcessPR_BatchReviewComments(t *testing.T) {
 	}
 	if got := typeCounts(events)[watcher.EventTypePRReviewComment]; got != 3 {
 		t.Errorf("expected still 3 pr_review_comment events after re-poll, got %d", got)
+	}
+}
+
+// TestProcessPR_RepeatReviewCommentSameFile is a regression test for the bug
+// where a second review comment by the same author on the same file path was
+// permanently suppressed because dedup used the title (author+path) alone.
+// CodeRabbit routinely re-comments on a file it has already flagged; the later
+// comment has a distinct createdAt and must emit.
+func TestProcessPR_RepeatReviewCommentSameFile(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Seed a cursor before any comments.
+	if _, err := processPR(conn, PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-08-10T14:00:00Z",
+	}, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("seed processPR: %v", err)
+	}
+
+	const path = "packages/foo/Bar.tsx"
+
+	// Poll 1: first comment on the file.
+	first := PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-08-10T15:37:12Z",
+		ReviewComments: []ReviewComment{
+			{Author: "coderabbitai", AuthorType: "bot", CreatedAt: "2026-08-10T15:37:12Z", Path: path, Body: "first pass"},
+		},
+	}
+	if _, err := processPR(conn, first, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR first: %v", err)
+	}
+
+	// Poll 2: SECOND comment by the same author on the SAME file, later ts.
+	second := PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-08-11T17:35:34Z",
+		ReviewComments: []ReviewComment{
+			{Author: "coderabbitai", AuthorType: "bot", CreatedAt: "2026-08-11T17:35:34Z", Path: path, Body: "second pass"},
+		},
+	}
+	if _, err := processPR(conn, second, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR second: %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	// Both comments must emit — same title, distinct createdAt.
+	if got := typeCounts(events)[watcher.EventTypePRReviewComment]; got != 2 {
+		t.Errorf("expected 2 pr_review_comment events (repeat comment on same file must not be deduped), got %d", got)
+	}
+
+	// Re-poll the second batch: same title AND same ts -> must be deduped.
+	if _, err := processPR(conn, second, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR second re-poll: %v", err)
+	}
+	events, err = db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if got := typeCounts(events)[watcher.EventTypePRReviewComment]; got != 2 {
+		t.Errorf("expected still 2 pr_review_comment events after re-poll (title+ts dedup), got %d", got)
+	}
+}
+
+// TestProcessPR_CommentedReview is a regression test for the bug where a review
+// submitted with state COMMENTED (as CodeRabbit and other bots do) emitted no
+// event at all — only APPROVED and CHANGES_REQUESTED were handled.
+func TestProcessPR_CommentedReview(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Seed a cursor before the review.
+	if _, err := processPR(conn, PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-08-11T17:00:00Z",
+	}, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("seed processPR: %v", err)
+	}
+
+	prData := PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-08-11T17:35:35Z",
+		Reviews: []Review{
+			{Author: "coderabbitai", AuthorType: "bot", State: "COMMENTED", SubmittedAt: "2026-08-11T17:35:35Z", Body: "Render the missing-configuration state."},
+		},
+	}
+	if _, err := processPR(conn, prData, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR: %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if got := typeCounts(events)[watcher.EventTypePRReviewComment]; got != 1 {
+		t.Errorf("expected 1 pr_review_comment event for a COMMENTED review, got %d", got)
+	}
+
+	// Re-poll: dedup by submittedAt must suppress the repeat.
+	if _, err := processPR(conn, prData, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR re-poll: %v", err)
+	}
+	events, err = db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if got := typeCounts(events)[watcher.EventTypePRReviewComment]; got != 1 {
+		t.Errorf("expected still 1 pr_review_comment event after re-poll, got %d", got)
 	}
 }
 
@@ -567,4 +684,31 @@ func ciEventCount(events []watcher.Event) int {
 		}
 	}
 	return n
+}
+
+// TestBuildPRStateJSON_Author verifies the cached PR state JSON includes the
+// PR author's login, so downstream consumers (e.g. the worktree UI) can
+// display who opened the PR.
+func TestBuildPRStateJSON_Author(t *testing.T) {
+	prData := PRData{
+		Number:     123,
+		Owner:      "owner",
+		Repo:       "repo",
+		State:      "OPEN",
+		Title:      "Test PR",
+		Author:     "alice",
+		AuthorType: "User",
+		UpdatedAt:  "2024-01-01T00:00:00Z",
+	}
+
+	stateJSON := buildPRStateJSON(prData)
+
+	var state map[string]interface{}
+	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+		t.Fatalf("failed to unmarshal state JSON: %v", err)
+	}
+
+	if got, want := state["author"], "alice"; got != want {
+		t.Errorf("state[\"author\"] = %v, want %v", got, want)
+	}
 }

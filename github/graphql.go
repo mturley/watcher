@@ -20,16 +20,18 @@ type PRRef struct {
 
 // PRData contains pull request data from GitHub GraphQL API.
 type PRData struct {
-	Number         int
-	Owner          string
-	Repo           string
-	State          string
-	Title          string
-	UpdatedAt      string
-	Reviews        []Review
-	Comments       []Comment
-	ReviewComments []ReviewComment
-	Commits        CommitInfo
+	Number              int
+	Owner               string
+	Repo                string
+	State               string
+	Title               string
+	Author              string
+	AuthorType          string
+	UpdatedAt           string
+	Reviews             []Review
+	Comments            []Comment
+	ReviewComments      []ReviewComment
+	Commits             CommitInfo
 	CheckRuns           []CheckRun
 	CheckRunsTotalCount int
 	CheckRunsHasMore    bool
@@ -189,6 +191,10 @@ func buildBatchedPRQuery(prs []PRRef) string {
         state
         title
         updatedAt
+        author {
+          __typename
+          login
+        }
         reviews(last: 20) {
           nodes {
             author {
@@ -335,14 +341,15 @@ func parseGraphQLResponse(data json.RawMessage, prs []PRRef) ([]PRData, *RateLim
 
 // prNode represents a PR node in the GraphQL response.
 type prNode struct {
-	Number        int                    `json:"number"`
-	State         string                 `json:"state"`
-	Title         string                 `json:"title"`
-	UpdatedAt     string                 `json:"updatedAt"`
-	Reviews       reviewsConnection      `json:"reviews"`
-	Comments      commentsConnection     `json:"comments"`
+	Number        int                     `json:"number"`
+	State         string                  `json:"state"`
+	Title         string                  `json:"title"`
+	Author        authorNode              `json:"author"`
+	UpdatedAt     string                  `json:"updatedAt"`
+	Reviews       reviewsConnection       `json:"reviews"`
+	Comments      commentsConnection      `json:"comments"`
 	ReviewThreads reviewThreadsConnection `json:"reviewThreads"`
-	Commits       commitsConnection      `json:"commits"`
+	Commits       commitsConnection       `json:"commits"`
 }
 
 type reviewsConnection struct {
@@ -392,10 +399,10 @@ type commitsConnection struct {
 
 type commitNode struct {
 	Commit struct {
-		OID                string              `json:"oid"`
-		CommittedDate      string              `json:"committedDate"`
-		MessageHeadline    string              `json:"messageHeadline"`
-		StatusCheckRollup  *statusCheckRollup  `json:"statusCheckRollup"`
+		OID               string             `json:"oid"`
+		CommittedDate     string             `json:"committedDate"`
+		MessageHeadline   string             `json:"messageHeadline"`
+		StatusCheckRollup *statusCheckRollup `json:"statusCheckRollup"`
 	} `json:"commit"`
 }
 
@@ -404,12 +411,12 @@ type statusCheckRollup struct {
 }
 
 type statusCheckContexts struct {
-	TotalCount int                   `json:"totalCount"`
+	TotalCount int `json:"totalCount"`
 	PageInfo   struct {
 		HasNextPage bool   `json:"hasNextPage"`
 		EndCursor   string `json:"endCursor"`
 	} `json:"pageInfo"`
-	Nodes      []statusCheckContext  `json:"nodes"`
+	Nodes []statusCheckContext `json:"nodes"`
 }
 
 type statusCheckContext struct {
@@ -428,12 +435,14 @@ type authorNode struct {
 // parsePRNode converts a prNode into a PRData struct.
 func parsePRNode(node *prNode, owner, repo string) PRData {
 	data := PRData{
-		Number:    node.Number,
-		Owner:     owner,
-		Repo:      repo,
-		State:     node.State,
-		Title:     node.Title,
-		UpdatedAt: node.UpdatedAt,
+		Number:     node.Number,
+		Owner:      owner,
+		Repo:       repo,
+		State:      node.State,
+		Title:      node.Title,
+		Author:     node.Author.Login,
+		AuthorType: authorType(node.Author.Typename),
+		UpdatedAt:  node.UpdatedAt,
 	}
 
 	// Parse reviews

@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mturley/watcher"
@@ -467,6 +468,75 @@ func TestFetchIssue_ChangelogPagination(t *testing.T) {
 	last := issue.Changelog[len(issue.Changelog)-1]
 	if last.To != "status-149" {
 		t.Errorf("expected last changelog entry To='status-149', got %q", last.To)
+	}
+}
+
+// TestFetchIssue_Reporter verifies that the issue's reporter display name is
+// parsed into IssueData.Reporter, so it can be cached in the poller's state
+// JSON for downstream consumers (e.g. the worktree UI).
+func TestFetchIssue_Reporter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/rest/api/3/issue/RHOAIENG-456":
+			// Verify reporter is requested in the explicit fields list.
+			if !strings.Contains(r.URL.Query().Get("fields"), "reporter") {
+				t.Errorf("expected fields query param to include \"reporter\", got %q", r.URL.Query().Get("fields"))
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"key": "RHOAIENG-456",
+				"fields": map[string]interface{}{
+					"summary":  "Issue with reporter",
+					"status":   map[string]interface{}{"name": "Open"},
+					"reporter": map[string]interface{}{"displayName": "Bob Reporter"},
+				},
+			})
+		case r.URL.Path == "/rest/api/3/issue/RHOAIENG-456/changelog":
+			json.NewEncoder(w).Encode(changelogPage(0, 0, true, 0))
+		case r.URL.Path == "/rest/api/3/issue/RHOAIENG-456/comment":
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"startAt": 0, "maxResults": 100, "total": 0, "comments": []interface{}{},
+			})
+		default:
+			http.Error(w, "not found: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL, Email: "e@x.com", Token: "t"}
+	issue, err := client.FetchIssue("RHOAIENG-456", nil)
+	if err != nil {
+		t.Fatalf("FetchIssue: %v", err)
+	}
+
+	if issue.Reporter == nil {
+		t.Fatal("expected Reporter to be set, got nil")
+	}
+	if got, want := *issue.Reporter, "Bob Reporter"; got != want {
+		t.Errorf("Reporter = %q, want %q", got, want)
+	}
+}
+
+// TestBuildJiraStateJSON_Reporter verifies the cached Jira state JSON
+// includes the issue reporter's display name.
+func TestBuildJiraStateJSON_Reporter(t *testing.T) {
+	reporter := "Bob Reporter"
+	issue := &IssueData{
+		Key:      "RHOAIENG-456",
+		Summary:  "Issue with reporter",
+		Status:   "Open",
+		Reporter: &reporter,
+	}
+
+	stateJSON := buildJiraStateJSON(issue)
+
+	var state map[string]interface{}
+	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+		t.Fatalf("failed to unmarshal state JSON: %v", err)
+	}
+
+	if got, want := state["reporter"], reporter; got != want {
+		t.Errorf("state[\"reporter\"] = %v, want %v", got, want)
 	}
 }
 
