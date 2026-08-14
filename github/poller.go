@@ -401,12 +401,17 @@ skipCIBundle:
 			eventType = watcher.EventTypePRClosed
 		}
 
+		// Terminal PR state (merged/closed) is once-per-resource: dedup on
+		// source+resource+type only. prData.UpdatedAt is the PR's mutable
+		// GitHub updatedAt field, which post-merge activity (comments,
+		// label changes, CI) continues to bump — keying dedup on it would
+		// let the merged/closed event re-fire on every such change.
 		dup, err := db.IsDuplicate(conn, db.DedupCheck{
-			Source:       "github",
-			ResourceType: resource.Type,
-			ResourceID:   resource.ID,
-			Type:         eventType,
-			ExternalTS:   &prData.UpdatedAt,
+			Source:        "github",
+			ResourceType:  resource.Type,
+			ResourceID:    resource.ID,
+			Type:          eventType,
+			MatchTypeOnly: true,
 		})
 		if err != nil {
 			return eventCount, fmt.Errorf("failed to check PR state duplicate: %w", err)

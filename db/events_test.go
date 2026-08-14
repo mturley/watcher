@@ -76,7 +76,7 @@ func TestIsDuplicateFalseCases(t *testing.T) {
 	}
 }
 
-func TestIsDuplicateRequiresExactlyOneMatcher(t *testing.T) {
+func TestIsDuplicateRequiresAtLeastOneMatcher(t *testing.T) {
 	c := mem(t)
 	if err := Migrate(c); err != nil {
 		t.Fatal(err)
@@ -86,9 +86,10 @@ func TestIsDuplicateRequiresExactlyOneMatcher(t *testing.T) {
 		t.Error("expected error when neither ExternalTS nor Title is set")
 	}
 
+	// Both set is now a valid mode (match on title AND external_ts).
 	ts := "2026-01-15T12:00:00Z"
 	title := "Comment by alice"
-	if _, err := IsDuplicate(c, DedupCheck{Source: "github", ResourceType: "pr", ResourceID: "owner/repo#1", Type: watcher.EventTypePRComment, ExternalTS: &ts, Title: &title}); err == nil {
-		t.Error("expected error when both ExternalTS and Title are set")
+	if _, err := IsDuplicate(c, DedupCheck{Source: "github", ResourceType: "pr", ResourceID: "owner/repo#1", Type: watcher.EventTypePRComment, ExternalTS: &ts, Title: &title}); err != nil {
+		t.Errorf("both ExternalTS and Title set should be allowed, got error: %v", err)
 	}
 }

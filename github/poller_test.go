@@ -172,6 +172,60 @@ func TestProcessPR_Dedup(t *testing.T) {
 	}
 }
 
+// TestProcessPR_MergedNoDuplicateAcrossUpdatedAtChange reproduces the
+// duplicate "PR merged" bug: prData.UpdatedAt is GitHub's mutable
+// updatedAt field, which keeps changing after merge due to unrelated
+// activity (comments, label changes, CI finishing). A second poll that
+// observes a new UpdatedAt on an already-merged PR must NOT re-emit
+// pr_merged.
+func TestProcessPR_MergedNoDuplicateAcrossUpdatedAtChange(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Seed a cursor via first poll while still open.
+	if _, err := processPR(conn, PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T08:00:00Z",
+	}, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("seed processPR: %v", err)
+	}
+
+	// Poll #1: PR is now merged.
+	merged := PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "MERGED", Title: "Test PR",
+		UpdatedAt: "2026-06-17T10:00:00Z",
+	}
+	if _, err := processPR(conn, merged, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR #1 (merged): %v", err)
+	}
+
+	// Poll #2 (~30 min later): PR is still merged, but UpdatedAt has been
+	// bumped by unrelated post-merge activity (e.g. a bot comment).
+	mergedLater := merged
+	mergedLater.UpdatedAt = "2026-06-17T10:30:00Z"
+	if _, err := processPR(conn, mergedLater, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR #2 (merged, later updatedAt): %v", err)
+	}
+
+	// Poll #3, for good measure, another 30 min later with yet another
+	// UpdatedAt bump.
+	mergedEvenLater := merged
+	mergedEvenLater.UpdatedAt = "2026-06-17T11:00:00Z"
+	if _, err := processPR(conn, mergedEvenLater, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR #3 (merged, even later updatedAt): %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if got := typeCounts(events)[watcher.EventTypePRMerged]; got != 1 {
+		t.Errorf("expected exactly 1 pr_merged event across 3 polls with changing UpdatedAt, got %d: %+v", got, events)
+	}
+}
+
 // TestProcessPR_Backfill verifies that a first poll with backfill enabled
 // emits all history rather than only a watch_started marker.
 func TestProcessPR_Backfill(t *testing.T) {
