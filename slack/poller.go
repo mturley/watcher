@@ -49,6 +49,16 @@ func Poll(conn *sql.DB, cfg SlackAuth, resources []watcher.Resource, logger *log
 			continue
 		}
 
+		// Guard the degenerate case of a thread with no messages (e.g. the
+		// root message was deleted out-of-band). Emitting watch_started with
+		// an empty ExternalTS would leave the cursor at "" forever, so the
+		// first-poll gate would re-fire a watch_started on every poll. Skip
+		// this resource this cycle rather than caching/emitting empty state.
+		if len(thread.Messages) == 0 {
+			logger.Printf("WARNING: slack thread %s has no messages; skipping this cycle", resource.ID)
+			continue
+		}
+
 		backfill, err := db.BackfillFor(conn, resource.Type, resource.ID)
 		if err != nil {
 			logger.Printf("WARNING: backfill resolve %s: %v", resource.ID, err)

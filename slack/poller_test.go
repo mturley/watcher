@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"testing"
@@ -25,22 +26,33 @@ var slackResource = watcher.Resource{
 }
 
 // fakeClient implements Client with real Replies/Users/Channel behavior for
-// the poller test; everything else returns zero values.
+// the poller test; everything else returns zero values. The repliesErr /
+// usersErr / channelErr fields let a test inject failures on those calls to
+// exercise the poller's error-handling and degradation paths.
 type fakeClient struct {
 	thread       Thread
 	users        map[string]User
 	channelName  string
 	channelCalls int
+	repliesErr   error
+	usersErr     error
+	channelErr   error
 }
 
 func (f *fakeClient) AuthTest(ctx context.Context) error         { return nil }
 func (f *fakeClient) WhoAmI(ctx context.Context) (string, error) { return "", nil }
 
 func (f *fakeClient) Replies(ctx context.Context, channel, threadTS string) (Thread, error) {
+	if f.repliesErr != nil {
+		return Thread{}, f.repliesErr
+	}
 	return f.thread, nil
 }
 
 func (f *fakeClient) Users(ctx context.Context, ids []string) (map[string]User, error) {
+	if f.usersErr != nil {
+		return nil, f.usersErr
+	}
 	out := make(map[string]User, len(ids))
 	for _, id := range ids {
 		if u, ok := f.users[id]; ok {
@@ -52,6 +64,9 @@ func (f *fakeClient) Users(ctx context.Context, ids []string) (map[string]User, 
 
 func (f *fakeClient) Channel(ctx context.Context, id string) (string, error) {
 	f.channelCalls++
+	if f.channelErr != nil {
+		return "", f.channelErr
+	}
 	return f.channelName, nil
 }
 
@@ -238,9 +253,190 @@ func TestPoll_NewReplyEmitsSlackReplyWithVerbatimTS(t *testing.T) {
 	}
 }
 
-// pollOnce drives the same sequence Poll performs for a single resource, but
+// eventTypeCount returns how many events of type t are linked to the resource.
+func eventTypeCount(t *testing.T, conn *sql.DB, resourceID string, evType watcher.EventType) int {
+	t.Helper()
+	var n int
+	if err := conn.QueryRow(`
+		SELECT COUNT(*) FROM watcher_events e
+		JOIN watcher_event_resources er ON er.event_id = e.id
+		WHERE er.resource_type = ? AND er.resource_id = ? AND e.type = ?
+	`, "slack", resourceID, string(evType)).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", evType, err)
+	}
+	return n
+}
+
+func TestPoll_RepliesErrorEmitsWatcherError(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	client := &fakeClient{repliesErr: errors.New("boom")}
+
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatalf("pollOnce should not return an error on a Replies failure, got %v", err)
+	}
+	if got := eventTypeCount(t, conn, slackResource.ID, watcher.EventTypeWatcherError); got != 1 {
+		t.Errorf("expected 1 watcher_error event on Replies failure, got %d", got)
+	}
+	// No watch_started / slack_reply should be emitted when the fetch failed.
+	if got := eventTypeCount(t, conn, slackResource.ID, watcher.EventTypeWatchStarted); got != 0 {
+		t.Errorf("expected 0 watch_started on Replies failure, got %d", got)
+	}
+}
+
+func TestPoll_ZeroMessageThreadEmitsNothing(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	// Root deleted out-of-band: Replies returns a thread with no messages.
+	client := &fakeClient{thread: Thread{Channel: "C1", ThreadTS: "1699000000.000100", Messages: nil}}
+
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	if got := eventTypeCount(t, conn, slackResource.ID, watcher.EventTypeWatchStarted); got != 0 {
+		t.Errorf("expected 0 watch_started for a zero-message thread, got %d", got)
+	}
+	// No resource_state row should have been written (empty ts would poison it).
+	st, err := db.GetResourceState(conn, "slack", slackResource.ID)
+	if err != nil {
+		t.Fatalf("GetResourceState: %v", err)
+	}
+	if st != nil {
+		t.Errorf("expected no resource_state for a zero-message thread, got %+v", st)
+	}
+}
+
+func TestPoll_UsersErrorEmitsReplyWithoutAuthor(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	root := Message{TS: "1699000000.000100", UserID: "U1", Text: "root message"}
+	reply := Message{TS: "1699000001.000200", UserID: "U2", Text: "a reply"}
+	client := &fakeClient{
+		thread:      Thread{Channel: "C1", ThreadTS: "1699000000.000100", Messages: []Message{root}},
+		channelName: "wg-dashboard-zaffre",
+		usersErr:    errors.New("users boom"),
+	}
+	// Poll #1 seeds cursor.
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatalf("poll #1: %v", err)
+	}
+	// Poll #2: a reply arrives, but Users() fails so author resolution degrades.
+	client.thread.Messages = []Message{root, reply}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatalf("poll #2: %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "slack", slackResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	var reply1 *watcher.Event
+	for i := range events {
+		if events[i].Type == watcher.EventTypeSlackReply {
+			reply1 = &events[i]
+		}
+	}
+	if reply1 == nil {
+		t.Fatal("expected a slack_reply event even when Users() failed")
+	}
+	if reply1.Author != nil {
+		t.Errorf("expected nil author when Users() failed, got %v", *reply1.Author)
+	}
+	if reply1.Body == nil || *reply1.Body != fallbackTitle(reply.Text) {
+		t.Errorf("Body = %v, want %q (no 'author: ' prefix)", reply1.Body, fallbackTitle(reply.Text))
+	}
+	// Cached author should be empty.
+	st, err := db.GetResourceState(conn, "slack", slackResource.ID)
+	if err != nil || st == nil {
+		t.Fatalf("GetResourceState: %v st=%v", err, st)
+	}
+	var state map[string]interface{}
+	if err := json.Unmarshal([]byte(st.StateJSON), &state); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if state["author"] != "" {
+		t.Errorf("cached author = %v, want empty on Users() failure", state["author"])
+	}
+}
+
+func TestPoll_ChannelErrorLeavesChannelEmptyAndRetries(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	root := Message{TS: "1699000000.000100", UserID: "U1", Text: "root message"}
+	client := &fakeClient{
+		thread:      Thread{Channel: "C1", ThreadTS: "1699000000.000100", Messages: []Message{root}},
+		channelName: "wg-dashboard-zaffre",
+		channelErr:  errors.New("channel boom"),
+	}
+	// Poll #1: Channel() fails → channel_name cached as "".
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatalf("poll #1: %v", err)
+	}
+	st, err := db.GetResourceState(conn, "slack", slackResource.ID)
+	if err != nil || st == nil {
+		t.Fatalf("GetResourceState: %v st=%v", err, st)
+	}
+	var state map[string]interface{}
+	if err := json.Unmarshal([]byte(st.StateJSON), &state); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if state["channel_name"] != "" {
+		t.Errorf("channel_name = %v, want empty on Channel() failure", state["channel_name"])
+	}
+	if client.channelCalls != 1 {
+		t.Fatalf("expected 1 Channel() call, got %d", client.channelCalls)
+	}
+	// Poll #2: since nothing was cached, Channel() is retried (and now succeeds).
+	client.channelErr = nil
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatalf("poll #2: %v", err)
+	}
+	if client.channelCalls != 2 {
+		t.Errorf("expected Channel() retried (2 calls) after a failed lookup, got %d", client.channelCalls)
+	}
+	st, _ = db.GetResourceState(conn, "slack", slackResource.ID)
+	_ = json.Unmarshal([]byte(st.StateJSON), &state)
+	if state["channel_name"] != "wg-dashboard-zaffre" {
+		t.Errorf("channel_name after retry = %v, want wg-dashboard-zaffre", state["channel_name"])
+	}
+}
+
+func TestPoll_MalformedResourceIDSkipped(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	bad := watcher.Resource{Type: "slack", ID: "no-colon-here"}
+	if err := db.Subscribe(conn, "test-sub", bad, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	client := &fakeClient{}
+	// Must not panic; returns nil and emits nothing for the bad id.
+	if err := pollOnce(conn, client, bad, testLogger()); err != nil {
+		t.Fatalf("pollOnce on malformed id should return nil, got %v", err)
+	}
+	events, err := db.EventsForResource(conn, "slack", bad.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("expected no events for a malformed resource id, got %d", len(events))
+	}
+}
+
+// pollOnce drives the SAME sequence Poll performs for a single resource,
 // against an injected fake Client (Poll itself always constructs a real
-// *HTTPClient via New(), so it can't be used directly with a fake here).
+// *HTTPClient via New(), so it can't be used directly with a fake). It mirrors
+// Poll's error branches — emitError + RecordPollerError on a Replies failure,
+// emitError on a processThread failure, the zero-message guard, and the state
+// cache write — so the tests exercise the real error-handling wiring rather
+// than a divergent shortcut. Per-resource "continue" in Poll maps to "return
+// nil" here (a single resource).
 func pollOnce(conn *sql.DB, client Client, resource watcher.Resource, logger *log.Logger) error {
 	channel, threadTS, ok := parseResourceID(resource.ID)
 	if !ok {
@@ -249,15 +445,30 @@ func pollOnce(conn *sql.DB, client Client, resource watcher.Resource, logger *lo
 	}
 	thread, err := client.Replies(context.Background(), channel, threadTS)
 	if err != nil {
-		return err
+		errBody := "Failed to fetch thread: " + err.Error()
+		if e := emitError(conn, "Failed to fetch "+resource.ID, &errBody, resource); e != nil {
+			logger.Printf("ERROR: emit watcher error: %v", e)
+		}
+		if e := db.RecordPollerError(conn, "slack", errBody); e != nil {
+			logger.Printf("ERROR: record poller error: %v", e)
+		}
+		return nil
+	}
+	if len(thread.Messages) == 0 {
+		logger.Printf("WARNING: slack thread %s has no messages; skipping this cycle", resource.ID)
+		return nil
 	}
 	backfill, err := db.BackfillFor(conn, resource.Type, resource.ID)
 	if err != nil {
-		return err
+		logger.Printf("WARNING: backfill resolve %s: %v", resource.ID, err)
 	}
 	names := resolveAuthors(client, thread.Messages)
 	if _, err := processThread(conn, thread, names, resource, backfill, logger); err != nil {
-		return err
+		errBody := "Failed to process thread: " + err.Error()
+		if e := emitError(conn, "Error processing "+resource.ID, &errBody, resource); e != nil {
+			logger.Printf("ERROR: emit watcher error: %v", e)
+		}
+		return nil
 	}
 	channelName := resolveChannelName(conn, client, resource, channel)
 	rootAuthor := ""
