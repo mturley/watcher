@@ -13,3 +13,9 @@ func TestDisplayNameFallsBackToRaw(t *testing.T) {
 		t.Errorf("got %q, want %q", got, "nonexistent")
 	}
 }
+
+func TestSlackReplyDisplayName(t *testing.T) {
+	if got := EventTypeSlackReply.DisplayName(); got != "Slack replies" {
+		t.Fatalf("EventTypeSlackReply.DisplayName() = %q, want %q", got, "Slack replies")
+	}
+}

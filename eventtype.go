@@ -23,6 +23,7 @@ const (
 	EventTypeJiraAssigned      EventType = "jira_assigned"
 	EventTypeJiraDescChanged   EventType = "jira_description_changed"
 	EventTypeJiraLabelsChanged EventType = "jira_labels_changed"
+	EventTypeSlackReply        EventType = "slack_reply"
 	EventTypeWatchStarted      EventType = "watch_started"
 	EventTypeWatcherError      EventType = "watcher_error"
 )
@@ -49,6 +50,7 @@ var eventTypeDisplayNames = map[EventType]string{
 	EventTypeJiraAssigned:      "assignments",
 	EventTypeJiraDescChanged:   "description changes",
 	EventTypeJiraLabelsChanged: "label changes",
+	EventTypeSlackReply:        "Slack replies",
 	EventTypeWatchStarted:      "watch started",
 	EventTypeWatcherError:      "watcher errors",
 }
