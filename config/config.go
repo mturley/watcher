@@ -44,9 +44,13 @@ type JiraConfig struct {
 	Token string `yaml:"token"`
 }
 
-// SlackConfig contains Slack API configuration (future).
+// SlackConfig contains Slack API credentials. Slack uses a browser user
+// session: a token (xoxc-) plus the d= cookie (xoxd-). WorkspaceDomain is
+// resolved at setup time (via team.info) and used to build permalinks.
 type SlackConfig struct {
-	Token string `yaml:"token"`
+	Token           string `yaml:"token"`
+	Cookie          string `yaml:"cookie"`
+	WorkspaceDomain string `yaml:"workspace_domain,omitempty"`
 }
 
 // Consumer is an entry in the consumer DB registry.
@@ -69,7 +73,9 @@ type JiraCreds struct {
 
 // SlackCreds are the typed credentials returned by (*Config).Slack.
 type SlackCreds struct {
-	Token string
+	Token           string
+	Cookie          string
+	WorkspaceDomain string
 }
 
 // ConfigFile is the top-level shape of the watcher library's separate
@@ -237,13 +243,17 @@ func (c *Config) Jira() (JiraCreds, error) {
 	}, nil
 }
 
-// Slack returns Slack credentials, or an error if Slack is not
-// configured. Slack support is a stub for now.
+// Slack returns Slack credentials, or an error if Slack is not fully
+// configured (both token and cookie are required).
 func (c *Config) Slack() (SlackCreds, error) {
-	if c.Services.Slack == nil || c.Services.Slack.Token == "" {
+	if c.Services.Slack == nil || c.Services.Slack.Token == "" || c.Services.Slack.Cookie == "" {
 		return SlackCreds{}, fmt.Errorf("slack not configured")
 	}
-	return SlackCreds{Token: c.Services.Slack.Token}, nil
+	return SlackCreds{
+		Token:           c.Services.Slack.Token,
+		Cookie:          c.Services.Slack.Cookie,
+		WorkspaceDomain: c.Services.Slack.WorkspaceDomain,
+	}, nil
 }
 
 // RegisterConsumer adds or updates a consumer's DB path in the

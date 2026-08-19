@@ -203,6 +203,26 @@ func TestConfigDefaultPathHonorsWatcherHome(t *testing.T) {
 	}
 }
 
+func TestSlackReturnsTokenCookieAndDomain(t *testing.T) {
+	c := &Config{Services: Services{Slack: &SlackConfig{
+		Token: "xoxc-1", Cookie: "xoxd-2", WorkspaceDomain: "acme.slack.com",
+	}}}
+	creds, err := c.Slack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creds.Token != "xoxc-1" || creds.Cookie != "xoxd-2" || creds.WorkspaceDomain != "acme.slack.com" {
+		t.Fatalf("got %+v", creds)
+	}
+}
+
+func TestSlackNotConfiguredWithoutCookie(t *testing.T) {
+	c := &Config{Services: Services{Slack: &SlackConfig{Token: "xoxc-1"}}} // no cookie
+	if _, err := c.Slack(); err == nil {
+		t.Fatal("expected error when cookie missing")
+	}
+}
+
 func TestRegisterConsumerRoundTrip(t *testing.T) {
 	cfg := &Config{}
 	cfg.RegisterConsumer("handler", "~/.agent-handler/handler.db")
