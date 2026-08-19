@@ -26,13 +26,23 @@ package db
 // the v1->v2 migration will fail loudly and leave the database at v1
 // rather than silently corrupting data. Such duplicates must be removed
 // by hand before Migrate can proceed.
-const CurrentSchemaVersion = 2
+//
+// Bumped to 3 to add watcher_resource_meta below. The bump is required
+// even though the table is purely additive and schemaDDL is idempotent:
+// Migrate short-circuits and skips re-running schemaDDL entirely when the
+// recorded version already equals CurrentSchemaVersion, so a database
+// already at version 2 would never create the new table without this bump.
+// A brand-new table is not part of managedColumns' collision check for
+// existing tables, so this doesn't interact with checkForCollisions beyond
+// adding the table to the managed set.
+const CurrentSchemaVersion = 3
 
 // managedTables is the exact set of tables Migrate owns.
 var managedTables = []string{
 	"watcher_schema_version", "watcher_events", "watcher_event_resources",
 	"watcher_resource_state", "watcher_subscriptions",
 	"watcher_resource_relationships", "watcher_poller_status",
+	"watcher_resource_meta",
 }
 
 // managedColumns maps each managed table to its expected set of column
@@ -61,6 +71,9 @@ var managedColumns = map[string][]string{
 	},
 	"watcher_poller_status": {
 		"name", "last_success", "last_error", "last_error_message",
+	},
+	"watcher_resource_meta": {
+		"resource_type", "resource_id", "custom_name", "custom_description",
 	},
 }
 
@@ -98,6 +111,14 @@ CREATE TABLE IF NOT EXISTS watcher_resource_state (
 	state_json TEXT NOT NULL,
 	resource_updated_at TEXT NOT NULL,
 	watcher_updated_at TEXT NOT NULL,
+	PRIMARY KEY (resource_type, resource_id)
+);
+
+CREATE TABLE IF NOT EXISTS watcher_resource_meta (
+	resource_type TEXT NOT NULL,
+	resource_id TEXT NOT NULL,
+	custom_name TEXT,
+	custom_description TEXT,
 	PRIMARY KEY (resource_type, resource_id)
 );
 
