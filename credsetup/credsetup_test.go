@@ -232,7 +232,7 @@ func TestTestAndRepair_Slack_UnconfiguredSetsWorkspaceDomain(t *testing.T) {
 	)
 
 	cfg := &config.Config{}
-	p := &fakePrompter{slackTokenResult: "tok", slackCookieResult: "cookie"}
+	p := &fakePrompter{confirmResult: true, slackTokenResult: "tok", slackCookieResult: "cookie"}
 
 	changed, err := TestAndRepair(cfg, Slack, p)
 	if err != nil {
@@ -252,6 +252,102 @@ func TestTestAndRepair_Slack_UnconfiguredSetsWorkspaceDomain(t *testing.T) {
 	}
 	if cfg.Services.Slack.WorkspaceDomain != "acme.slack.com" {
 		t.Fatalf("expected WorkspaceDomain=acme.slack.com, got %q", cfg.Services.Slack.WorkspaceDomain)
+	}
+}
+
+func TestTestAndRepair_GitHub_UnconfiguredConfirmNo(t *testing.T) {
+	withGitHubSeam(t, func(token string, apiURL ...string) error {
+		t.Fatalf("validate should not be called when unconfigured")
+		return nil
+	})
+
+	cfg := &config.Config{}
+	p := &fakePrompter{confirmResult: false}
+
+	changed, err := TestAndRepair(cfg, GitHub, p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if changed {
+		t.Fatalf("expected changed=false")
+	}
+	if len(p.promptCalls) != 0 {
+		t.Fatalf("expected no PromptToken call after declining configure confirm")
+	}
+	if cfg.Services.GitHub != nil {
+		t.Fatalf("expected cfg to remain unconfigured, got %+v", cfg.Services.GitHub)
+	}
+}
+
+func TestTestAndRepair_GitHub_UnconfiguredConfirmYesValidToken(t *testing.T) {
+	withGitHubSeam(t, func(token string, apiURL ...string) error { return nil })
+
+	cfg := &config.Config{}
+	p := &fakePrompter{confirmResult: true, tokenResults: []string{"new-token"}}
+
+	changed, err := TestAndRepair(cfg, GitHub, p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected changed=true")
+	}
+	if len(p.promptCalls) != 1 {
+		t.Fatalf("expected exactly one PromptToken call, got %d", len(p.promptCalls))
+	}
+	if cfg.Services.GitHub == nil || cfg.Services.GitHub.Token != "new-token" {
+		t.Fatalf("expected token set, got %+v", cfg.Services.GitHub)
+	}
+}
+
+func TestTestAndRepair_Slack_UnconfiguredConfirmNo(t *testing.T) {
+	withSlackSeam(t,
+		func(token, cookie string) error {
+			t.Fatalf("validate should not be called when unconfigured")
+			return nil
+		},
+		func(token, cookie string) string { return "" },
+	)
+
+	cfg := &config.Config{}
+	p := &fakePrompter{confirmResult: false, slackTokenResult: "tok", slackCookieResult: "cookie"}
+
+	changed, err := TestAndRepair(cfg, Slack, p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if changed {
+		t.Fatalf("expected changed=false")
+	}
+	if p.slackCalls != 0 {
+		t.Fatalf("expected no PromptSlack call after declining configure confirm")
+	}
+	if cfg.Services.Slack != nil {
+		t.Fatalf("expected cfg to remain unconfigured, got %+v", cfg.Services.Slack)
+	}
+}
+
+func TestTestAndRepair_Jira_UnconfiguredConfirmNo(t *testing.T) {
+	withJiraSeam(t, func(host, email, token string) error {
+		t.Fatalf("validate should not be called when unconfigured")
+		return nil
+	})
+
+	cfg := &config.Config{}
+	p := &fakePrompter{confirmResult: false}
+
+	changed, err := TestAndRepair(cfg, Jira, p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if changed {
+		t.Fatalf("expected changed=false")
+	}
+	if len(p.promptCalls) != 0 {
+		t.Fatalf("expected no PromptToken call after declining configure confirm")
+	}
+	if cfg.Services.Jira != nil {
+		t.Fatalf("expected cfg to remain unconfigured, got %+v", cfg.Services.Jira)
 	}
 }
 
