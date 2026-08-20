@@ -90,6 +90,11 @@ func repairGitHub(cfg *config.Config, p Prompter) (bool, error) {
 		if !p.Confirm("Replace the GitHub token?") {
 			return false, nil
 		}
+	} else {
+		if !p.Confirm("Configure GitHub?") {
+			p.Info("GitHub: skipped")
+			return false, nil
+		}
 	}
 
 	tok := p.PromptToken(GitHub, "Create a token at https://github.com/settings/tokens (needs repo/read scopes)")
@@ -118,6 +123,10 @@ func repairJira(cfg *config.Config, p Prompter) (bool, error) {
 	// Jira setup instead of building a multi-field prompt here.
 	host, email := creds.Host, creds.Email
 	if !configured {
+		if !p.Confirm("Configure Jira?") {
+			p.Info("Jira: skipped")
+			return false, nil
+		}
 		if cfg.Services.Jira == nil || cfg.Services.Jira.Host == "" || cfg.Services.Jira.Email == "" {
 			p.Info("Jira is not configured. Run the full Jira setup to provide a host and email before repairing the token.")
 			return false, nil
@@ -172,6 +181,11 @@ func repairSlack(cfg *config.Config, p Prompter) (bool, error) {
 		}
 		p.Info("Slack: failed (" + err.Error() + ")")
 		if !p.Confirm("Replace the Slack token+cookie?") {
+			return false, nil
+		}
+	} else {
+		if !p.Confirm("Configure Slack?") {
+			p.Info("Slack: skipped")
 			return false, nil
 		}
 	}
