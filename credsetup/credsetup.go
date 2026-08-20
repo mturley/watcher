@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/mturley/watcher/config"
 	wgithub "github.com/mturley/watcher/github"
@@ -30,13 +31,17 @@ const (
 
 // Prompter is implemented by consumers to drive interactive credential
 // setup. Info reports status messages, Confirm asks a yes/no question,
-// PromptToken asks for a single token/secret for a service, and PromptSlack
-// asks for the Slack-specific token+cookie pair.
+// PromptToken asks for a single token/secret for a service, PromptSlack
+// asks for the Slack-specific token+cookie pair, and PromptJira asks for the
+// Jira base URL (host) and account email needed for first-time (greenfield)
+// setup, when no host/email is configured yet. An empty host or empty email
+// means the operator wants to abort/skip.
 type Prompter interface {
 	Info(msg string)
 	Confirm(msg string) bool
 	PromptToken(service Service, instructions string) string
 	PromptSlack(instructions string) (token, cookie string)
+	PromptJira(instructions string) (host, email string)
 }
 
 // Test seam: overridable in tests so TestAndRepair needs no network.
@@ -117,21 +122,22 @@ func repairJira(cfg *config.Config, p Prompter) (bool, error) {
 	creds, cfgErr := cfg.Jira()
 	configured := cfgErr == nil
 
-	// Jira repair only ever replaces the token; host/email are reused from
-	// the existing config. If Jira isn't configured at all, there's no
-	// host/email to reuse, so point the operator at the consumer's full
-	// Jira setup instead of building a multi-field prompt here.
+	// If Jira is already configured, repair only ever replaces the token;
+	// host/email are reused from the existing config. If Jira isn't
+	// configured at all, this is greenfield setup: prompt for host+email
+	// via PromptJira before falling through to the shared token prompt.
 	host, email := creds.Host, creds.Email
 	if !configured {
 		if !p.Confirm("Configure Jira?") {
 			p.Info("Jira: skipped")
 			return false, nil
 		}
-		if cfg.Services.Jira == nil || cfg.Services.Jira.Host == "" || cfg.Services.Jira.Email == "" {
-			p.Info("Jira is not configured. Run the full Jira setup to provide a host and email before repairing the token.")
+		host, email = p.PromptJira("Enter your Jira site URL (e.g. https://yourorg.atlassian.net) and the account email")
+		host = strings.TrimRight(host, "/")
+		if host == "" || email == "" {
+			p.Info("Jira: skipped")
 			return false, nil
 		}
-		host, email = cfg.Services.Jira.Host, cfg.Services.Jira.Email
 	} else {
 		p.Info("Testing Jira credentials...")
 		err := validateJira(host, email, creds.Token)
