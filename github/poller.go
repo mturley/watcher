@@ -289,11 +289,12 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 
 	// Fetch remaining check contexts if paginated
 	if prData.CheckRunsHasMore && prData.CheckRunsEndCursor != "" {
-		moreRuns, err := FetchRemainingCheckContexts(token, prData.Owner, prData.Repo, prData.Number, prData.CheckRunsEndCursor)
+		moreRuns, moreCtx, err := FetchRemainingCheckContexts(token, prData.Owner, prData.Repo, prData.Number, prData.CheckRunsEndCursor)
 		if err != nil {
 			logger.Printf("WARNING: failed to paginate check contexts for %s: %v", resource.ID, err)
 		} else {
 			prData.CheckRuns = append(prData.CheckRuns, moreRuns...)
+			prData.StatusContexts = append(prData.StatusContexts, moreCtx...)
 		}
 	}
 
@@ -371,7 +372,7 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 				title = fmt.Sprintf("CI running for %s @ %s (%d/%d passed)", prLabel, shortSHA, passed, total)
 			} else {
 				eventType = watcher.EventTypeCIPassed
-				title = fmt.Sprintf("CI passed for %s @ %s (%d/%d checks)", prLabel, shortSHA, passed, total)
+				title = fmt.Sprintf("CI checks passed for %s @ %s (%d/%d checks)", prLabel, shortSHA, passed, total)
 			}
 
 			// Build body: failures first, then pending, then passes
@@ -385,7 +386,7 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 				latestTS = time.Now().UTC().Format(time.RFC3339)
 			}
 
-			if err := db.UpsertCIBundle(conn, prData.Commits.LatestSHA, eventType, title, body, latestTS, resource); err != nil {
+			if err := db.UpsertCIBundle(conn, prData.Commits.LatestSHA, eventType, title, body, latestTS, resource, db.CICheckBundleTypes); err != nil {
 				return eventCount, fmt.Errorf("failed to upsert CI bundle: %w", err)
 			}
 			eventCount++
@@ -393,6 +394,83 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 		}
 	}
 skipCIBundle:
+
+	// Process StatusContexts (gated workflows / external CI like ci/prow) as a
+	// separate per-commit bundle, independent of the CheckRun bundle above. A
+	// StatusContext (e.g. "Cypress E2E Tests", triggered after the Test
+	// workflow) can still be PENDING while every CheckRun has passed, so folding
+	// it into the CheckRun bundle would let "CI checks passed" hide a
+	// still-running gated workflow.
+	if len(prData.StatusContexts) > 0 && prData.Commits.LatestSHA != "" {
+		// StatusContexts carry no completion timestamp, so there is no
+		// newly-completed signal to compare against the cursor. Drive refresh
+		// off (a) the first/backfill poll and (b) any change to the full set of
+		// (name,state) pairs — this catches SUCCESS→FAILURE transitions that
+		// don't change the pending set, as well as pending appearing/clearing.
+		curWF := workflowFingerprint(prData)
+		prevWF, _ := prevStateMap["ci_workflow_fingerprint"].(string)
+		workflowChanged := curWF != "" && curWF != prevWF
+
+		if cursor == "" || workflowChanged {
+			passed, failed, pending := 0, 0, 0
+			var failedNames, pendingNames, passedNames []string
+
+			for _, sc := range prData.StatusContexts {
+				switch sc.State {
+				case "SUCCESS", "EXPECTED", "NEUTRAL":
+					passed++
+					passedNames = append(passedNames, fmt.Sprintf("✓ %s", sc.Name))
+				case "FAILURE", "ERROR":
+					failed++
+					failedNames = append(failedNames, fmt.Sprintf("✗ %s: %s", sc.Name, sc.State))
+				default: // PENDING and any unknown state, treated as in-flight
+					pending++
+					pendingNames = append(pendingNames, fmt.Sprintf("⧖ %s", sc.Name))
+				}
+			}
+
+			total := passed + failed + pending
+			if total > 0 {
+				shortSHA := prData.Commits.LatestSHA
+				if len(shortSHA) > 7 {
+					shortSHA = shortSHA[:7]
+				}
+
+				var eventType watcher.EventType
+				var title string
+				prLabel := fmt.Sprintf("PR #%d", prData.Number)
+
+				if failed > 0 && pending > 0 {
+					eventType = watcher.EventTypeCIWorkflowsPartialFailure
+					title = fmt.Sprintf("Workflows failing for %s @ %s (%d failed, %d/%d passed)", prLabel, shortSHA, failed, passed, total)
+				} else if failed > 0 {
+					eventType = watcher.EventTypeCIWorkflowsFailed
+					title = fmt.Sprintf("Workflows failed for %s @ %s (%d failed, %d passed)", prLabel, shortSHA, failed, passed)
+				} else if pending > 0 {
+					eventType = watcher.EventTypeCIWorkflowsPending
+					title = fmt.Sprintf("Workflows running for %s @ %s (%d/%d passed)", prLabel, shortSHA, passed, total)
+				} else {
+					eventType = watcher.EventTypeCIWorkflowsPassed
+					title = fmt.Sprintf("Workflows passed for %s @ %s (%d/%d)", prLabel, shortSHA, passed, total)
+				}
+
+				var bodyLines []string
+				bodyLines = append(bodyLines, failedNames...)
+				bodyLines = append(bodyLines, pendingNames...)
+				bodyLines = append(bodyLines, passedNames...)
+				body := strings.Join(bodyLines, "\n")
+
+				// StatusContexts have no per-context timestamp; use now.
+				externalTS := time.Now().UTC().Format(time.RFC3339)
+
+				if err := db.UpsertCIBundle(conn, prData.Commits.LatestSHA, eventType, title, body, externalTS, resource, db.CIWorkflowBundleTypes); err != nil {
+					return eventCount, fmt.Errorf("failed to upsert workflow bundle: %w", err)
+				}
+				eventCount++
+				logger.Printf("Upserted workflow bundle for %s (%s): %s", resource.ID, prData.Commits.LatestSHA[:8], title)
+			}
+		}
+	}
 
 	// Check PR state
 	if prData.State == "MERGED" || prData.State == "CLOSED" {
@@ -436,6 +514,18 @@ skipCIBundle:
 	if prData.Commits.LatestSHA != "" && prevStateMap != nil {
 		prevSHA, _ := prevStateMap["latest_commit_sha"].(string)
 		if prevSHA != "" && prevSHA != prData.Commits.LatestSHA {
+			// The previous commit's CI/workflow bundles now describe a
+			// superseded commit. Flag them out of date (title-only, no
+			// timestamp bump) so a consumer that still holds them in its inbox
+			// doesn't treat them as the current CI state. Idempotent, so
+			// re-running on later polls while the SHA remains superseded is
+			// harmless. Only the immediately-previous SHA is known here (same
+			// limitation as new-commit detection), so commits skipped between
+			// polls are not marked.
+			if err := db.MarkCIBundlesOutOfDate(conn, prevSHA, resource); err != nil {
+				logger.Printf("WARNING: failed to mark CI bundles out of date for %s @ %s: %v", resource.ID, prevSHA, err)
+			}
+
 			dup, err := db.IsDuplicate(conn, db.DedupCheck{
 				Source:       "github",
 				ResourceType: resource.Type,
@@ -607,6 +697,7 @@ func buildPRStateJSON(prData PRData) string {
 		"ci_status":                    deriveCIStatus(prData.CheckRuns),
 		"latest_commit_sha":            prData.Commits.LatestSHA,
 		"ci_pending_fingerprint":       pendingCIFingerprint(prData),
+		"ci_workflow_fingerprint":      workflowFingerprint(prData),
 	}
 	data, _ := json.Marshal(state)
 	return string(data)
@@ -643,4 +734,26 @@ func pendingCIFingerprint(prData PRData) string {
 		segments[i] = fmt.Sprintf("%d:%s", len(n), n)
 	}
 	return prData.Commits.LatestSHA + "|" + strings.Join(segments, "\n")
+}
+
+// workflowFingerprint computes a stable fingerprint of the FULL StatusContext
+// set (name + state) for the latest commit, so the workflow bundle refreshes on
+// any state transition — not just when the pending set changes. A gated
+// workflow flipping SUCCESS→FAILURE with no change to what's pending must still
+// refresh the bundle, so unlike pendingCIFingerprint this hashes every context
+// and includes its state. Returns "" when there are no StatusContexts, so
+// callers can distinguish "no workflows" from "workflow set unchanged".
+//
+// Uses the same length-prefixed, sorted encoding as pendingCIFingerprint to
+// stay collision-free regardless of characters in context names (see its doc).
+func workflowFingerprint(prData PRData) string {
+	if len(prData.StatusContexts) == 0 {
+		return ""
+	}
+	entries := make([]string, 0, len(prData.StatusContexts))
+	for _, sc := range prData.StatusContexts {
+		entries = append(entries, fmt.Sprintf("%d:%s=%s", len(sc.Name), sc.Name, sc.State))
+	}
+	sort.Strings(entries)
+	return prData.Commits.LatestSHA + "|" + strings.Join(entries, "\n")
 }

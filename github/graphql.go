@@ -33,6 +33,7 @@ type PRData struct {
 	ReviewComments      []ReviewComment
 	Commits             CommitInfo
 	CheckRuns           []CheckRun
+	StatusContexts      []StatusContext
 	CheckRunsTotalCount int
 	CheckRunsHasMore    bool
 	CheckRunsEndCursor  string
@@ -85,6 +86,18 @@ type CheckRun struct {
 	Status      string
 	Conclusion  string
 	CompletedAt string
+}
+
+// StatusContext represents a commit status context in the PR's
+// statusCheckRollup (GraphQL __typename "StatusContext"), as opposed to a
+// CheckRun. Gated workflows triggered via workflow_run (e.g. odh-dashboard's
+// "Cypress E2E Tests") and external CI systems (e.g. OpenShift "ci/prow/*")
+// report here rather than as CheckRuns. Unlike CheckRun there is no separate
+// status/conclusion or completion timestamp: State is a single enum
+// (EXPECTED, PENDING, SUCCESS, FAILURE, ERROR).
+type StatusContext struct {
+	Name  string
+	State string
 }
 
 // RateLimit contains GitHub API rate limit info.
@@ -252,6 +265,11 @@ func buildBatchedPRQuery(prs []PRRef) string {
                       status
                       conclusion
                       completedAt
+                    }
+                    ... on StatusContext {
+                      context
+                      state
+                      targetUrl
                     }
                   }
                 }
@@ -425,6 +443,12 @@ type statusCheckContext struct {
 	Status      *string `json:"status"`
 	Conclusion  *string `json:"conclusion"`
 	CompletedAt *string `json:"completedAt"`
+	// StatusContext-only fields. StatusContext uses "context" for its name and
+	// "state" for its single status enum, distinct from CheckRun's
+	// name/status/conclusion. A CheckRun node simply leaves these empty.
+	Context   string  `json:"context"`
+	StateEnum string  `json:"state"`
+	TargetURL *string `json:"targetUrl"`
 }
 
 type authorNode struct {
@@ -502,48 +526,67 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 			data.CheckRunsTotalCount = rollup.TotalCount
 			data.CheckRunsHasMore = rollup.PageInfo.HasNextPage
 			data.CheckRunsEndCursor = rollup.PageInfo.EndCursor
-			for _, ctx := range rollup.Nodes {
-				if ctx.TypeName != "CheckRun" {
-					continue
-				}
-				status := ""
-				if ctx.Status != nil {
-					status = *ctx.Status
-				}
-				conclusion := ""
-				if ctx.Conclusion != nil {
-					conclusion = *ctx.Conclusion
-				}
-				completedAt := ""
-				if ctx.CompletedAt != nil {
-					completedAt = *ctx.CompletedAt
-				}
-				data.CheckRuns = append(data.CheckRuns, CheckRun{
-					Name:        ctx.Name,
-					Status:      status,
-					Conclusion:  conclusion,
-					CompletedAt: completedAt,
-				})
-			}
+			data.CheckRuns, data.StatusContexts = appendRollupNodes(data.CheckRuns, data.StatusContexts, rollup.Nodes)
 		}
 	}
 
 	return data
 }
 
-// FetchRemainingCheckContexts paginates through remaining statusCheckRollup contexts.
-// Called when the initial query returned hasNextPage=true. Max 10 pages as a safety limit.
-func FetchRemainingCheckContexts(token, owner, repo string, prNumber int, cursor string) ([]CheckRun, error) {
+// appendRollupNodes classifies statusCheckRollup context nodes by __typename,
+// appending CheckRun nodes to runs and StatusContext nodes to contexts, and
+// returns the extended slices. Unknown node types are dropped. Shared by the
+// initial parse and the pagination path so both surface StatusContexts (e.g.
+// gated workflows) instead of silently dropping them.
+func appendRollupNodes(runs []CheckRun, contexts []StatusContext, nodes []statusCheckContext) ([]CheckRun, []StatusContext) {
+	for _, ctx := range nodes {
+		switch ctx.TypeName {
+		case "CheckRun":
+			status := ""
+			if ctx.Status != nil {
+				status = *ctx.Status
+			}
+			conclusion := ""
+			if ctx.Conclusion != nil {
+				conclusion = *ctx.Conclusion
+			}
+			completedAt := ""
+			if ctx.CompletedAt != nil {
+				completedAt = *ctx.CompletedAt
+			}
+			runs = append(runs, CheckRun{
+				Name:        ctx.Name,
+				Status:      status,
+				Conclusion:  conclusion,
+				CompletedAt: completedAt,
+			})
+		case "StatusContext":
+			contexts = append(contexts, StatusContext{
+				Name:  ctx.Context,
+				State: ctx.StateEnum,
+			})
+		}
+	}
+	return runs, contexts
+}
+
+// FetchRemainingCheckContexts paginates through remaining statusCheckRollup
+// contexts. Called when the initial query returned hasNextPage=true. Max 10
+// pages as a safety limit. Returns both CheckRuns and StatusContexts, since a
+// single contexts connection interleaves both node kinds and StatusContexts can
+// land beyond the first page.
+func FetchRemainingCheckContexts(token, owner, repo string, prNumber int, cursor string) ([]CheckRun, []StatusContext, error) {
 	var allRuns []CheckRun
+	var allContexts []StatusContext
 	currentCursor := cursor
 
 	for page := 0; page < 10; page++ {
-		query := fmt.Sprintf(`{"query":"{repository(owner:\"%s\",name:\"%s\"){pullRequest(number:%d){commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:\"%s\"){pageInfo{hasNextPage endCursor}nodes{__typename ... on CheckRun{name status conclusion completedAt}}}}}}}}}}"}`,
+		query := fmt.Sprintf(`{"query":"{repository(owner:\"%s\",name:\"%s\"){pullRequest(number:%d){commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:\"%s\"){pageInfo{hasNextPage endCursor}nodes{__typename ... on CheckRun{name status conclusion completedAt} ... on StatusContext{context state targetUrl}}}}}}}}}}"}`,
 			owner, repo, prNumber, currentCursor)
 
 		req, err := http.NewRequest("POST", "https://api.github.com/graphql", bytes.NewReader([]byte(query)))
 		if err != nil {
-			return allRuns, fmt.Errorf("failed to create request for page %d: %w", page+1, err)
+			return allRuns, allContexts, fmt.Errorf("failed to create request for page %d: %w", page+1, err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
@@ -551,13 +594,13 @@ func FetchRemainingCheckContexts(token, owner, repo string, prNumber int, cursor
 		httpClient := &http.Client{}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			return allRuns, fmt.Errorf("failed to fetch check contexts page %d: %w", page+1, err)
+			return allRuns, allContexts, fmt.Errorf("failed to fetch check contexts page %d: %w", page+1, err)
 		}
 
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			return allRuns, fmt.Errorf("failed to read response for page %d: %w", page+1, err)
+			return allRuns, allContexts, fmt.Errorf("failed to read response for page %d: %w", page+1, err)
 		}
 
 		var result struct {
@@ -576,7 +619,7 @@ func FetchRemainingCheckContexts(token, owner, repo string, prNumber int, cursor
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(body, &result); err != nil {
-			return allRuns, fmt.Errorf("failed to parse check contexts page %d: %w", page+1, err)
+			return allRuns, allContexts, fmt.Errorf("failed to parse check contexts page %d: %w", page+1, err)
 		}
 
 		commits := result.Data.Repository.PullRequest.Commits.Nodes
@@ -585,29 +628,7 @@ func FetchRemainingCheckContexts(token, owner, repo string, prNumber int, cursor
 		}
 
 		rollup := commits[0].Commit.StatusCheckRollup.Contexts
-		for _, ctx := range rollup.Nodes {
-			if ctx.TypeName != "CheckRun" {
-				continue
-			}
-			status := ""
-			if ctx.Status != nil {
-				status = *ctx.Status
-			}
-			conclusion := ""
-			if ctx.Conclusion != nil {
-				conclusion = *ctx.Conclusion
-			}
-			completedAt := ""
-			if ctx.CompletedAt != nil {
-				completedAt = *ctx.CompletedAt
-			}
-			allRuns = append(allRuns, CheckRun{
-				Name:        ctx.Name,
-				Status:      status,
-				Conclusion:  conclusion,
-				CompletedAt: completedAt,
-			})
-		}
+		allRuns, allContexts = appendRollupNodes(allRuns, allContexts, rollup.Nodes)
 
 		if !rollup.PageInfo.HasNextPage {
 			break
@@ -615,7 +636,7 @@ func FetchRemainingCheckContexts(token, owner, repo string, prNumber int, cursor
 		currentCursor = rollup.PageInfo.EndCursor
 	}
 
-	return allRuns, nil
+	return allRuns, allContexts, nil
 }
 
 // authorType converts GitHub's __typename into "user" or "bot".

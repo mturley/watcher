@@ -18,14 +18,24 @@ const (
 	EventTypeCIFailed          EventType = "ci_failed"
 	EventTypeCIPending         EventType = "ci_pending"
 	EventTypeCIPartialFailure  EventType = "ci_partial_failure"
-	EventTypeJiraComment       EventType = "jira_comment"
-	EventTypeJiraStatusChange  EventType = "jira_status_change"
-	EventTypeJiraAssigned      EventType = "jira_assigned"
-	EventTypeJiraDescChanged   EventType = "jira_description_changed"
-	EventTypeJiraLabelsChanged EventType = "jira_labels_changed"
-	EventTypeSlackReply        EventType = "slack_reply"
-	EventTypeWatchStarted      EventType = "watch_started"
-	EventTypeWatcherError      EventType = "watcher_error"
+	// Gated/downstream workflows and third-party status checks surface on the
+	// PR's statusCheckRollup as StatusContext nodes (e.g. odh-dashboard's
+	// "Cypress E2E Tests", OpenShift "ci/prow/*"), distinct from CheckRun
+	// nodes. They are rolled up into their own per-commit bundle so a passing
+	// CheckRun bundle ("CI checks passed") doesn't imply gated workflows have
+	// also finished.
+	EventTypeCIWorkflowsPassed         EventType = "ci_workflows_passed"
+	EventTypeCIWorkflowsFailed         EventType = "ci_workflows_failed"
+	EventTypeCIWorkflowsPending        EventType = "ci_workflows_pending"
+	EventTypeCIWorkflowsPartialFailure EventType = "ci_workflows_partial_failure"
+	EventTypeJiraComment               EventType = "jira_comment"
+	EventTypeJiraStatusChange          EventType = "jira_status_change"
+	EventTypeJiraAssigned              EventType = "jira_assigned"
+	EventTypeJiraDescChanged           EventType = "jira_description_changed"
+	EventTypeJiraLabelsChanged         EventType = "jira_labels_changed"
+	EventTypeSlackReply                EventType = "slack_reply"
+	EventTypeWatchStarted              EventType = "watch_started"
+	EventTypeWatcherError              EventType = "watcher_error"
 )
 
 // eventTypeDisplayNames maps each EventType to a human-readable label.
@@ -41,10 +51,16 @@ var eventTypeDisplayNames = map[EventType]string{
 	EventTypePRNewCommits:      "new commits",
 	EventTypeCICheckPassed:     "CI passed",
 	EventTypeCICheckFailed:     "CI failed",
-	EventTypeCIPassed:          "CI passed",
+	EventTypeCIPassed:          "CI checks passed",
 	EventTypeCIFailed:          "CI failed",
 	EventTypeCIPending:         "CI running",
 	EventTypeCIPartialFailure:  "CI failing",
+
+	EventTypeCIWorkflowsPassed:         "workflows passed",
+	EventTypeCIWorkflowsFailed:         "workflows failed",
+	EventTypeCIWorkflowsPending:        "workflows running",
+	EventTypeCIWorkflowsPartialFailure: "workflows failing",
+
 	EventTypeJiraComment:       "Jira comments",
 	EventTypeJiraStatusChange:  "status changes",
 	EventTypeJiraAssigned:      "assignments",

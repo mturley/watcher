@@ -740,6 +740,259 @@ func ciEventCount(events []watcher.Event) int {
 	return n
 }
 
+// wfEventCount counts events whose type is one of the workflow bundle types.
+func wfEventCount(events []watcher.Event) int {
+	n := 0
+	for _, e := range events {
+		switch e.Type {
+		case watcher.EventTypeCIWorkflowsPassed, watcher.EventTypeCIWorkflowsFailed,
+			watcher.EventTypeCIWorkflowsPending, watcher.EventTypeCIWorkflowsPartialFailure:
+			n++
+		}
+	}
+	return n
+}
+
+// findEventTitleByType returns the title of the first event with the given type.
+func findEventTitleByType(t *testing.T, events []watcher.Event, typ watcher.EventType) string {
+	t.Helper()
+	for _, e := range events {
+		if e.Type == typ {
+			return e.Title
+		}
+	}
+	t.Fatalf("no event of type %q found", typ)
+	return ""
+}
+
+// TestProcessPR_DualBundlesCoexist reproduces the PR #9393 bug: all CheckRuns
+// pass while a gated workflow (StatusContext) is still PENDING. The CheckRun
+// bundle must report "CI checks passed" AND a separate workflow bundle must
+// report the pending gate — both tagged commit:<sha> as distinct rows.
+func TestProcessPR_DualBundlesCoexist(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	const sha = "966c7e8abc123"
+	data := PRData{
+		Number: 9393, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T09:00:00Z",
+		Commits:   CommitInfo{LatestSHA: sha, LatestDate: "2026-06-17T08:00:00Z"},
+		CheckRuns: []CheckRun{
+			{Name: "lint", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-06-17T08:30:00Z"},
+			{Name: "build", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-06-17T08:40:00Z"},
+		},
+		StatusContexts: []StatusContext{
+			{Name: "Cypress E2E Tests", State: "PENDING"},
+			{Name: "ci/prow/images", State: "SUCCESS"},
+		},
+	}
+	if _, err := processPR(conn, data, prResource, "test-token", true, testLogger()); err != nil {
+		t.Fatalf("processPR: %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	if got := ciEventCount(events); got != 1 {
+		t.Errorf("expected 1 CheckRun bundle, got %d", got)
+	}
+	if got := wfEventCount(events); got != 1 {
+		t.Errorf("expected 1 workflow bundle, got %d", got)
+	}
+	types := typeCounts(events)
+	if types[watcher.EventTypeCIPassed] != 1 {
+		t.Errorf("expected ci_passed (checks passed), got %+v", types)
+	}
+	if types[watcher.EventTypeCIWorkflowsPending] != 1 {
+		t.Errorf("expected ci_workflows_pending, got %+v", types)
+	}
+	if got := findEventTitleByType(t, events, watcher.EventTypeCIPassed); !strings.Contains(got, "CI checks passed") {
+		t.Errorf("CheckRun bundle title = %q, want 'CI checks passed'", got)
+	}
+	wfTitle := findEventTitleByType(t, events, watcher.EventTypeCIWorkflowsPending)
+	if !strings.Contains(wfTitle, "Workflows running") {
+		t.Errorf("workflow bundle title = %q, want 'Workflows running'", wfTitle)
+	}
+}
+
+// TestProcessPR_WorkflowBundleRefreshesOnStateChange verifies the workflow
+// bundle is recorded on first poll, not churned when the StatusContext set is
+// unchanged, and refreshed in place when a context's state transitions (even
+// with no change to what's pending).
+func TestProcessPR_WorkflowBundleRefreshesOnStateChange(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	const sha = "wfsha123456"
+	base := func(updatedAt string, ctxs []StatusContext) PRData {
+		return PRData{
+			Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+			UpdatedAt: updatedAt,
+			Commits:   CommitInfo{LatestSHA: sha, LatestDate: "2026-06-17T08:00:00Z"},
+			// A completed CheckRun keeps the check bundle out of the way and
+			// gives processing a real cursor.
+			CheckRuns:      []CheckRun{{Name: "build", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-06-17T08:30:00Z"}},
+			StatusContexts: ctxs,
+		}
+	}
+
+	// Poll 1: E2E pending.
+	if _, err := processPR(conn, base("2026-06-17T09:00:00Z", []StatusContext{{Name: "Cypress E2E Tests", State: "PENDING"}}), prResource, "test-token", true, testLogger()); err != nil {
+		t.Fatalf("poll1: %v", err)
+	}
+	events, _ := db.EventsForResource(conn, "pr", prResource.ID)
+	if got := wfEventCount(events); got != 1 {
+		t.Fatalf("expected 1 workflow bundle after poll1, got %d", got)
+	}
+
+	// Sentinel the workflow bundle so we can detect whether poll 2 rewrote it.
+	const sentinel = "SENTINEL-WF-DO-NOT-OVERWRITE"
+	sentinelizeWorkflowBundle(t, conn, sha, sentinel)
+
+	// Poll 2: SAME context set → must not refresh (sentinel survives).
+	if _, err := processPR(conn, base("2026-06-17T09:05:00Z", []StatusContext{{Name: "Cypress E2E Tests", State: "PENDING"}}), prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("poll2: %v", err)
+	}
+	events, _ = db.EventsForResource(conn, "pr", prResource.ID)
+	if got := findEventTitleByType(t, events, watcher.EventTypeCIWorkflowsPending); got != sentinel {
+		t.Errorf("unchanged context set refreshed the bundle: title = %q, want sentinel", got)
+	}
+
+	// Poll 3: E2E flips PENDING→SUCCESS → must refresh in place.
+	if _, err := processPR(conn, base("2026-06-17T09:10:00Z", []StatusContext{{Name: "Cypress E2E Tests", State: "SUCCESS"}}), prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("poll3: %v", err)
+	}
+	events, _ = db.EventsForResource(conn, "pr", prResource.ID)
+	if got := wfEventCount(events); got != 1 {
+		t.Fatalf("expected still 1 workflow bundle after poll3, got %d", got)
+	}
+	if typeCounts(events)[watcher.EventTypeCIWorkflowsPassed] != 1 {
+		t.Errorf("expected workflow bundle to flip to ci_workflows_passed, got %+v", typeCounts(events))
+	}
+}
+
+// TestProcessPR_MarksPrevCommitOutOfDate verifies that when a new commit
+// appears, the previous commit's bundles get the [out of date] title prefix
+// (both families), the new commit's do not, and re-polling doesn't double-prefix.
+func TestProcessPR_MarksPrevCommitOutOfDate(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	const shaA = "commitAAAA111"
+	const shaB = "commitBBBB222"
+
+	// Poll commit A: both a CheckRun bundle and a workflow bundle.
+	dataA := PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T09:00:00Z",
+		Commits:   CommitInfo{LatestSHA: shaA, LatestDate: "2026-06-17T08:00:00Z"},
+		CheckRuns: []CheckRun{{Name: "build", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-06-17T08:30:00Z"}},
+		StatusContexts: []StatusContext{
+			{Name: "Cypress E2E Tests", State: "SUCCESS"},
+		},
+	}
+	if _, err := processPR(conn, dataA, prResource, "test-token", true, testLogger()); err != nil {
+		t.Fatalf("poll A: %v", err)
+	}
+
+	// Poll commit B: new latest SHA.
+	dataB := PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T10:00:00Z",
+		Commits:   CommitInfo{LatestSHA: shaB, LatestDate: "2026-06-17T09:30:00Z", Recent: []CommitEntry{{SHA: shaB, MessageHeadline: "new work"}}},
+		CheckRuns: []CheckRun{{Name: "build", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: "2026-06-17T09:45:00Z"}},
+		StatusContexts: []StatusContext{
+			{Name: "Cypress E2E Tests", State: "PENDING"},
+		},
+	}
+	if _, err := processPR(conn, dataB, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("poll B: %v", err)
+	}
+
+	titlesFor := func(commitSHA string) []string {
+		t.Helper()
+		rows, err := conn.Query(`
+			SELECT e.title FROM watcher_events e
+			JOIN watcher_event_resources er ON e.id = er.event_id
+			WHERE er.resource_id = ? AND e.tags = ?`, prResource.ID, "commit:"+commitSHA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, s)
+		}
+		return out
+	}
+
+	aTitles := titlesFor(shaA)
+	if len(aTitles) != 2 {
+		t.Fatalf("expected 2 bundles for commit A, got %d: %v", len(aTitles), aTitles)
+	}
+	for _, tt := range aTitles {
+		if !strings.HasPrefix(tt, "[out of date] ") {
+			t.Errorf("commit A bundle not marked out of date: %q", tt)
+		}
+	}
+	for _, tt := range titlesFor(shaB) {
+		if strings.HasPrefix(tt, "[out of date] ") {
+			t.Errorf("commit B bundle should NOT be out of date: %q", tt)
+		}
+	}
+
+	// Re-poll B (SHA unchanged from stored state) → A must not double-prefix.
+	if _, err := processPR(conn, dataB, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("re-poll B: %v", err)
+	}
+	for _, tt := range titlesFor(shaA) {
+		if strings.HasPrefix(tt, "[out of date] [out of date] ") {
+			t.Errorf("commit A bundle double-prefixed: %q", tt)
+		}
+	}
+}
+
+// sentinelizeWorkflowBundle overwrites the workflow bundle's title for a commit,
+// mirroring sentinelizeCIBundle but for the ci_workflows_* family.
+func sentinelizeWorkflowBundle(t *testing.T, conn *sql.DB, commitSHA, sentinelTitle string) {
+	t.Helper()
+	tag := "commit:" + commitSHA
+	res, err := conn.Exec(`
+		UPDATE watcher_events
+		SET title = ?
+		WHERE id IN (
+			SELECT e.id FROM watcher_events e
+			JOIN watcher_event_resources er ON e.id = er.event_id
+			WHERE e.source = 'github'
+			  AND e.type IN ('ci_workflows_passed', 'ci_workflows_failed', 'ci_workflows_pending', 'ci_workflows_partial_failure')
+			  AND er.resource_type = ? AND er.resource_id = ?
+			  AND e.tags = ?
+		)
+	`, sentinelTitle, prResource.Type, prResource.ID, tag)
+	if err != nil {
+		t.Fatalf("sentinelizeWorkflowBundle: %v", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		t.Fatalf("sentinelizeWorkflowBundle RowsAffected: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("sentinelizeWorkflowBundle: expected to update exactly 1 row, updated %d", n)
+	}
+}
+
 // TestBuildPRStateJSON_Author verifies the cached PR state JSON includes the
 // PR author's login, so downstream consumers (e.g. the worktree UI) can
 // display who opened the PR.
