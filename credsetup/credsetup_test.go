@@ -18,6 +18,10 @@ type fakePrompter struct {
 	slackCookieResult string // PromptSlack cookie return value
 	slackCalls        int
 
+	jiraHostResult  string // PromptJira host return value
+	jiraEmailResult string // PromptJira email return value
+	jiraCalls       int
+
 	infoCalls    []string
 	confirmCalls []string
 	promptCalls  []Service
@@ -45,6 +49,11 @@ func (f *fakePrompter) PromptToken(service Service, instructions string) string 
 func (f *fakePrompter) PromptSlack(instructions string) (string, string) {
 	f.slackCalls++
 	return f.slackTokenResult, f.slackCookieResult
+}
+
+func (f *fakePrompter) PromptJira(instructions string) (string, string) {
+	f.jiraCalls++
+	return f.jiraHostResult, f.jiraEmailResult
 }
 
 // withGitHubSeam overrides validateGitHub for the duration of the test.
@@ -345,6 +354,76 @@ func TestTestAndRepair_Jira_UnconfiguredConfirmNo(t *testing.T) {
 	}
 	if len(p.promptCalls) != 0 {
 		t.Fatalf("expected no PromptToken call after declining configure confirm")
+	}
+	if cfg.Services.Jira != nil {
+		t.Fatalf("expected cfg to remain unconfigured, got %+v", cfg.Services.Jira)
+	}
+}
+
+func TestTestAndRepair_Jira_UnconfiguredConfirmYesGreenfieldSetup(t *testing.T) {
+	withJiraSeam(t, func(host, email, token string) error {
+		if token == "new-good-token" && host == "https://acme.atlassian.net" && email == "a@acme.com" {
+			return nil
+		}
+		return wjira.ErrAuth
+	})
+
+	cfg := &config.Config{}
+	p := &fakePrompter{
+		confirmResult:   true,
+		jiraHostResult:  "https://acme.atlassian.net",
+		jiraEmailResult: "a@acme.com",
+		tokenResults:    []string{"new-good-token"},
+	}
+
+	changed, err := TestAndRepair(cfg, Jira, p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected changed=true")
+	}
+	if p.jiraCalls != 1 {
+		t.Fatalf("expected exactly one PromptJira call, got %d", p.jiraCalls)
+	}
+	if len(p.promptCalls) != 1 {
+		t.Fatalf("expected exactly one PromptToken call, got %d", len(p.promptCalls))
+	}
+	if cfg.Services.Jira == nil {
+		t.Fatalf("expected Jira config to be set")
+	}
+	if cfg.Services.Jira.Host != "https://acme.atlassian.net" {
+		t.Fatalf("expected host set, got %q", cfg.Services.Jira.Host)
+	}
+	if cfg.Services.Jira.Email != "a@acme.com" {
+		t.Fatalf("expected email set, got %q", cfg.Services.Jira.Email)
+	}
+	if cfg.Services.Jira.Token != "new-good-token" {
+		t.Fatalf("expected token set, got %q", cfg.Services.Jira.Token)
+	}
+}
+
+func TestTestAndRepair_Jira_UnconfiguredConfirmYesPromptJiraAborted(t *testing.T) {
+	withJiraSeam(t, func(host, email, token string) error {
+		t.Fatalf("validate should not be called when PromptJira is aborted")
+		return nil
+	})
+
+	cfg := &config.Config{}
+	p := &fakePrompter{confirmResult: true, jiraHostResult: "", jiraEmailResult: ""}
+
+	changed, err := TestAndRepair(cfg, Jira, p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if changed {
+		t.Fatalf("expected changed=false")
+	}
+	if p.jiraCalls != 1 {
+		t.Fatalf("expected exactly one PromptJira call, got %d", p.jiraCalls)
+	}
+	if len(p.promptCalls) != 0 {
+		t.Fatalf("expected no PromptToken call after PromptJira abort")
 	}
 	if cfg.Services.Jira != nil {
 		t.Fatalf("expected cfg to remain unconfigured, got %+v", cfg.Services.Jira)
