@@ -1,8 +1,8 @@
 # watcher
 
 `watcher` is a Go library that polls external resources — GitHub pull
-requests and Jira issues today, Slack threads in the future — and records
-every change it detects as a durable event in a SQLite database.
+requests, Jira issues, and Slack threads — and records every change it
+detects as a durable event in a SQLite database.
 
 It is **not**:
 
@@ -23,11 +23,11 @@ See the full design rationale in
 ## Install
 
 ```bash
-go get github.com/mturley/watcher@v0.2.0
+go get github.com/mturley/watcher@v0.4.3
 ```
 
-(if you're building against a pre-release commit, use the commit SHA or
-a branch instead.)
+(v0.4.3 is the current release; use `@latest` or a specific tag. If you're
+building against a pre-release commit, use the commit SHA or a branch instead.)
 
 **Note on upgrading from v0.1:** There is no in-place v0.1→v0.2 database upgrade path. If you have an existing v0.1 watcher database, you must delete it and let `db.Migrate` create a fresh v0.2 schema (the schema added a column and migration aborts if the table structure doesn't match).
 
@@ -113,10 +113,14 @@ func main() {
   every `db.*`, `github.Poll`, and `jira.Poll` call.
 - **The library owns its tables.** `db.Migrate` creates
   `watcher_schema_version`, `watcher_events`, `watcher_event_resources`,
-  `watcher_resource_state`, `watcher_subscriptions`,
+  `watcher_resource_state`, `watcher_resource_meta`, `watcher_subscriptions`,
   `watcher_resource_relationships`, and `watcher_poller_status`. If any
   of those table names already exist in your DB with a different schema,
   `Migrate` refuses to proceed rather than risk corrupting your data.
+- **Each consumer owns its own database.** The library defines the schema, not
+  the file: two consumers (e.g. agent-handler and worktree) each pass their own
+  `*sql.DB` and get physically separate databases. They share schema and code,
+  never rows — there is no shared table or cross-consumer query.
 - **You own your read-state.** Cursors, "seen"/"dismissed" flags, and
   any other consumer-specific bookkeeping should be stored in your own
   tables, keyed off `watcher_events.id` or `ts`. The library only tracks
@@ -150,8 +154,11 @@ Source-specific caveats:
   CI bundle per commit.
 - **Jira**: the issue changelog is fully paginated by the client before
   the poller processes it, so no partial-history edge cases there.
-- **Slack**: not yet implemented (see Status below). The `slack:...`
-  resource ID format is reserved but there is no poller yet.
+- **Slack**: `slack.Poll` fetches a watched thread's replies. On first poll it
+  records the thread root as cached state and a `watch_started` marker; each new
+  reply after the cursor becomes one `slack_reply` event
+  (`EventTypeSlackReply`). Slack `ts` values are epoch-second strings (not
+  RFC3339), which the poller's cursor logic handles internally.
 
 ## Subscription lifecycle
 
@@ -218,6 +225,10 @@ services:
     host: https://yourcompany.atlassian.net
     email: you@yourcompany.com
     token: xxx
+  slack:
+    token: xoxc-xxx           # browser session token
+    cookie: xoxd-xxx          # the d= session cookie
+    workspace_domain: yourteam.slack.com
 jira_custom_fields:
   epic_key: customfield_10014
 consumers:
@@ -232,6 +243,7 @@ than zero-value credentials:
 cfg, err := config.Load(config.DefaultPath())
 ghCreds, err := cfg.GitHub()   // config.GitHubCreds{Token}
 jiraCreds, err := cfg.Jira()   // config.JiraCreds{Host, Email, Token, CustomFields}
+slackCreds, err := cfg.Slack() // config.SlackCreds{Token, Cookie, WorkspaceDomain}
 ```
 
 `cfg.RegisterConsumer(name, dbPath)` / `cfg.Consumers()` manage the
@@ -279,6 +291,46 @@ bots := cfg.JiraBotUsernames()   // []string, or nil if unset
 fields := cfg.JiraCustomFields() // map[string]string, or nil if unset
 ```
 
+## Credential validation & repair
+
+Each source package exposes a network validator plus an `ErrAuth` sentinel, so a
+consumer can distinguish "the credential is bad" from "the network is down":
+
+```go
+err := github.Validate(token)            // github.ErrAuth on 401/invalid
+err := jira.Validate(host, email, token) // jira.ErrAuth on 401/403
+err := slack.Validate(token, cookie)     // slack.ErrAuth on a failed AuthTest
+if errors.Is(err, github.ErrAuth) { /* creds are bad → prompt for new ones */ }
+```
+
+The `credsetup` package builds a shared "test the credential; if it's bad or
+missing, help configure and re-validate a new one" flow on top of those
+validators — the single implementation both agent-handler and worktree use for
+their setup commands. The library stays UI-free: all interaction goes through a
+consumer-supplied `Prompter`.
+
+```go
+type Prompter interface {
+    Info(msg string)                                          // status lines
+    Confirm(msg string) bool                                  // y/N
+    PromptToken(service Service, instructions string) string  // secret input
+    PromptSlack(instructions string) (token, cookie string)   // Slack needs both
+    PromptJira(instructions string) (host, email string)      // greenfield Jira
+}
+
+// TestAndRepair validates svc's creds in cfg; on failure/missing it walks the
+// user (via p) through supplying + re-validating new ones, mutating cfg on
+// success. It does NOT save — the caller persists via cfg.Save so a full setup
+// batches all services into one write. Returns whether cfg changed.
+func TestAndRepair(cfg *config.Config, svc Service, p Prompter) (changed bool, err error)
+```
+
+`Service` is one of `credsetup.GitHub`, `credsetup.Jira`, `credsetup.Slack`.
+Configuring a not-yet-set-up service is gated behind a `Confirm` ("Configure
+X?"), so each service is optional. Transport (non-`ErrAuth`) errors are surfaced
+without prompting — a network blip shouldn't ask the user to re-enter a valid
+token.
+
 ## Resource ID formats
 
 | Type    | ID format                    | Example                            |
@@ -287,8 +339,9 @@ fields := cfg.JiraCustomFields() // map[string]string, or nil if unset
 | `jira`  | issue key                     | `PROJ-123`                          |
 | `slack` | `slack:CHANNEL:THREAD_TS`     | `slack:C0123ABC:1699999999.000100`  |
 
-The `slack` format is reserved for future use; there is no Slack poller
-yet (see Status below).
+All three types have working pollers (`github.Poll`, `jira.Poll`,
+`slack.Poll`). For Slack, `ID` is `<channel_id>:<thread_ts>` and `URL` is the
+thread's archive permalink.
 
 ## Scheduler
 
@@ -304,9 +357,11 @@ on Linux. `scheduler.Uninstall`, `Start`, `Stop`, `IsInstalled`, and
 There are three ways to drive polling, depending on how your consumer
 is deployed:
 
-- **One-off `Poll`** (`github.Poll`, `jira.Poll`): call it yourself,
-  e.g. from a CLI subcommand invoked by cron/launchd, or once at
+- **One-off `Poll`** (`github.Poll`, `jira.Poll`, `slack.Poll`): call it
+  yourself, e.g. from a CLI subcommand invoked by cron/launchd, or once at
   startup. This is the building block the other two modes wrap.
+  `slack.Poll(conn, slack.SlackAuth{Token, Cookie, WorkspaceDomain}, resources, logger)`
+  mirrors the GitHub/Jira signatures.
 - **Foreground `Loop`**: for a long-running process (a `watch loop`
   command, or a goroutine inside a server), use the library's own
   in-process scheduler instead of OS-level scheduling:
@@ -332,14 +387,23 @@ is deployed:
 
 ## Status / scope
 
-`v0.1.0` was the extraction of agent-handler's watcher subsystem into a
-standalone, consumer-agnostic library. `v0.2.0` generalizes the
-subscription lifecycle (tombstones, `IfAbsent`, `UserUnsubscribe`/
-`Reinstate`, prefix-based renew/revoke), renames the config file to
-`auth.yaml`, and adds the foreground `Loop` runner. Deliberately out of
-scope so far:
+Release history:
 
-- Slack polling (resource ID format reserved, no poller implemented)
+- **v0.1.0** — extraction of agent-handler's watcher subsystem into a
+  standalone, consumer-agnostic library.
+- **v0.2.x** — generalized the subscription lifecycle (tombstones, `IfAbsent`,
+  `UserUnsubscribe`/`Reinstate`, prefix-based renew/revoke), renamed the config
+  file to `auth.yaml`, added the foreground `Loop` runner, cached PR author /
+  Jira reporter in resource state, fixed duplicate terminal-event dedup, and
+  added the `watcher_resource_meta` table (custom name/description per resource).
+- **v0.3.0** — **Slack thread resource type + poller** (`slack` package: Web API
+  client, domain types, `slack.Poll`, `EventTypeSlackReply`).
+- **v0.4.x** — per-service `Validate` functions + `ErrAuth` sentinels, and the
+  `credsetup` package (shared credential test-and-repair via a consumer-supplied
+  `Prompter`). v0.4.3 added `credsetup.PromptJira` for greenfield Jira setup.
+
+Current release: **v0.4.3**. Deliberately out of scope:
+
 - A cross-system discovery CLI/UI
 - Any integration code for specific consumers (agent-handler, worktree,
   etc.) — those live in their own repos and depend on this library
