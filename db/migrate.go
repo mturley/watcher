@@ -42,6 +42,15 @@ func Migrate(conn *sql.DB) error {
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	// Backfill updated_at for rows that predate the column (added nullable by
+	// ensureAdditiveColumns above). New rows always carry a timestamp.
+	if _, err := tx.Exec(
+		`UPDATE watcher_resource_meta SET updated_at = ? WHERE updated_at IS NULL OR updated_at = ''`,
+		now,
+	); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("watcher: backfilling resource meta updated_at: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM watcher_schema_version`); err != nil {
 		tx.Rollback()
 		return fmt.Errorf("watcher: clearing schema version: %w", err)
@@ -100,6 +109,14 @@ func SchemaVersion(conn *sql.DB) (int, error) {
 var additiveColumns = map[string]map[string]string{
 	"watcher_subscriptions": {
 		"unsubscribed_by_user": "INTEGER NOT NULL DEFAULT 0",
+	},
+	// updated_at is nullable (SQLite ALTER ADD COLUMN cannot add a NOT NULL
+	// column without a constant default, and we want the migration to
+	// backfill existing rows with the migration timestamp instead). Reads
+	// COALESCE NULL to "" (see GetResourceMeta), and Migrate backfills
+	// pre-existing rows below.
+	"watcher_resource_meta": {
+		"updated_at": "TEXT",
 	},
 }
 
