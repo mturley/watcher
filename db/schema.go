@@ -35,7 +35,11 @@ package db
 // A brand-new table is not part of managedColumns' collision check for
 // existing tables, so this doesn't interact with checkForCollisions beyond
 // adding the table to the managed set.
-const CurrentSchemaVersion = 3
+// Bumped to 4 to add watcher_resource_meta.updated_at (see additiveColumns
+// in migrate.go). The bump is required so databases already at version 3
+// re-run the migration path and pick up the new column via
+// ensureAdditiveColumns.
+const CurrentSchemaVersion = 4
 
 // managedTables is the exact set of tables Migrate owns.
 var managedTables = []string{
@@ -74,6 +78,7 @@ var managedColumns = map[string][]string{
 	},
 	"watcher_resource_meta": {
 		"resource_type", "resource_id", "custom_name", "custom_description",
+		"updated_at",
 	},
 }
 
@@ -119,6 +124,7 @@ CREATE TABLE IF NOT EXISTS watcher_resource_meta (
 	resource_id TEXT NOT NULL,
 	custom_name TEXT,
 	custom_description TEXT,
+	updated_at TEXT,
 	PRIMARY KEY (resource_type, resource_id)
 );
 
