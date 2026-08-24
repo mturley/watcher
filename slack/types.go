@@ -116,7 +116,10 @@ type rawElement struct {
 	Text    string `json:"text"`
 	URL     string `json:"url"`
 	UserID  string `json:"user_id"`
-	Name    string `json:"name"` // emoji name / usergroup
+	Name    string `json:"name"` // emoji name
+	// Slack keys these two differently from every other leaf field.
+	UserGroupID string `json:"usergroup_id"` // "usergroup" elements
+	Range       string `json:"range"`        // "broadcast" elements
 	Unicode string `json:"unicode"`
 	Style   struct {
 		Bold   bool `json:"bold"`
@@ -247,7 +250,14 @@ type Element struct {
 	Text    string // for text/link label
 	URL     string // for link
 	UserID  string // for user mention
-	Name    string // for emoji name / usergroup id
+	Name    string // for emoji name
+	// UserGroupID is the subteam id of a "usergroup" mention. Slack sends it
+	// as "usergroup_id", NOT "name" — mapping it onto Name left it empty and
+	// rendered every group as a generic placeholder.
+	UserGroupID string
+	// Range is "here" | "channel" | "everyone" for a "broadcast" mention.
+	// Slack sends it as "range"; without it every broadcast looked like @here.
+	Range   string
 	Unicode string // for standard emoji codepoint (may be empty)
 	Style   Style  // bold/italic/code for text
 }
@@ -265,4 +275,12 @@ type User struct {
 	RealName    string
 	DisplayName string
 	Avatar72    string
+}
+
+// UserGroup is a Slack user group (a "subteam"), used to render
+// "<!subteam^S123>" mentions as the group's name rather than a placeholder.
+type UserGroup struct {
+	ID     string
+	Name   string // human name, e.g. "Platform Team"
+	Handle string // @handle, e.g. "platform"
 }

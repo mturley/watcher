@@ -26,6 +26,7 @@ type Client interface {
 	Users(ctx context.Context, ids []string) (map[string]User, error)
 	Channel(ctx context.Context, id string) (string, error)
 	Emoji(ctx context.Context) (map[string]string, error)
+	UserGroups(ctx context.Context) (map[string]UserGroup, error)
 	MarkRead(ctx context.Context, channel, threadTS, ts string) error
 	MarkUnread(ctx context.Context, channel, threadTS, ts string) error
 	PostReply(ctx context.Context, channel, threadTS, text string) (Message, error)
@@ -297,4 +298,29 @@ func (c *HTTPClient) RemoveReaction(ctx context.Context, channel, ts, name strin
 		return nil
 	}
 	return err
+}
+
+// UserGroups returns the workspace's user groups keyed by subteam id.
+//
+// Callers should fetch this once and cache it (see the emoji map for the same
+// pattern): the directory changes rarely, and a mention only needs the id to
+// resolve. An error is returned rather than an empty map so callers can tell
+// "lookup failed" from "workspace has no groups" — silently rendering ids in
+// the first case would look identical to having no groups at all.
+func (c *HTTPClient) UserGroups(ctx context.Context) (map[string]UserGroup, error) {
+	var r struct {
+		UserGroups []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Handle string `json:"handle"`
+		} `json:"usergroups"`
+	}
+	if err := c.call(ctx, "usergroups.list", url.Values{}, &r); err != nil {
+		return nil, err
+	}
+	out := make(map[string]UserGroup, len(r.UserGroups))
+	for _, g := range r.UserGroups {
+		out[g.ID] = UserGroup{ID: g.ID, Name: g.Name, Handle: g.Handle}
+	}
+	return out, nil
 }

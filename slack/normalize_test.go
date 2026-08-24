@@ -495,3 +495,47 @@ func TestNormalizeBlockKit_DegenerateElements(t *testing.T) {
 		t.Errorf("context with malformed Elements: got %+v, want type=context with len(Elements)=0", got3[0])
 	}
 }
+
+// TestNormalizeUserGroupAndBroadcastElements pins the two element types Slack
+// keys differently from everything else: a usergroup carries "usergroup_id"
+// and a broadcast carries "range" — neither is "name". Mapping them onto Name
+// (as the struct comment once claimed) silently produced empty values, which
+// rendered every group as a generic "@usergroup" and, worse, every broadcast
+// as "@here" regardless of whether it was @channel or @everyone.
+func TestNormalizeUserGroupAndBroadcastElements(t *testing.T) {
+	raw := []rawElement{
+		{Type: "usergroup", UserGroupID: "S07CFUVMXBM"},
+		{Type: "broadcast", Range: "channel"},
+		{Type: "emoji", Name: "tada"},
+	}
+	got := normalizeLeaves(raw)
+	if len(got) != 3 {
+		t.Fatalf("want 3 elements, got %d", len(got))
+	}
+	if got[0].UserGroupID != "S07CFUVMXBM" {
+		t.Errorf("usergroup id not carried through: %+v", got[0])
+	}
+	if got[1].Range != "channel" {
+		t.Errorf("broadcast range not carried through: %+v", got[1])
+	}
+	if got[2].Name != "tada" {
+		t.Errorf("emoji name regressed: %+v", got[2])
+	}
+}
+
+// TestNormalizeUserGroupElementFromJSON proves the JSON tags match what Slack
+// actually sends, which a struct-literal test alone cannot catch.
+func TestNormalizeUserGroupElementFromJSON(t *testing.T) {
+	var els []rawElement
+	body := `[{"type":"usergroup","usergroup_id":"S123"},{"type":"broadcast","range":"everyone"}]`
+	if err := json.Unmarshal([]byte(body), &els); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got := normalizeLeaves(els)
+	if got[0].UserGroupID != "S123" {
+		t.Errorf("usergroup_id did not unmarshal: %+v", got[0])
+	}
+	if got[1].Range != "everyone" {
+		t.Errorf("range did not unmarshal: %+v", got[1])
+	}
+}

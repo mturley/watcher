@@ -155,6 +155,7 @@ func normalizeLeaves(raw []rawElement) []Element {
 		out = append(out, Element{
 			Type: e.Type, Text: e.Text, URL: e.URL, UserID: e.UserID,
 			Name: e.Name, Unicode: e.Unicode,
+			UserGroupID: e.UserGroupID, Range: e.Range,
 			Style: Style{Bold: e.Style.Bold, Italic: e.Style.Italic, Code: e.Style.Code, Strike: e.Style.Strike},
 		})
 	}

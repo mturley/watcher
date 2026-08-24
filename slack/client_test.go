@@ -162,3 +162,51 @@ func TestRemoveReaction_OtherErrorPropagates(t *testing.T) {
 		t.Error("expected message_not_found to propagate")
 	}
 }
+
+// TestUserGroupsMapsByID pins usergroups.list -> map[id]UserGroup, which is
+// what lets a "<!subteam^S123>" mention render as the group's name instead of
+// a generic placeholder.
+func TestUserGroupsMapsByID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/usergroups.list" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true,"usergroups":[
+			{"id":"S1","name":"Platform Team","handle":"platform"},
+			{"id":"S2","name":"Design","handle":"design"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := NewWithBaseURL("xoxc-token", "xoxd-cookie", srv.URL)
+	got, err := c.UserGroups(context.Background())
+	if err != nil {
+		t.Fatalf("UserGroups() error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 groups, got %d: %+v", len(got), got)
+	}
+	if got["S1"].Name != "Platform Team" || got["S1"].Handle != "platform" {
+		t.Errorf("S1 mapped wrong: %+v", got["S1"])
+	}
+	if got["S2"].ID != "S2" {
+		t.Errorf("id not populated: %+v", got["S2"])
+	}
+}
+
+// TestUserGroupsErrorPropagates ensures a failed lookup surfaces rather than
+// silently yielding an empty directory — an empty map is indistinguishable
+// from "workspace has no groups" at the call site.
+func TestUserGroupsErrorPropagates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":false,"error":"missing_scope"}`))
+	}))
+	defer srv.Close()
+
+	c := NewWithBaseURL("xoxc-token", "xoxd-cookie", srv.URL)
+	if _, err := c.UserGroups(context.Background()); err == nil {
+		t.Fatal("expected an error when Slack returns ok:false")
+	}
+}

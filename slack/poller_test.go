@@ -71,6 +71,7 @@ func (f *fakeClient) Channel(ctx context.Context, id string) (string, error) {
 }
 
 func (f *fakeClient) Emoji(ctx context.Context) (map[string]string, error)               { return nil, nil }
+func (f *fakeClient) UserGroups(ctx context.Context) (map[string]UserGroup, error)       { return nil, nil }
 func (f *fakeClient) MarkRead(ctx context.Context, channel, threadTS, ts string) error   { return nil }
 func (f *fakeClient) MarkUnread(ctx context.Context, channel, threadTS, ts string) error { return nil }
 func (f *fakeClient) PostReply(ctx context.Context, channel, threadTS, text string) (Message, error) {
