@@ -88,7 +88,12 @@ func Poll(conn *sql.DB, cfg SlackAuth, resources []watcher.Resource, logger *log
 		if len(thread.Messages) > 0 {
 			rootAuthor = names[thread.Messages[0].UserID]
 		}
-		stateJSON := buildSlackStateJSON(thread, channelName, rootAuthor)
+		// Resolve mention tokens before the title is cached. Without this the
+		// card title shows raw "<@U…>" / "<!subteam^S…>" for the very text
+		// that renders as names in the thread view — fallbackTitle is a Go
+		// port precisely so the two titles agree.
+		stateJSON := buildSlackStateJSON(thread, channelName, rootAuthor,
+			resolvedRootText(client, thread, names))
 		latestTS := latestThreadTS(thread)
 		now := time.Now().UTC().Format(time.RFC3339)
 		if err := db.UpsertResourceState(conn, "slack", resource.ID, stateJSON, latestTS, now); err != nil {
@@ -295,13 +300,58 @@ func resolveChannelName(conn *sql.DB, client Client, resource watcher.Resource, 
 
 // buildSlackStateJSON builds a JSON representation of a Slack thread's
 // current state, cached to resource_state for the Overview card.
-func buildSlackStateJSON(thread Thread, channelName, rootAuthor string) string {
+// resolvedRootText returns the thread's root message text with mentions
+// rewritten to names. Directories are fetched only for the ids the text
+// actually references, and any lookup failure degrades to bare ids rather
+// than failing the poll — a title is a nicety, the events are the point.
+func resolvedRootText(client Client, thread Thread, names map[string]string) string {
+	text := rootText(thread)
+	userIDs, groupIDs := MentionIDs(text)
+	if len(userIDs) == 0 && len(groupIDs) == 0 {
+		return text
+	}
+
+	// names already covers message AUTHORS; a mention may be someone who
+	// never posted, so look up only the ids still missing.
+	users := make(map[string]string, len(userIDs))
+	var missing []string
+	for _, id := range userIDs {
+		if n, ok := names[id]; ok && n != "" {
+			users[id] = n
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		if fetched, err := client.Users(context.Background(), missing); err == nil {
+			for id, u := range fetched {
+				name := u.DisplayName
+				if name == "" {
+					name = u.RealName
+				}
+				if name != "" {
+					users[id] = name
+				}
+			}
+		}
+	}
+
+	groups := map[string]UserGroup{}
+	if len(groupIDs) > 0 {
+		if fetched, err := client.UserGroupsInfo(context.Background(), groupIDs); err == nil {
+			groups = fetched
+		}
+	}
+	return ResolveMentions(text, users, groups)
+}
+
+func buildSlackStateJSON(thread Thread, channelName, rootAuthor, resolvedRoot string) string {
 	createdTS := ""
 	if len(thread.Messages) > 0 {
 		createdTS = thread.Messages[0].TS // root message ts = thread creation time
 	}
 	m := map[string]interface{}{
-		"title":        threadTitle(thread),
+		"title":        fallbackTitle(resolvedRoot),
 		"channel_name": channelName,            // "" if unresolved; card shows "#name"
 		"author":       rootAuthor,             // display name of the thread's first-message author
 		"created_ts":   createdTS,              // raw Slack ts of the root message

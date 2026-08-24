@@ -12,6 +12,7 @@ import (
 	"github.com/mturley/watcher"
 	"github.com/mturley/watcher/db"
 	"github.com/mturley/watcher/testutil"
+	"strings"
 )
 
 // testLogger returns a logger that discards output.
@@ -479,7 +480,30 @@ func pollOnce(conn *sql.DB, client Client, resource watcher.Resource, logger *lo
 	if len(thread.Messages) > 0 {
 		rootAuthor = names[thread.Messages[0].UserID]
 	}
-	stateJSON := buildSlackStateJSON(thread, channelName, rootAuthor)
+	stateJSON := buildSlackStateJSON(thread, channelName, rootAuthor, rootText(thread))
 	latestTS := latestThreadTS(thread)
 	return db.UpsertResourceState(conn, "slack", resource.ID, stateJSON, latestTS, "2026-08-19T00:00:00Z")
+}
+
+// TestCachedTitleResolvesMentions pins the whole point of the Go-side
+// resolver: the cached card title must match what the live thread view
+// renders. Before this, a title cached from raw text showed "<@U1>" for the
+// same message that displayed "@ana" one pane over.
+func TestCachedTitleResolvesMentions(t *testing.T) {
+	thread := Thread{Messages: []Message{
+		{UserID: "U1", TS: "1.0", Text: "hey <@U2> can <!subteam^S1> review this?"},
+	}}
+	resolved := ResolveMentions(
+		thread.Messages[0].Text,
+		map[string]string{"U2": "bo"},
+		map[string]UserGroup{"S1": {ID: "S1", Handle: "platform"}},
+	)
+	stateJSON := buildSlackStateJSON(thread, "eng", "ana", resolved)
+
+	if strings.Contains(stateJSON, "<@U2>") || strings.Contains(stateJSON, "subteam") {
+		t.Fatalf("cached title still holds raw mention tokens: %s", stateJSON)
+	}
+	if !strings.Contains(stateJSON, "@bo") || !strings.Contains(stateJSON, "@platform") {
+		t.Fatalf("cached title missing resolved names: %s", stateJSON)
+	}
 }
