@@ -178,17 +178,30 @@ func FetchPRs(token string, prs []PRRef, apiURL ...string) ([]PRData, *RateLimit
 		return nil, nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
+	// GraphQL reports partial success: when one repo cannot be resolved its
+	// alias comes back null while every OTHER alias still carries valid data.
+	// Bailing out here discarded the whole batch, so a single bogus
+	// subscription stripped enrichment from every PR the user watches. Keep
+	// the errors aside, parse what did come back, and only fail if nothing
+	// usable survived.
+	var partialErr error
 	if len(result.Errors) > 0 {
 		var errMsgs []string
 		for _, e := range result.Errors {
 			errMsgs = append(errMsgs, e.Message)
 		}
-		return nil, nil, fmt.Errorf("GraphQL errors: %s", strings.Join(errMsgs, "; "))
+		partialErr = fmt.Errorf("GraphQL errors: %s", strings.Join(errMsgs, "; "))
 	}
 
 	prDataList, rateLimit, err := parseGraphQLResponse(result.Data, prs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse GraphQL response: %w", err)
+	}
+
+	if len(prDataList) == 0 && partialErr != nil {
+		// Nothing resolved — surface the failure rather than reporting an
+		// empty success, which would look like "no PRs to update".
+		return nil, nil, partialErr
 	}
 
 	return prDataList, rateLimit, nil
@@ -336,18 +349,25 @@ func parseGraphQLResponse(data json.RawMessage, prs []PRRef) ([]PRData, *RateLim
 		alias := fmt.Sprintf("pr%d", i)
 		prRaw, ok := rawData[alias]
 		if !ok {
-			return nil, nil, fmt.Errorf("missing PR data for alias %s", alias)
+			// This alias failed (unresolvable repo, permissions, deleted PR).
+			// Skip just this PR: the rest of the batch is still good.
+			continue
 		}
 
 		var repoData struct {
 			PullRequest *prNode `json:"pullRequest"`
 		}
 		if err := json.Unmarshal(prRaw, &repoData); err != nil {
-			return nil, nil, fmt.Errorf("failed to unmarshal repo data for %s: %w", alias, err)
+			// A null alias unmarshals fine; a malformed one is this PR's
+			// problem alone, so skip it rather than failing every sibling.
+			continue
 		}
 
 		if repoData.PullRequest == nil {
-			return nil, nil, fmt.Errorf("PR %s/%s#%d not found", pr.Owner, pr.Repo, pr.Number)
+			// The repo resolved to null (this is what an unresolvable repo
+			// looks like in the data alongside a GraphQL error). Skip this
+			// PR only — its siblings in the batch are unaffected.
+			continue
 		}
 
 		prData := parsePRNode(repoData.PullRequest, pr.Owner, pr.Repo)

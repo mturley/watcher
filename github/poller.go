@@ -64,6 +64,24 @@ func Poll(conn *sql.DB, token string, resources []watcher.Resource, logger *log.
 
 	logger.Printf("Rate limit: %d/%d remaining", rateLimit.Remaining, rateLimit.Limit)
 
+	// A batched GraphQL query reports partial success: an unresolvable repo
+	// nulls its own alias while the rest of the batch succeeds. Those PRs are
+	// skipped rather than failing everything, so name them here — otherwise a
+	// permanently-broken subscription is invisible and its card silently
+	// stays un-enriched forever.
+	if len(prDataList) < len(prRefs) {
+		returned := make(map[string]struct{}, len(prDataList))
+		for _, d := range prDataList {
+			returned[fmt.Sprintf("%s/%s#%d", d.Owner, d.Repo, d.Number)] = struct{}{}
+		}
+		for _, ref := range prRefs {
+			id := fmt.Sprintf("%s/%s#%d", ref.Owner, ref.Repo, ref.Number)
+			if _, ok := returned[id]; !ok {
+				logger.Printf("WARNING: no data returned for %s (unresolvable repo, deleted PR, or no access) — it will stay un-enriched until the subscription is removed", id)
+			}
+		}
+	}
+
 	// Process each PR
 	eventCount := 0
 	for _, prData := range prDataList {
