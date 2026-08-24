@@ -2,6 +2,7 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,6 +29,7 @@ type Client interface {
 	Channel(ctx context.Context, id string) (string, error)
 	Emoji(ctx context.Context) (map[string]string, error)
 	UserGroups(ctx context.Context) (map[string]UserGroup, error)
+	UserGroupsInfo(ctx context.Context, ids []string) (map[string]UserGroup, error)
 	MarkRead(ctx context.Context, channel, threadTS, ts string) error
 	MarkUnread(ctx context.Context, channel, threadTS, ts string) error
 	PostReply(ctx context.Context, channel, threadTS, text string) (Message, error)
@@ -37,22 +40,32 @@ type Client interface {
 // HTTPClient implements Client against Slack's real (or test) Web API.
 type HTTPClient struct {
 	token, cookie, baseURL string
-	hc                     *http.Client
+	// edgeBaseURL hosts Slack's per-org cache API, which is a DIFFERENT host
+	// from the main Web API and speaks JSON rather than form encoding. Tests
+	// point it at the same httptest server as baseURL.
+	edgeBaseURL string
+	hc          *http.Client
+
+	teamIDMu sync.Mutex
+	teamID   string // cached auth.test team/enterprise id, for edge paths
 }
 
 // New returns an HTTPClient pointed at the real Slack Web API.
 func New(token, cookie string) *HTTPClient {
-	return NewWithBaseURL(token, cookie, "https://slack.com/api")
+	c := NewWithBaseURL(token, cookie, "https://slack.com/api")
+	c.edgeBaseURL = "https://edgeapi.slack.com"
+	return c
 }
 
 // NewWithBaseURL returns an HTTPClient pointed at baseURL, for use with
 // httptest servers in tests.
 func NewWithBaseURL(token, cookie, baseURL string) *HTTPClient {
 	return &HTTPClient{
-		token:   token,
-		cookie:  cookie,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		hc:      &http.Client{Timeout: 20 * time.Second},
+		token:       token,
+		cookie:      cookie,
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		edgeBaseURL: strings.TrimRight(baseURL, "/"),
+		hc:          &http.Client{Timeout: 20 * time.Second},
 	}
 }
 
@@ -320,6 +333,98 @@ func (c *HTTPClient) UserGroups(ctx context.Context) (map[string]UserGroup, erro
 	}
 	out := make(map[string]UserGroup, len(r.UserGroups))
 	for _, g := range r.UserGroups {
+		out[g.ID] = UserGroup{ID: g.ID, Name: g.Name, Handle: g.Handle}
+	}
+	return out, nil
+}
+
+// teamIDOnce resolves and caches the team/enterprise id from auth.test. The
+// edge cache API is per-org and carries that id in its URL path.
+func (c *HTTPClient) teamIDOnce(ctx context.Context) (string, error) {
+	c.teamIDMu.Lock()
+	defer c.teamIDMu.Unlock()
+	if c.teamID != "" {
+		return c.teamID, nil
+	}
+	var r struct {
+		TeamID string `json:"team_id"`
+	}
+	if err := c.call(ctx, "auth.test", url.Values{}, &r); err != nil {
+		return "", err
+	}
+	if r.TeamID == "" {
+		return "", fmt.Errorf("auth.test returned no team_id")
+	}
+	c.teamID = r.TeamID
+	return r.TeamID, nil
+}
+
+// UserGroupsInfo resolves specific user groups by subteam id.
+//
+// This is what Slack's own web client uses, and it is the only thing that
+// works on an Enterprise Grid org: usergroups.list enumerates and comes back
+// empty there, and there is no public usergroups.info. See
+// docs/reverse-engineering/slack-web-api.md in the worktree repo for how this
+// was found.
+//
+// It differs from every other call in this client in three ways, which is why
+// it does not go through call(): a different host (the per-org edge cache),
+// a JSON body rather than form encoding, and the token carried in that body
+// rather than as a bearer header.
+func (c *HTTPClient) UserGroupsInfo(ctx context.Context, ids []string) (map[string]UserGroup, error) {
+	out := make(map[string]UserGroup, len(ids))
+	if len(ids) == 0 {
+		return out, nil // nothing to resolve; do not make a pointless request
+	}
+	teamID, err := c.teamIDOnce(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"token": c.token, "ids": ids, "enterprise_token": c.token,
+	})
+	if err != nil {
+		return nil, err
+	}
+	endpoint := fmt.Sprintf("%s/cache/%s/usergroups/info?_x_app_name=client", c.edgeBaseURL, teamID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", "d="+c.cookie)
+
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		OK      bool   `json:"ok"`
+		Error   string `json:"error"`
+		Results []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Handle string `json:"handle"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, err
+	}
+	if !r.OK {
+		switch r.Error {
+		case "invalid_auth", "token_expired", "not_authed":
+			return nil, fmt.Errorf("%w: %s", ErrAuth, r.Error)
+		default:
+			return nil, fmt.Errorf("slack edge error: %s", r.Error)
+		}
+	}
+	for _, g := range r.Results {
 		out[g.ID] = UserGroup{ID: g.ID, Name: g.Name, Handle: g.Handle}
 	}
 	return out, nil

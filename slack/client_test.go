@@ -210,3 +210,64 @@ func TestUserGroupsErrorPropagates(t *testing.T) {
 		t.Fatal("expected an error when Slack returns ok:false")
 	}
 }
+
+// TestUserGroupsInfoResolvesByID pins the edge-cache lookup that Slack's own
+// web client uses. Unlike usergroups.list (which enumerates, and returns
+// nothing at all on an Enterprise Grid org) this resolves specific subteam
+// ids — the shape a renderer needs, since a <!subteam^S…> mention supplies
+// the id and only the name is missing.
+func TestUserGroupsInfoResolvesByID(t *testing.T) {
+	var gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/auth.test":
+			w.Write([]byte(`{"ok":true,"team_id":"E030G10V24F"}`))
+		case strings.Contains(r.URL.Path, "usergroups/info"):
+			gotPath = r.URL.Path
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			w.Write([]byte(`{"ok":true,"results":[
+				{"id":"S1","handle":"platform","name":"Platform Team","team_id":"T9"},
+				{"id":"S2","handle":"design","name":"Design","team_id":"T9"}
+			]}`))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewWithBaseURL("xoxc-token", "xoxd-cookie", srv.URL)
+	got, err := c.UserGroupsInfo(context.Background(), []string{"S1", "S2"})
+	if err != nil {
+		t.Fatalf("UserGroupsInfo() error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 groups, got %d: %+v", len(got), got)
+	}
+	if got["S1"].Handle != "platform" || got["S1"].Name != "Platform Team" {
+		t.Errorf("S1 mapped wrong: %+v", got["S1"])
+	}
+	// The team/enterprise id belongs in the PATH — the endpoint is per-org.
+	if !strings.Contains(gotPath, "E030G10V24F") {
+		t.Errorf("team id missing from path: %s", gotPath)
+	}
+	// The token travels in the JSON BODY here, not as a bearer header.
+	if !strings.Contains(gotBody, `"ids"`) || !strings.Contains(gotBody, "xoxc-token") {
+		t.Errorf("body missing ids/token: %s", gotBody)
+	}
+}
+
+// TestUserGroupsInfoEmptyIDsSkipsCall ensures we never make a pointless
+// round trip for a thread that mentions no groups.
+func TestUserGroupsInfoEmptyIDsSkipsCall(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("should not have called out, got %s", r.URL.Path)
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("xoxc-token", "xoxd-cookie", srv.URL)
+	got, err := c.UserGroupsInfo(context.Background(), nil)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("want empty map and no error, got %v / %v", got, err)
+	}
+}
