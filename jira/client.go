@@ -19,19 +19,25 @@ type Client struct {
 
 // IssueData represents Jira issue data with changelog and comments.
 type IssueData struct {
-	Key          string
-	Summary      string
-	Status       string
-	Priority     string
-	IssueType    string
-	Assignee     *string
-	Reporter     *string
-	Labels       []string
-	CreatedAt    string
-	UpdatedAt    string
-	Comments     []IssueComment
-	Changelog    []ChangelogEntry
-	CustomFields map[string]interface{}
+	Key       string
+	Summary   string
+	Status    string
+	Priority  string
+	IssueType string
+	// IssueTypeID and IssueTypeIconURL support rendering Jira's own
+	// per-issue-type icon. The URL needs Basic auth, so it is never usable
+	// directly from a browser — a consumer must proxy it server-side. The id
+	// is the natural cache key: the icon is per TYPE, not per issue.
+	IssueTypeID      string
+	IssueTypeIconURL string
+	Assignee         *string
+	Reporter         *string
+	Labels           []string
+	CreatedAt        string
+	UpdatedAt        string
+	Comments         []IssueComment
+	Changelog        []ChangelogEntry
+	CustomFields     map[string]interface{}
 }
 
 // IssueComment represents a Jira issue comment.
@@ -102,7 +108,9 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 				Name string `json:"name"`
 			} `json:"priority"`
 			IssueType struct {
-				Name string `json:"name"`
+				ID      string `json:"id"`
+				Name    string `json:"name"`
+				IconURL string `json:"iconUrl"`
 			} `json:"issuetype"`
 			Assignee *struct {
 				DisplayName string `json:"displayName"`
@@ -133,15 +141,17 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 
 	// Build IssueData
 	issue := &IssueData{
-		Key:          raw.Key,
-		Summary:      raw.Fields.Summary,
-		Status:       raw.Fields.Status.Name,
-		Priority:     raw.Fields.Priority.Name,
-		IssueType:    raw.Fields.IssueType.Name,
-		Labels:       raw.Fields.Labels,
-		CreatedAt:    raw.Fields.Created,
-		UpdatedAt:    raw.Fields.Updated,
-		CustomFields: make(map[string]interface{}),
+		Key:              raw.Key,
+		Summary:          raw.Fields.Summary,
+		Status:           raw.Fields.Status.Name,
+		Priority:         raw.Fields.Priority.Name,
+		IssueType:        raw.Fields.IssueType.Name,
+		IssueTypeID:      raw.Fields.IssueType.ID,
+		IssueTypeIconURL: raw.Fields.IssueType.IconURL,
+		Labels:           raw.Fields.Labels,
+		CreatedAt:        raw.Fields.Created,
+		UpdatedAt:        raw.Fields.Updated,
+		CustomFields:     make(map[string]interface{}),
 	}
 	if raw.Key == "" {
 		issue.Key = issueKey

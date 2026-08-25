@@ -397,9 +397,13 @@ func buildJiraStateJSON(issue *IssueData) string {
 		"assignee":   issue.Assignee,
 		"reporter":   issue.Reporter,
 		"issue_type": issue.IssueType,
-		"labels":     issue.Labels,
-		"created_at": issue.CreatedAt,
-		"updated_at": issue.UpdatedAt,
+		// Cached so the UI can render Jira's own icon for the type. Requires
+		// auth to fetch, so consumers proxy it rather than using it directly.
+		"issue_type_id":       issue.IssueTypeID,
+		"issue_type_icon_url": issue.IssueTypeIconURL,
+		"labels":              issue.Labels,
+		"created_at":          issue.CreatedAt,
+		"updated_at":          issue.UpdatedAt,
 	}
 	for k, v := range issue.CustomFields {
 		state[k] = v
