@@ -507,3 +507,39 @@ func TestCachedTitleResolvesMentions(t *testing.T) {
 		t.Fatalf("cached title missing resolved names: %s", stateJSON)
 	}
 }
+
+// TestCachedStateCarriesUnread pins the data the worktree UI's unread dot
+// needs. It is computed at poll time from the read cursor Slack already
+// returns with the thread, so a consumer can show unread state per thread
+// without a per-thread fetch of its own.
+func TestCachedStateCarriesUnread(t *testing.T) {
+	decode := func(js string) map[string]interface{} {
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(js), &m); err != nil {
+			t.Fatalf("state json: %v", err)
+		}
+		return m
+	}
+
+	// Read cursor behind the newest message => unread.
+	behind := Thread{LastRead: "1.0", Messages: []Message{
+		{UserID: "U1", TS: "1.0", Text: "root"},
+		{UserID: "U2", TS: "2.0", Text: "reply"},
+	}}
+	if got := decode(buildSlackStateJSON(behind, "eng", "ana", "root"))["has_unread"]; got != true {
+		t.Fatalf("has_unread = %v, want true when last_read is behind the newest message", got)
+	}
+
+	// Caught up => read.
+	caught := Thread{LastRead: "2.0", Messages: behind.Messages}
+	if got := decode(buildSlackStateJSON(caught, "eng", "ana", "root"))["has_unread"]; got != false {
+		t.Fatalf("has_unread = %v, want false when last_read is at the newest message", got)
+	}
+
+	// No read cursor at all must NOT read as "everything unread" — that
+	// would light up every thread the moment the field shipped.
+	none := Thread{LastRead: "", Messages: behind.Messages}
+	if got := decode(buildSlackStateJSON(none, "eng", "ana", "root"))["has_unread"]; got != false {
+		t.Fatalf("has_unread = %v, want false when there is no read cursor", got)
+	}
+}

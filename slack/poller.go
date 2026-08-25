@@ -357,6 +357,12 @@ func buildSlackStateJSON(thread Thread, channelName, rootAuthor, resolvedRoot st
 		"created_ts":   createdTS,              // raw Slack ts of the root message
 		"updated_ts":   latestThreadTS(thread), // raw Slack ts of the latest message
 		"reply_count":  max(0, len(thread.Messages)-1),
+		// Computed here, not by consumers: the read cursor arrives with the
+		// thread Slack already returns, so caching the verdict lets a UI show
+		// an unread marker per thread with no extra per-thread fetch. Uses
+		// UnreadDividerIndex, so an absent read cursor means "nothing unread"
+		// rather than "everything unread".
+		"has_unread": UnreadDividerIndex(thread) >= 0,
 	}
 	b, _ := json.Marshal(m)
 	return string(b)
