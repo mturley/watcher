@@ -363,6 +363,14 @@ func buildSlackStateJSON(thread Thread, channelName, rootAuthor, resolvedRoot st
 		// UnreadDividerIndex, so an absent read cursor means "nothing unread"
 		// rather than "everything unread".
 		"has_unread": UnreadDividerIndex(thread) >= 0,
+		// The cursor the boolean above was derived from, kept because the
+		// two answer different questions: has_unread says the thread has
+		// something new, last_read says WHICH messages are new. A timeline
+		// interleaving several resources cannot draw a divider, so it marks
+		// individual replies by comparing each message ts against this.
+		// Empty when Slack returned no cursor — distinguishable from "read
+		// up to ts 0", and the case has_unread resolves to false.
+		"last_read": thread.LastRead,
 	}
 	b, _ := json.Marshal(m)
 	return string(b)

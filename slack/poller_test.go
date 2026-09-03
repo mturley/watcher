@@ -543,3 +543,34 @@ func TestCachedStateCarriesUnread(t *testing.T) {
 		t.Fatalf("has_unread = %v, want false when there is no read cursor", got)
 	}
 }
+
+// TestCachedStateCarriesLastRead pins the read CURSOR itself, not just the
+// derived boolean beside it. has_unread answers "does this thread have
+// anything new?"; last_read answers "which messages are the new ones?", which
+// is what a consumer needs to mark individual replies in a timeline that
+// interleaves several resources and so cannot draw a divider.
+func TestCachedStateCarriesLastRead(t *testing.T) {
+	decode := func(js string) map[string]interface{} {
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(js), &m); err != nil {
+			t.Fatalf("state json: %v", err)
+		}
+		return m
+	}
+
+	th := Thread{LastRead: "1.0", Messages: []Message{
+		{UserID: "U1", TS: "1.0", Text: "root"},
+		{UserID: "U2", TS: "2.0", Text: "reply"},
+	}}
+	if got := decode(buildSlackStateJSON(th, "eng", "ana", "root"))["last_read"]; got != "1.0" {
+		t.Fatalf("last_read = %v, want the thread's read cursor verbatim", got)
+	}
+
+	// Absent cursor stays absent rather than becoming "0" or the root ts:
+	// a consumer must be able to tell "read up to here" from "no cursor at
+	// all", which is exactly the case has_unread resolves to false.
+	none := Thread{LastRead: "", Messages: th.Messages}
+	if got := decode(buildSlackStateJSON(none, "eng", "ana", "root"))["last_read"]; got != "" {
+		t.Fatalf("last_read = %v, want empty when the thread has no read cursor", got)
+	}
+}
