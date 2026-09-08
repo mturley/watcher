@@ -3,6 +3,7 @@ package slack
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -269,5 +270,60 @@ func TestUserGroupsInfoEmptyIDsSkipsCall(t *testing.T) {
 	got, err := c.UserGroupsInfo(context.Background(), nil)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("want empty map and no error, got %v / %v", got, err)
+	}
+}
+
+// TestEdgeCallMapsAuthErrors ensures edgeCall maps edge-cache auth failures
+// to ErrAuth the same way UserGroupsInfo used to inline.
+func TestEdgeCallMapsAuthErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "auth.test") {
+			w.Write([]byte(`{"ok":true,"team_id":"E1","user_id":"U1"}`))
+			return
+		}
+		w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
+	}))
+	defer srv.Close()
+
+	c := NewWithBaseURL("tok", "cookie", srv.URL)
+	var out struct{}
+	err := c.edgeCall(context.Background(), "users/search", map[string]any{"query": "x"}, &out)
+	if !errors.Is(err, ErrAuth) {
+		t.Fatalf("want ErrAuth, got %v", err)
+	}
+}
+
+// TestEdgeCallPostsTokenInBodyAtCachePath ensures edgeCall hits the per-org
+// cache path and injects the token into the JSON body (not a header), while
+// preserving the caller's payload fields.
+func TestEdgeCallPostsTokenInBodyAtCachePath(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "auth.test") {
+			w.Write([]byte(`{"ok":true,"team_id":"E1","user_id":"U1"}`))
+			return
+		}
+		gotPath = r.URL.Path
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Write([]byte(`{"ok":true,"results":[]}`))
+	}))
+	defer srv.Close()
+
+	c := NewWithBaseURL("tok", "cookie", srv.URL)
+	var out struct {
+		Results []struct{} `json:"results"`
+	}
+	if err := c.edgeCall(context.Background(), "users/search", map[string]any{"query": "x"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/cache/E1/users/search" {
+		t.Errorf("path = %q, want /cache/E1/users/search", gotPath)
+	}
+	if gotBody["token"] != "tok" || gotBody["enterprise_token"] != "tok" {
+		t.Errorf("token not injected into body: %v", gotBody)
+	}
+	if gotBody["query"] != "x" {
+		t.Errorf("caller payload lost: %v", gotBody)
 	}
 }

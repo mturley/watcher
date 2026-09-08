@@ -359,6 +359,62 @@ func (c *HTTPClient) teamIDOnce(ctx context.Context) (string, error) {
 	return r.TeamID, nil
 }
 
+// edgeCall POSTs payload as JSON to Slack's per-org edge cache and unmarshals
+// the response into out. The edge cache is a DIFFERENT host from the Web API,
+// speaks JSON rather than form encoding, and takes the session token in the
+// BODY rather than a header — see docs/reverse-engineering/slack-web-api.md
+// in the worktree repo. Every edge endpoint shares this shape, so it lives
+// here once rather than being copied per method.
+func (c *HTTPClient) edgeCall(ctx context.Context, path string, payload map[string]any, out any) error {
+	teamID, err := c.teamIDOnce(ctx)
+	if err != nil {
+		return err
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["token"] = c.token
+	payload["enterprise_token"] = c.token
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf("%s/cache/%s/%s?_x_app_name=client", c.edgeBaseURL, teamID, path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", "d="+c.cookie)
+
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	var env struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return err
+	}
+	if !env.OK {
+		switch env.Error {
+		case "invalid_auth", "token_expired", "not_authed":
+			return fmt.Errorf("%w: %s", ErrAuth, env.Error)
+		default:
+			return fmt.Errorf("slack edge error: %s", env.Error)
+		}
+	}
+	return json.Unmarshal(raw, out)
+}
+
 // UserGroupsInfo resolves specific user groups by subteam id.
 //
 // This is what Slack's own web client uses, and it is the only thing that
@@ -366,63 +422,20 @@ func (c *HTTPClient) teamIDOnce(ctx context.Context) (string, error) {
 // empty there, and there is no public usergroups.info. See
 // docs/reverse-engineering/slack-web-api.md in the worktree repo for how this
 // was found.
-//
-// It differs from every other call in this client in three ways, which is why
-// it does not go through call(): a different host (the per-org edge cache),
-// a JSON body rather than form encoding, and the token carried in that body
-// rather than as a bearer header.
 func (c *HTTPClient) UserGroupsInfo(ctx context.Context, ids []string) (map[string]UserGroup, error) {
 	out := make(map[string]UserGroup, len(ids))
 	if len(ids) == 0 {
 		return out, nil // nothing to resolve; do not make a pointless request
 	}
-	teamID, err := c.teamIDOnce(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	payload, err := json.Marshal(map[string]any{
-		"token": c.token, "ids": ids, "enterprise_token": c.token,
-	})
-	if err != nil {
-		return nil, err
-	}
-	endpoint := fmt.Sprintf("%s/cache/%s/usergroups/info?_x_app_name=client", c.edgeBaseURL, teamID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Cookie", "d="+c.cookie)
-
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
 	var r struct {
-		OK      bool   `json:"ok"`
-		Error   string `json:"error"`
 		Results []struct {
 			ID     string `json:"id"`
 			Name   string `json:"name"`
 			Handle string `json:"handle"`
 		} `json:"results"`
 	}
-	if err := json.Unmarshal(body, &r); err != nil {
+	if err := c.edgeCall(ctx, "usergroups/info", map[string]any{"ids": ids}, &r); err != nil {
 		return nil, err
-	}
-	if !r.OK {
-		switch r.Error {
-		case "invalid_auth", "token_expired", "not_authed":
-			return nil, fmt.Errorf("%w: %s", ErrAuth, r.Error)
-		default:
-			return nil, fmt.Errorf("slack edge error: %s", r.Error)
-		}
 	}
 	for _, g := range r.Results {
 		out[g.ID] = UserGroup{ID: g.ID, Name: g.Name, Handle: g.Handle}
