@@ -385,3 +385,37 @@ func TestSearchUsersEmptyQueryMakesNoCall(t *testing.T) {
 		t.Fatalf("got %v, %v; want no users and no error", users, err)
 	}
 }
+
+func TestSearchUserGroupsFiltersDeleted(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/usergroups_search.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "auth.test") {
+			w.Write([]byte(`{"ok":true,"team_id":"E1","user_id":"U1"}`))
+			return
+		}
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Write(fixture)
+	}))
+	defer srv.Close()
+
+	c := NewWithBaseURL("tok", "cookie", srv.URL)
+	groups, err := c.SearchUserGroups(context.Background(), "team", 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// usergroups/search returns DELETED groups (date_delete != 0). Offering
+	// one as a mention would be a dead ping.
+	if len(groups) != 1 || groups[0].ID != "S100" {
+		t.Fatalf("got %+v, want only S100", groups)
+	}
+	if groups[0].Handle != "platform-team" || groups[0].Name != "Platform Team" {
+		t.Errorf("mapped wrong: %+v", groups[0])
+	}
+	if gotBody["org_wide"] != true {
+		t.Errorf("org_wide not sent: %v", gotBody)
+	}
+}

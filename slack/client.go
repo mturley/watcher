@@ -495,3 +495,34 @@ func (c *HTTPClient) SearchUsers(ctx context.Context, query, currentChannel stri
 	}
 	return out, nil
 }
+
+// SearchUserGroups finds user groups by fuzzy match on name AND description.
+// Slack returns deleted groups from this endpoint; they are filtered here.
+func (c *HTTPClient) SearchUserGroups(ctx context.Context, query string, limit int) ([]UserGroup, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	var r struct {
+		Results []struct {
+			ID         string `json:"id"`
+			Handle     string `json:"handle"`
+			Name       string `json:"name"`
+			DateDelete int64  `json:"date_delete"`
+		} `json:"results"`
+	}
+	payload := map[string]any{"query": query, "count": limit, "org_wide": true}
+	if err := c.edgeCall(ctx, "usergroups/search", payload, &r); err != nil {
+		return nil, err
+	}
+	out := make([]UserGroup, 0, len(r.Results))
+	for _, g := range r.Results {
+		if g.DateDelete != 0 {
+			continue
+		}
+		out = append(out, UserGroup{ID: g.ID, Name: g.Name, Handle: g.Handle})
+	}
+	return out, nil
+}

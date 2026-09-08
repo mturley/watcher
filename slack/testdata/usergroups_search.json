@@ -1,0 +1,6 @@
+{"ok":true,"results":[
+ {"id":"S100","handle":"platform-team","name":"Platform Team",
+  "description":"Owns the build system","date_delete":0},
+ {"id":"S200","handle":"old-guild","name":"Retired Guild",
+  "description":"Disbanded","date_delete":1780000000}
+]}
