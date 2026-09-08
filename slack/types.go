@@ -285,3 +285,13 @@ type UserGroup struct {
 	Name   string // human name, e.g. "Platform Team"
 	Handle string // @handle, e.g. "platform"
 }
+
+// Channel is the minimal view of a conversation needed to offer a
+// "#channel" mention. channels/search returns a full conversation object;
+// four fields is all any consumer here needs, so the rest is dropped.
+type Channel struct {
+	ID         string
+	Name       string
+	IsPrivate  bool
+	IsArchived bool
+}

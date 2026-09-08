@@ -419,3 +419,33 @@ func TestSearchUserGroupsFiltersDeleted(t *testing.T) {
 		t.Errorf("org_wide not sent: %v", gotBody)
 	}
 }
+
+func TestSearchChannelsFiltersArchivedAndKeepsPrivate(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/channels_search.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "auth.test") {
+			w.Write([]byte(`{"ok":true,"team_id":"E1","user_id":"U1"}`))
+			return
+		}
+		w.Write(fixture)
+	}))
+	defer srv.Close()
+
+	c := NewWithBaseURL("tok", "cookie", srv.URL)
+	chans, err := c.SearchChannels(context.Background(), "build", 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chans) != 2 {
+		t.Fatalf("got %+v, want 2 (archived filtered, private kept)", chans)
+	}
+	if chans[0].ID != "C100" || chans[0].Name != "build-tools" || chans[0].IsPrivate {
+		t.Errorf("first channel mapped wrong: %+v", chans[0])
+	}
+	if !chans[1].IsPrivate {
+		t.Errorf("private channel should be kept and flagged: %+v", chans[1])
+	}
+}

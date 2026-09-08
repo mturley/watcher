@@ -76,6 +76,15 @@ func (f *fakeClient) UserGroups(ctx context.Context) (map[string]UserGroup, erro
 func (f *fakeClient) UserGroupsInfo(ctx context.Context, ids []string) (map[string]UserGroup, error) {
 	return nil, nil
 }
+func (f *fakeClient) SearchUsers(ctx context.Context, query, currentChannel string, limit int) ([]User, error) {
+	return nil, nil
+}
+func (f *fakeClient) SearchUserGroups(ctx context.Context, query string, limit int) ([]UserGroup, error) {
+	return nil, nil
+}
+func (f *fakeClient) SearchChannels(ctx context.Context, query string, limit int) ([]Channel, error) {
+	return nil, nil
+}
 func (f *fakeClient) MarkRead(ctx context.Context, channel, threadTS, ts string) error   { return nil }
 func (f *fakeClient) MarkUnread(ctx context.Context, channel, threadTS, ts string) error { return nil }
 func (f *fakeClient) PostReply(ctx context.Context, channel, threadTS, text string) (Message, error) {

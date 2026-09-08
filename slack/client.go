@@ -30,6 +30,9 @@ type Client interface {
 	Emoji(ctx context.Context) (map[string]string, error)
 	UserGroups(ctx context.Context) (map[string]UserGroup, error)
 	UserGroupsInfo(ctx context.Context, ids []string) (map[string]UserGroup, error)
+	SearchUsers(ctx context.Context, query, currentChannel string, limit int) ([]User, error)
+	SearchUserGroups(ctx context.Context, query string, limit int) ([]UserGroup, error)
+	SearchChannels(ctx context.Context, query string, limit int) ([]Channel, error)
 	MarkRead(ctx context.Context, channel, threadTS, ts string) error
 	MarkUnread(ctx context.Context, channel, threadTS, ts string) error
 	PostReply(ctx context.Context, channel, threadTS, text string) (Message, error)
@@ -523,6 +526,45 @@ func (c *HTTPClient) SearchUserGroups(ctx context.Context, query string, limit i
 			continue
 		}
 		out = append(out, UserGroup{ID: g.ID, Name: g.Name, Handle: g.Handle})
+	}
+	return out, nil
+}
+
+// SearchChannels finds channels by fuzzy name match. Private channels the
+// user belongs to ARE included (flagged via IsPrivate); archived channels are
+// filtered, since mentioning one is a dead link.
+func (c *HTTPClient) SearchChannels(ctx context.Context, query string, limit int) ([]Channel, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	var r struct {
+		Results []struct {
+			ID         string `json:"id"`
+			Name       string `json:"name"`
+			IsPrivate  bool   `json:"is_private"`
+			IsArchived bool   `json:"is_archived"`
+		} `json:"results"`
+	}
+	// top_channels is only a client-side ranking hint and is deliberately
+	// omitted; check_membership/include_record_channels mirror what Slack's
+	// own client sends.
+	payload := map[string]any{
+		"query": query, "count": limit, "fuzz": 1,
+		"check_membership":        true,
+		"include_record_channels": true,
+	}
+	if err := c.edgeCall(ctx, "channels/search", payload, &r); err != nil {
+		return nil, err
+	}
+	out := make([]Channel, 0, len(r.Results))
+	for _, ch := range r.Results {
+		if ch.IsArchived {
+			continue
+		}
+		out = append(out, Channel{ID: ch.ID, Name: ch.Name, IsPrivate: ch.IsPrivate, IsArchived: false})
 	}
 	return out, nil
 }
