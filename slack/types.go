@@ -272,6 +272,7 @@ type Reaction struct {
 
 type User struct {
 	ID          string
+	Name        string // Slack handle, e.g. "aroberts"
 	RealName    string
 	DisplayName string
 	Avatar72    string

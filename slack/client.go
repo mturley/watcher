@@ -238,6 +238,7 @@ func (c *HTTPClient) Users(ctx context.Context, ids []string) (map[string]User, 
 		var r struct {
 			User struct {
 				ID       string `json:"id"`
+				Name     string `json:"name"`
 				RealName string `json:"real_name"`
 				Profile  struct {
 					DisplayName        string `json:"display_name"`
@@ -252,6 +253,7 @@ func (c *HTTPClient) Users(ctx context.Context, ids []string) (map[string]User, 
 		}
 		out[id] = User{
 			ID:          id,
+			Name:        r.User.Name,
 			RealName:    r.User.RealName,
 			DisplayName: r.User.Profile.DisplayName,
 			Avatar72:    r.User.Profile.Image72,
@@ -439,6 +441,57 @@ func (c *HTTPClient) UserGroupsInfo(ctx context.Context, ids []string) (map[stri
 	}
 	for _, g := range r.Results {
 		out[g.ID] = UserGroup{ID: g.ID, Name: g.Name, Handle: g.Handle}
+	}
+	return out, nil
+}
+
+// SearchUsers finds users by fuzzy substring across the org, the way Slack's
+// own composer does. currentChannel is a RANKING HINT, not a filter — results
+// are org-wide. Deleted users are filtered here so no consumer can offer a
+// mention of a departed account.
+func (c *HTTPClient) SearchUsers(ctx context.Context, query, currentChannel string, limit int) ([]User, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, nil // a bare trigger must not cost a Slack call
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	var r struct {
+		Results []struct {
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			RealName string `json:"real_name"`
+			Deleted  bool   `json:"deleted"`
+			Profile  struct {
+				DisplayName string `json:"display_name"`
+				Image72     string `json:"image_72"`
+			} `json:"profile"`
+		} `json:"results"`
+	}
+	payload := map[string]any{
+		"query":                      query,
+		"count":                      limit,
+		"fuzz":                       1,
+		"include_profile_only_users": true,
+		"enable_workspace_ranking":   true,
+		"top_users":                  []string{},
+		"current_channel":            currentChannel,
+	}
+	if err := c.edgeCall(ctx, "users/search", payload, &r); err != nil {
+		return nil, err
+	}
+	out := make([]User, 0, len(r.Results))
+	for _, u := range r.Results {
+		if u.Deleted {
+			continue
+		}
+		out = append(out, User{
+			ID:          u.ID,
+			Name:        u.Name,
+			RealName:    u.RealName,
+			DisplayName: u.Profile.DisplayName,
+			Avatar72:    u.Profile.Image72,
+		})
 	}
 	return out, nil
 }

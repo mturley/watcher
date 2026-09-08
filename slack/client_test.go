@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 )
@@ -325,5 +326,62 @@ func TestEdgeCallPostsTokenInBodyAtCachePath(t *testing.T) {
 	}
 	if gotBody["query"] != "x" {
 		t.Errorf("caller payload lost: %v", gotBody)
+	}
+}
+
+func TestSearchUsers(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/users_search.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "auth.test") {
+			w.Write([]byte(`{"ok":true,"team_id":"E1","user_id":"U1"}`))
+			return
+		}
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Write(fixture)
+	}))
+	defer srv.Close()
+
+	c := NewWithBaseURL("tok", "cookie", srv.URL)
+	users, err := c.SearchUsers(context.Background(), "rob", "C1", 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deleted users are filtered in the library so no consumer has to remember.
+	if len(users) != 2 {
+		t.Fatalf("got %d users, want 2 (deleted filtered): %+v", len(users), users)
+	}
+	if users[0].ID != "U100" || users[0].Name != "aroberts" || users[0].DisplayName != "ada" {
+		t.Errorf("first user mapped wrong: %+v", users[0])
+	}
+	if users[0].Avatar72 != "https://example.invalid/ada_72.png" {
+		t.Errorf("avatar not mapped: %+v", users[0])
+	}
+
+	// The ranking/fuzz parameters Slack's own client sends must be present.
+	for _, k := range []string{"fuzz", "include_profile_only_users", "enable_workspace_ranking"} {
+		if _, ok := gotBody[k]; !ok {
+			t.Errorf("payload missing %q: %v", k, gotBody)
+		}
+	}
+	if gotBody["query"] != "rob" || gotBody["current_channel"] != "C1" || gotBody["count"] != float64(25) {
+		t.Errorf("payload wrong: %v", gotBody)
+	}
+}
+
+func TestSearchUsersEmptyQueryMakesNoCall(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request to %s", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	c := NewWithBaseURL("tok", "cookie", srv.URL)
+	users, err := c.SearchUsers(context.Background(), "   ", "C1", 25)
+	if err != nil || len(users) != 0 {
+		t.Fatalf("got %v, %v; want no users and no error", users, err)
 	}
 }

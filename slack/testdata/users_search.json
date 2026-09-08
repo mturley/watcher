@@ -1,0 +1,10 @@
+{"ok":true,"results":[
+ {"id":"U100","name":"aroberts","deleted":false,"is_bot":false,"real_name":"Ada Roberts",
+  "profile":{"display_name":"ada","real_name":"Ada Roberts",
+             "image_72":"https://example.invalid/ada_72.png"}},
+ {"id":"U200","name":"brobson","deleted":false,"is_bot":false,"real_name":"Ben Robson",
+  "profile":{"display_name":"","real_name":"Ben Robson",
+             "image_72":"https://example.invalid/ben_72.png"}},
+ {"id":"U300","name":"crobin","deleted":true,"is_bot":false,"real_name":"Cara Robin",
+  "profile":{"display_name":"cara","real_name":"Cara Robin","image_72":""}}
+]}
