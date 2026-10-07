@@ -27,6 +27,7 @@ type PRData struct {
 	Title               string
 	Author              string
 	AuthorType          string
+	AuthorID            string // decimal databaseId; "" when unknown
 	UpdatedAt           string
 	Reviews             []Review
 	Comments            []Comment
@@ -43,6 +44,7 @@ type PRData struct {
 type Review struct {
 	Author      string
 	AuthorType  string
+	AuthorID    string // decimal databaseId; "" when unknown
 	State       string
 	SubmittedAt string
 	Body        string
@@ -52,6 +54,7 @@ type Review struct {
 type Comment struct {
 	Author     string
 	AuthorType string
+	AuthorID   string // decimal databaseId; "" when unknown
 	CreatedAt  string
 	Body       string
 }
@@ -60,6 +63,7 @@ type Comment struct {
 type ReviewComment struct {
 	Author     string
 	AuthorType string
+	AuthorID   string // decimal databaseId; "" when unknown
 	CreatedAt  string
 	Path       string
 	Body       string
@@ -220,12 +224,16 @@ func buildBatchedPRQuery(prs []PRRef) string {
         author {
           __typename
           login
+          ... on User { databaseId }
+          ... on Bot { databaseId }
         }
         reviews(last: 20) {
           nodes {
             author {
               __typename
               login
+              ... on User { databaseId }
+              ... on Bot { databaseId }
             }
             state
             submittedAt
@@ -237,6 +245,8 @@ func buildBatchedPRQuery(prs []PRRef) string {
             author {
               __typename
               login
+              ... on User { databaseId }
+              ... on Bot { databaseId }
             }
             createdAt
             body
@@ -249,6 +259,8 @@ func buildBatchedPRQuery(prs []PRRef) string {
                 author {
                   __typename
                   login
+                  ... on User { databaseId }
+                  ... on Bot { databaseId }
                 }
                 createdAt
                 path
@@ -472,8 +484,18 @@ type statusCheckContext struct {
 }
 
 type authorNode struct {
-	Typename string `json:"__typename"`
-	Login    string `json:"login"`
+	Typename   string `json:"__typename"`
+	Login      string `json:"login"`
+	DatabaseID *int64 `json:"databaseId"` // absent for actors that aren't a User or Bot
+}
+
+// id is the actor's stable numeric ID as a decimal string, or "" when
+// GitHub didn't supply one (e.g. a Mannequin or a deleted account).
+func (a authorNode) id() string {
+	if a.DatabaseID == nil {
+		return ""
+	}
+	return strconv.FormatInt(*a.DatabaseID, 10)
 }
 
 // parsePRNode converts a prNode into a PRData struct.
@@ -486,6 +508,7 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 		Title:      node.Title,
 		Author:     node.Author.Login,
 		AuthorType: authorType(node.Author.Typename),
+		AuthorID:   node.Author.id(),
 		UpdatedAt:  node.UpdatedAt,
 	}
 
@@ -494,6 +517,7 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 		data.Reviews = append(data.Reviews, Review{
 			Author:      r.Author.Login,
 			AuthorType:  authorType(r.Author.Typename),
+			AuthorID:    r.Author.id(),
 			State:       r.State,
 			SubmittedAt: r.SubmittedAt,
 			Body:        r.Body,
@@ -505,6 +529,7 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 		data.Comments = append(data.Comments, Comment{
 			Author:     c.Author.Login,
 			AuthorType: authorType(c.Author.Typename),
+			AuthorID:   c.Author.id(),
 			CreatedAt:  c.CreatedAt,
 			Body:       c.Body,
 		})
@@ -516,6 +541,7 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 			data.ReviewComments = append(data.ReviewComments, ReviewComment{
 				Author:     rc.Author.Login,
 				AuthorType: authorType(rc.Author.Typename),
+				AuthorID:   rc.Author.id(),
 				CreatedAt:  rc.CreatedAt,
 				Path:       rc.Path,
 				Body:       rc.Body,

@@ -1019,3 +1019,29 @@ func TestBuildPRStateJSON_Author(t *testing.T) {
 		t.Errorf("state[\"author\"] = %v, want %v", got, want)
 	}
 }
+
+func TestProcessPR_CommentCarriesAuthorID(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := processPR(conn, PRData{Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "T",
+		UpdatedAt: "2026-06-17T08:00:00Z"}, prResource, "t", false, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	pr := PRData{Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "T", UpdatedAt: "2026-06-17T10:00:00Z",
+		Comments: []Comment{{Author: "alice", AuthorType: "user", AuthorID: "101", CreatedAt: "2026-06-17T09:00:00Z", Body: "hi"}}}
+	if _, err := processPR(conn, pr, prResource, "t", false, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	evs, _ := db.EventsForResource(conn, "pr", prResource.ID)
+	for _, e := range evs {
+		if e.Type == watcher.EventTypePRComment {
+			if e.AuthorID == nil || *e.AuthorID != "101" {
+				t.Fatalf("pr_comment AuthorID = %v, want 101", e.AuthorID)
+			}
+			return
+		}
+	}
+	t.Fatal("no pr_comment emitted")
+}

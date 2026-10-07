@@ -2,10 +2,10 @@ package github
 
 import (
 	"encoding/json"
-	"testing"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"testing"
 )
 
 // TestParseGraphQLResponse_Author verifies that the PR-level author is
@@ -106,5 +106,37 @@ func TestFetchPRsTotalFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "myrepo") {
 		t.Errorf("error should name the failing repo, got: %v", err)
+	}
+}
+
+func TestParseGraphQLResponse_AuthorIDs(t *testing.T) {
+	raw := `{
+		"pr0": {"pullRequest": {
+			"number": 1, "state": "OPEN", "title": "T", "updatedAt": "2024-01-01T00:00:00Z",
+			"author": {"__typename": "User", "login": "alice", "databaseId": 101},
+			"reviews": {"nodes": [{"author": {"__typename": "Bot", "login": "rabbit", "databaseId": 202}, "state": "COMMENTED", "submittedAt": "2024-01-01T00:00:00Z", "body": "b"}]},
+			"comments": {"nodes": [{"author": {"__typename": "Mannequin", "login": "ghost"}, "createdAt": "2024-01-01T00:00:00Z", "body": "c"}]},
+			"reviewThreads": {"nodes": [{"comments": {"nodes": [{"author": {"__typename": "User", "login": "bob", "databaseId": 303}, "createdAt": "2024-01-01T00:00:00Z", "path": "x.go", "body": "rc"}]}}]},
+			"commits": {"totalCount": 0, "nodes": []}
+		}},
+		"rateLimit": {"remaining": 5000, "limit": 5000}
+	}`
+	res, _, err := parseGraphQLResponse(json.RawMessage(raw), []PRRef{{Owner: "o", Repo: "r", Number: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := res[0]
+	if pr.AuthorID != "101" || pr.Reviews[0].AuthorID != "202" || pr.ReviewComments[0].AuthorID != "303" {
+		t.Fatalf("ids = %q %q %q", pr.AuthorID, pr.Reviews[0].AuthorID, pr.ReviewComments[0].AuthorID)
+	}
+	if pr.Comments[0].AuthorID != "" {
+		t.Fatalf("an actor without databaseId must yield \"\", got %q", pr.Comments[0].AuthorID)
+	}
+}
+
+func TestBuildBatchedPRQueryRequestsDatabaseIDs(t *testing.T) {
+	q := buildBatchedPRQuery([]PRRef{{Owner: "o", Repo: "r", Number: 1}})
+	if n := strings.Count(q, "... on User { databaseId }"); n < 4 {
+		t.Fatalf("expected databaseId fragments at every author selection, found %d", n)
 	}
 }

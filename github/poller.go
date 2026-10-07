@@ -119,7 +119,7 @@ func Poll(conn *sql.DB, token string, resources []watcher.Resource, logger *log.
 
 // emitEvent inserts a watcher event for the given resource, setting the
 // ID and recording timestamp that db.InsertEvent does not set.
-func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType *string, r watcher.Resource) error {
+func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType, authorID *string, r watcher.Resource) error {
 	extTS := externalTS
 	return db.InsertEvent(conn, watcher.Event{
 		ID:         uuid.New().String(),
@@ -131,6 +131,7 @@ func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, ex
 		Body:       body,
 		Author:     author,
 		AuthorType: authorType,
+		AuthorID:   authorID,
 	}, r)
 }
 
@@ -170,7 +171,7 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 	if cursor == "" && !backfill {
 		title := fmt.Sprintf("Started watching PR: %s", prData.Title)
 		body := fmt.Sprintf("PR #%d in %s/%s\nState: %s", prData.Number, prData.Owner, prData.Repo, prData.State)
-		if err := emitEvent(conn, watcher.EventTypeWatchStarted, title, &body, prData.UpdatedAt, nil, nil, resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypeWatchStarted, title, &body, prData.UpdatedAt, nil, nil, nil, resource); err != nil {
 			return eventCount, fmt.Errorf("failed to emit watch_started event: %w", err)
 		}
 		eventCount++
@@ -221,7 +222,7 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 			title = fmt.Sprintf("PR review by %s", review.Author)
 		}
 
-		if err := emitEvent(conn, eventType, title, &review.Body, review.SubmittedAt, &review.Author, &review.AuthorType, resource); err != nil {
+		if err := emitEvent(conn, eventType, title, &review.Body, review.SubmittedAt, &review.Author, &review.AuthorType, optional(review.AuthorID), resource); err != nil {
 			return eventCount, fmt.Errorf("failed to emit %s event: %w", eventType, err)
 		}
 		eventCount++
@@ -249,7 +250,7 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 		}
 
 		title := fmt.Sprintf("Comment by %s", comment.Author)
-		if err := emitEvent(conn, watcher.EventTypePRComment, title, &comment.Body, comment.CreatedAt, &comment.Author, &comment.AuthorType, resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypePRComment, title, &comment.Body, comment.CreatedAt, &comment.Author, &comment.AuthorType, optional(comment.AuthorID), resource); err != nil {
 			return eventCount, fmt.Errorf("failed to emit pr_comment event: %w", err)
 		}
 		eventCount++
@@ -285,7 +286,7 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 			continue
 		}
 
-		if err := emitEvent(conn, watcher.EventTypePRReviewComment, title, &reviewComment.Body, reviewComment.CreatedAt, &reviewComment.Author, &reviewComment.AuthorType, resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypePRReviewComment, title, &reviewComment.Body, reviewComment.CreatedAt, &reviewComment.Author, &reviewComment.AuthorType, optional(reviewComment.AuthorID), resource); err != nil {
 			return eventCount, fmt.Errorf("failed to emit pr_review_comment event: %w", err)
 		}
 		eventCount++
@@ -515,7 +516,7 @@ skipCIBundle:
 		if !dup {
 			title := fmt.Sprintf("PR %s", prData.State)
 			body := fmt.Sprintf("PR #%d: %s", prData.Number, prData.Title)
-			if err := emitEvent(conn, eventType, title, &body, prData.UpdatedAt, nil, nil, resource); err != nil {
+			if err := emitEvent(conn, eventType, title, &body, prData.UpdatedAt, nil, nil, nil, resource); err != nil {
 				return eventCount, fmt.Errorf("failed to emit %s event: %w", eventType, err)
 			}
 			eventCount++
@@ -556,7 +557,7 @@ skipCIBundle:
 			} else if !dup {
 				title := fmt.Sprintf("New commits pushed to PR #%d", prData.Number)
 				body := formatNewCommitsBody(prData, prevSHA)
-				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, nil, nil, resource); err != nil {
+				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, nil, nil, nil, resource); err != nil {
 					logger.Printf("WARNING: failed to emit new commits event: %v", err)
 				} else {
 					eventCount++
@@ -774,4 +775,12 @@ func workflowFingerprint(prData PRData) string {
 	}
 	sort.Strings(entries)
 	return prData.Commits.LatestSHA + "|" + strings.Join(entries, "\n")
+}
+
+// optional returns &s, or nil for "", so an unknown ID stores NULL.
+func optional(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
