@@ -16,9 +16,9 @@ func InsertEvent(conn *sql.DB, e watcher.Event, r watcher.Resource) error {
 	}
 
 	if _, err := tx.Exec(`
-		INSERT INTO watcher_events (id, ts, external_ts, source, type, title, body, author, author_type, tags)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, e.ID, e.TS, e.ExternalTS, e.Source, string(e.Type), e.Title, e.Body, e.Author, e.AuthorType, e.Tags); err != nil {
+		INSERT INTO watcher_events (id, ts, external_ts, source, type, title, body, author, author_type, tags, author_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, e.ID, e.TS, e.ExternalTS, e.Source, string(e.Type), e.Title, e.Body, e.Author, e.AuthorType, e.Tags, e.AuthorID); err != nil {
 		tx.Rollback()
 		return fmt.Errorf("failed to insert event: %w", err)
 	}

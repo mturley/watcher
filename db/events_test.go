@@ -93,3 +93,35 @@ func TestIsDuplicateRequiresAtLeastOneMatcher(t *testing.T) {
 		t.Errorf("both ExternalTS and Title set should be allowed, got error: %v", err)
 	}
 }
+
+func TestInsertEventRoundTripsAuthorID(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	ts := "2026-01-15T12:00:00Z"
+	id, login := "583231", "alice"
+	res := watcher.Resource{Type: "pr", ID: "owner/repo#1"}
+	if err := InsertEvent(c, watcher.Event{ID: "e1", TS: ts, ExternalTS: &ts, Source: "github",
+		Type: watcher.EventTypePRComment, Title: "c", Author: &login, AuthorID: &id}, res); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertEvent(c, watcher.Event{ID: "e2", TS: ts, ExternalTS: &ts, Source: "github",
+		Type: watcher.EventTypePRComment, Title: "d"}, res); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := EventsForResource(c, "pr", "owner/repo#1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]*string{}
+	for _, e := range evs {
+		got[e.ID] = e.AuthorID
+	}
+	if got["e1"] == nil || *got["e1"] != id {
+		t.Fatalf("e1 AuthorID = %v, want %q", got["e1"], id)
+	}
+	if got["e2"] != nil {
+		t.Fatalf("e2 AuthorID = %q, want nil", *got["e2"])
+	}
+}

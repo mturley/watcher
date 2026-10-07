@@ -39,7 +39,8 @@ package db
 // in migrate.go). The bump is required so databases already at version 3
 // re-run the migration path and pick up the new column via
 // ensureAdditiveColumns.
-const CurrentSchemaVersion = 4
+// Bumped to 5 to add watcher_events.author_id (see additiveColumns).
+const CurrentSchemaVersion = 5
 
 // managedTables is the exact set of tables Migrate owns.
 var managedTables = []string{
@@ -56,7 +57,7 @@ var managedColumns = map[string][]string{
 	"watcher_schema_version": {"version", "migrated_at"},
 	"watcher_events": {
 		"id", "ts", "external_ts", "source", "type", "title", "body",
-		"author", "author_type", "tags",
+		"author", "author_type", "tags", "author_id",
 	},
 	"watcher_event_resources": {
 		"event_id", "resource_type", "resource_id", "resource_url",
@@ -100,7 +101,8 @@ CREATE TABLE IF NOT EXISTS watcher_events (
 	body TEXT,
 	author TEXT,
 	author_type TEXT,
-	tags TEXT
+	tags TEXT,
+	author_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS watcher_event_resources (

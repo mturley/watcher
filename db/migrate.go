@@ -118,6 +118,11 @@ var additiveColumns = map[string]map[string]string{
 	"watcher_resource_meta": {
 		"updated_at": "TEXT",
 	},
+	// author_id: the author's stable account ID (schema v5). Nullable, never
+	// backfilled: events recorded before v5 simply have no ID.
+	"watcher_events": {
+		"author_id": "TEXT",
+	},
 }
 
 // ensureAdditiveColumns adds any column in additiveColumns that is

@@ -298,3 +298,27 @@ func TestMigrateAddsUnsubscribedByUserColumn(t *testing.T) {
 		t.Fatal("watcher_subscriptions missing unsubscribed_by_user column")
 	}
 }
+
+// A database already at v4 (no author_id) must gain the column on Migrate.
+// Without the v5 bump, Migrate would return early and never add it.
+func TestMigrateV4AddsEventAuthorID(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec(`ALTER TABLE watcher_events DROP COLUMN author_id`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec(`UPDATE watcher_schema_version SET version = 4`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(c); err != nil {
+		t.Fatalf("Migrate on a v4 DB: %v", err)
+	}
+	if !hasColumn(t, c, "watcher_events", "author_id") {
+		t.Fatal("watcher_events missing author_id after migrating from v4")
+	}
+	if v, _ := SchemaVersion(c); v != 5 {
+		t.Fatalf("version = %d, want 5", v)
+	}
+}

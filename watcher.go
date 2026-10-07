@@ -24,4 +24,8 @@ type Event struct {
 	Author     *string
 	AuthorType *string
 	Tags       *string // e.g. "commit:<sha>" for CI bundles
+	// AuthorID is the author's stable account ID in Source's own namespace
+	// (GitHub databaseId, Jira accountId, Slack user ID); nil when unknown.
+	// Compare it only together with Source.
+	AuthorID *string
 }
