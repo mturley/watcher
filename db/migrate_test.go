@@ -322,3 +322,25 @@ func TestMigrateV4AddsEventAuthorID(t *testing.T) {
 		t.Fatalf("version = %d, want 5", v)
 	}
 }
+
+// A database migrated by a NEWER library (higher version, extra additive
+// columns) must still open: refusing it would brick every older consumer
+// binary the moment a newer one touches the shared DB file.
+func TestMigrateAcceptsNewerSchema(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec(`ALTER TABLE watcher_events ADD COLUMN from_the_future TEXT`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec(`UPDATE watcher_schema_version SET version = ?`, CurrentSchemaVersion+1); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(c); err != nil {
+		t.Fatalf("Migrate on a newer-schema DB: %v", err)
+	}
+	if v, _ := SchemaVersion(c); v != CurrentSchemaVersion+1 {
+		t.Fatalf("version = %d, want it left at %d", v, CurrentSchemaVersion+1)
+	}
+}

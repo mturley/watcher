@@ -22,6 +22,16 @@ func Migrate(conn *sql.DB) error {
 	if version == CurrentSchemaVersion {
 		return nil
 	}
+	// A newer library already migrated this database. Every schema change so
+	// far has been additive (new tables, new nullable columns), which this
+	// older code can safely ignore, so open it as-is rather than letting the
+	// collision check refuse the wider tables: refusing would brick every
+	// older consumer binary the moment a newer one touched the shared file.
+	// A future NON-additive change must not rely on this; it needs its own
+	// explicit compatibility gate.
+	if version > CurrentSchemaVersion {
+		return nil
+	}
 
 	if err := ensureAdditiveColumns(conn); err != nil {
 		return err
