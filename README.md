@@ -331,6 +331,34 @@ X?"), so each service is optional. Transport (non-`ErrAuth`) errors are surfaced
 without prompting — a network blip shouldn't ask the user to re-enter a valid
 token.
 
+## Event authors
+
+Every event carries the display `author`, an `author_type` (`user` / `bot` /
+`human`), and, since schema v5 (v0.10.0), an `author_id`: the author's
+stable account ID in the source's own namespace.
+
+| Source | `author_id` |
+|---|---|
+| GitHub | the actor's numeric `databaseId`, as a decimal string |
+| Jira | the `accountId` |
+| Slack | the user ID (`U…`) |
+
+`author_id` is NULL for events recorded before v5, for authorless events
+(CI results, `pr_closed`, `watch_started`, errors), and when the source gave
+no ID (a GitHub Mannequin or deleted account, a Slack bot post without a
+user). Compare it only together with `source`: IDs are unique within a
+source, not across sources.
+
+Two GitHub events are attributed beyond their source payload:
+
+- `pr_merged` is attributed to the PR's `mergedBy`.
+- `pr_new_commits` is attributed only when every commit the event covers is
+  linked to the same GitHub user. A mixed or unlinked push stays authorless.
+
+To recognise the user's own events, look up their ID with
+`github.ViewerID(token)` or `jira.AccountID(host, email, token)`; for Slack,
+`(*slack.HTTPClient).WhoAmI(ctx)` already returns it.
+
 ## Resource ID formats
 
 | Type    | ID format                    | Example                            |
