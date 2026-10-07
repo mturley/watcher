@@ -236,6 +236,9 @@ func TestPoll_NewReplyEmitsSlackReplyWithVerbatimTS(t *testing.T) {
 	if ev.ExternalTS == nil || *ev.ExternalTS != reply.TS {
 		t.Errorf("ExternalTS = %v, want verbatim %q (raw Slack ts, never RFC3339)", ev.ExternalTS, reply.TS)
 	}
+	if ev.AuthorID == nil || *ev.AuthorID != "U2" {
+		t.Errorf("AuthorID = %v, want the replier's user ID U2", ev.AuthorID)
+	}
 	if ev.Body == nil {
 		t.Fatal("expected non-nil body")
 	}

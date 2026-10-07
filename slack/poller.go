@@ -110,7 +110,7 @@ func Poll(conn *sql.DB, cfg SlackAuth, resources []watcher.Resource, logger *log
 
 // emitEvent inserts a watcher event for the given resource, setting the ID
 // and recording timestamp that db.InsertEvent does not set.
-func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType *string, r watcher.Resource) error {
+func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType, authorID *string, r watcher.Resource) error {
 	extTS := externalTS
 	return db.InsertEvent(conn, watcher.Event{
 		ID:         uuid.New().String(),
@@ -122,6 +122,7 @@ func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, ex
 		Body:       body,
 		Author:     author,
 		AuthorType: authorType,
+		AuthorID:   authorID,
 	}, r)
 }
 
@@ -169,7 +170,7 @@ func processThread(conn *sql.DB, thread Thread, names map[string]string, resourc
 	if cursor == "" && !backfill {
 		wsTitle := fmt.Sprintf("Started watching thread: %s", title)
 		body := title
-		if err := emitEvent(conn, watcher.EventTypeWatchStarted, wsTitle, &body, latestThreadTS(thread), nil, nil, resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypeWatchStarted, wsTitle, &body, latestThreadTS(thread), nil, nil, nil, resource); err != nil {
 			return 0, fmt.Errorf("emit watch_started: %w", err)
 		}
 		return 1, nil
@@ -207,7 +208,7 @@ func processThread(conn *sql.DB, thread Thread, names map[string]string, resourc
 		if author != "" {
 			authorPtr = &author
 		}
-		if err := emitEvent(conn, watcher.EventTypeSlackReply, evTitle, &body, m.TS, authorPtr, nil, resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypeSlackReply, evTitle, &body, m.TS, authorPtr, nil, optional(m.UserID), resource); err != nil {
 			return eventCount, fmt.Errorf("emit slack_reply: %w", err)
 		}
 		eventCount++
@@ -374,4 +375,12 @@ func buildSlackStateJSON(thread Thread, channelName, rootAuthor, resolvedRoot st
 	}
 	b, _ := json.Marshal(m)
 	return string(b)
+}
+
+// optional returns &s, or nil for "", so an unknown ID stores NULL.
+func optional(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

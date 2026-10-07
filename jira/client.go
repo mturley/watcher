@@ -43,6 +43,7 @@ type IssueData struct {
 // IssueComment represents a Jira issue comment.
 type IssueComment struct {
 	Author    string
+	AuthorID  string // Jira accountId; "" when absent
 	CreatedAt string
 	Body      string // Summary text, not full ADF
 }
@@ -50,6 +51,7 @@ type IssueComment struct {
 // ChangelogEntry represents a single Jira changelog item.
 type ChangelogEntry struct {
 	Author    string
+	AuthorID  string // Jira accountId; "" when absent
 	CreatedAt string
 	Field     string
 	From      string
@@ -240,6 +242,7 @@ func (c *Client) fetchChangelog(issueKey string) ([]ChangelogEntry, error) {
 			Values     []struct {
 				Author struct {
 					DisplayName string `json:"displayName"`
+					AccountID   string `json:"accountId"`
 				} `json:"author"`
 				Created string `json:"created"`
 				Items   []struct {
@@ -257,6 +260,7 @@ func (c *Client) fetchChangelog(issueKey string) ([]ChangelogEntry, error) {
 			for _, item := range history.Items {
 				entries = append(entries, ChangelogEntry{
 					Author:    history.Author.DisplayName,
+					AuthorID:  history.Author.AccountID,
 					CreatedAt: history.Created,
 					Field:     item.Field,
 					From:      item.FromString,
@@ -298,6 +302,7 @@ func (c *Client) fetchComments(issueKey string) ([]IssueComment, error) {
 			Comments   []struct {
 				Author struct {
 					DisplayName string `json:"displayName"`
+					AccountID   string `json:"accountId"`
 				} `json:"author"`
 				Created string      `json:"created"`
 				Body    interface{} `json:"body"` // ADF JSON
@@ -314,6 +319,7 @@ func (c *Client) fetchComments(issueKey string) ([]IssueComment, error) {
 			}
 			comments = append(comments, IssueComment{
 				Author:    cm.Author.DisplayName,
+				AuthorID:  cm.Author.AccountID,
 				CreatedAt: cm.Created,
 				Body:      body,
 			})

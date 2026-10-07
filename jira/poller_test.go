@@ -586,3 +586,66 @@ func changelogPage(start, total int, isLast bool, count int) map[string]interfac
 		"values":     values,
 	}
 }
+
+func TestFetchIssue_DecodesAccountIDs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/rest/api/3/issue/X-1":
+			json.NewEncoder(w).Encode(map[string]interface{}{"key": "X-1", "fields": map[string]interface{}{
+				"summary": "S", "status": map[string]interface{}{"name": "Open"}}})
+		case "/rest/api/3/issue/X-1/changelog":
+			json.NewEncoder(w).Encode(map[string]interface{}{"startAt": 0, "maxResults": 100, "total": 1, "isLast": true,
+				"values": []interface{}{map[string]interface{}{
+					"author":  map[string]interface{}{"displayName": "Jane", "accountId": "acc-jane"},
+					"created": "2026-06-17T09:00:00.000+0000",
+					"items":   []interface{}{map[string]interface{}{"field": "status", "fromString": "A", "toString": "B"}},
+				}}})
+		case "/rest/api/3/issue/X-1/comment":
+			json.NewEncoder(w).Encode(map[string]interface{}{"startAt": 0, "maxResults": 100, "total": 1,
+				"comments": []interface{}{map[string]interface{}{
+					"author":  map[string]interface{}{"displayName": "Jane", "accountId": "acc-jane"},
+					"created": "2026-06-17T09:30:00.000+0000", "body": "plain",
+				}}})
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	issue, err := (&Client{BaseURL: server.URL, Email: "e", Token: "t"}).FetchIssue("X-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issue.Changelog[0].AuthorID != "acc-jane" || issue.Comments[0].AuthorID != "acc-jane" {
+		t.Fatalf("ids = %q / %q", issue.Changelog[0].AuthorID, issue.Comments[0].AuthorID)
+	}
+}
+
+func TestProcessIssue_EventsCarryAuthorID(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	processIssue(conn, JiraAuth{}, IssueData{Key: "RHOAIENG-123", Summary: "S", Status: "To Do",
+		Changelog: []ChangelogEntry{{Author: "J", CreatedAt: "2026-06-17T08:00:00.000+0000", Field: "status", From: "A", To: "B"}}},
+		jiraResource, false, testLogger())
+	issue := IssueData{Key: "RHOAIENG-123", Summary: "S", Status: "Done",
+		Comments:  []IssueComment{{Author: "Jane", AuthorID: "acc-jane", CreatedAt: "2026-06-17T09:00:00.000+0000", Body: "c"}},
+		Changelog: []ChangelogEntry{{Author: "Jane", AuthorID: "acc-jane", CreatedAt: "2026-06-17T09:30:00.000+0000", Field: "status", From: "B", To: "C"}}}
+	if _, err := processIssue(conn, JiraAuth{}, issue, jiraResource, false, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	evs, _ := db.EventsForResource(conn, "jira", jiraResource.ID)
+	seen := 0
+	for _, e := range evs {
+		if e.Type == watcher.EventTypeJiraComment || e.Type == watcher.EventTypeJiraStatusChange {
+			if e.AuthorID == nil || *e.AuthorID != "acc-jane" {
+				t.Fatalf("%s AuthorID = %v", e.Type, e.AuthorID)
+			}
+			seen++
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("checked %d events, want 2", seen)
+	}
+}
