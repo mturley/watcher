@@ -50,3 +50,36 @@ func Validate(host, email, token string) error {
 	}
 	return nil
 }
+
+// AccountID returns the authenticated user's Jira accountId: the value
+// pollers store in watcher_events.author_id.
+func AccountID(host, email, token string) (string, error) {
+	base := strings.TrimRight(host, "/")
+	req, err := http.NewRequest(http.MethodGet, base+"/rest/api/3/myself", nil)
+	if err != nil {
+		return "", fmt.Errorf("jira myself: %w", err)
+	}
+	req.SetBasicAuth(email, token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("jira myself request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", fmt.Errorf("invalid Jira credentials: %w", ErrAuth)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("jira API status %d", resp.StatusCode)
+	}
+	var out struct {
+		AccountID string `json:"accountId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("jira myself parse: %w", err)
+	}
+	if out.AccountID == "" {
+		return "", fmt.Errorf("jira myself: empty accountId")
+	}
+	return out.AccountID, nil
+}

@@ -30,3 +30,21 @@ func TestValidate(t *testing.T) {
 		t.Fatalf("500: want plain error, got %v", err)
 	}
 }
+
+func TestViewerID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Write([]byte(`{"data":{"viewer":{"databaseId":583231}}}`))
+	}))
+	defer srv.Close()
+	id, err := ViewerID("tok", srv.URL)
+	if err != nil || id != "583231" {
+		t.Fatalf("ViewerID = %q, %v", id, err)
+	}
+	if _, err := ViewerID("bad", srv.URL); !errors.Is(err, ErrAuth) {
+		t.Fatalf("bad token err = %v, want ErrAuth", err)
+	}
+}

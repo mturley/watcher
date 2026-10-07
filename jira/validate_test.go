@@ -60,3 +60,18 @@ func TestValidate(t *testing.T) {
 		}
 	})
 }
+
+func TestAccountID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/api/3/myself" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`{"accountId":"acc-me","displayName":"Me"}`))
+	}))
+	defer srv.Close()
+	id, err := AccountID(srv.URL, "e", "t")
+	if err != nil || id != "acc-me" {
+		t.Fatalf("AccountID = %q, %v", id, err)
+	}
+}
