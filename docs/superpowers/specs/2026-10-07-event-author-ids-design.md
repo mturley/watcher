@@ -50,8 +50,11 @@ Slack user ID.
     `managedColumns["watcher_events"]`, and to
     `additiveColumns["watcher_events"]` (`"TEXT"`), so existing databases
     (worktree's and agent-handler's) gain it on their next `Migrate`.
-  - No `CurrentSchemaVersion` bump, matching how `unsubscribed_by_user`
-    and `watcher_resource_meta.updated_at` were added.
+  - Bump `CurrentSchemaVersion` from 4 to 5. `Migrate` returns early when
+    the recorded version already equals `CurrentSchemaVersion`, so without
+    a bump a database at version 4 would never reach
+    `ensureAdditiveColumns`. This matches how
+    `watcher_resource_meta.updated_at` was added (3 → 4).
   - No backfill: existing rows keep `NULL`.
 - `watcher.Event` gains `AuthorID *string`; `db.InsertEvent` writes it.
 - `author_id` is meaningful only together with `source`: the same string
