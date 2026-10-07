@@ -516,7 +516,12 @@ skipCIBundle:
 		if !dup {
 			title := fmt.Sprintf("PR %s", prData.State)
 			body := fmt.Sprintf("PR #%d: %s", prData.Number, prData.Title)
-			if err := emitEvent(conn, eventType, title, &body, prData.UpdatedAt, nil, nil, nil, resource); err != nil {
+			// pr_merged names who merged; pr_closed has no such field.
+			var author, authorType, authorID *string
+			if eventType == watcher.EventTypePRMerged && prData.MergedBy != "" {
+				author, authorType, authorID = &prData.MergedBy, &prData.MergedByType, optional(prData.MergedByID)
+			}
+			if err := emitEvent(conn, eventType, title, &body, prData.UpdatedAt, author, authorType, authorID, resource); err != nil {
 				return eventCount, fmt.Errorf("failed to emit %s event: %w", eventType, err)
 			}
 			eventCount++
@@ -557,7 +562,14 @@ skipCIBundle:
 			} else if !dup {
 				title := fmt.Sprintf("New commits pushed to PR #%d", prData.Number)
 				body := formatNewCommitsBody(prData, prevSHA)
-				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, nil, nil, nil, resource); err != nil {
+				// Credited only when every commit the event covers has one
+				// linked author; a mixed or unlinked push stays authorless.
+				var author, authorType, authorID *string
+				if login, id, ok := commonCommitAuthor(newCommitsSince(prData, prevSHA)); ok {
+					user := "user"
+					author, authorType, authorID = &login, &user, &id
+				}
+				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, author, authorType, authorID, resource); err != nil {
 					logger.Printf("WARNING: failed to emit new commits event: %v", err)
 				} else {
 					eventCount++
@@ -674,22 +686,7 @@ func hasNewCommitsSinceReview(prData PRData) bool {
 
 // formatNewCommitsBody builds the body text for a pr_new_commits event.
 func formatNewCommitsBody(prData PRData, prevSHA string) string {
-	// Find commits newer than prevSHA
-	var newCommits []CommitEntry
-	foundPrev := false
-	for _, c := range prData.Commits.Recent {
-		if c.SHA == prevSHA {
-			foundPrev = true
-			continue
-		}
-		if foundPrev {
-			newCommits = append(newCommits, c)
-		}
-	}
-	// If we didn't find prevSHA in the recent list, show all recent commits
-	if !foundPrev {
-		newCommits = prData.Commits.Recent
-	}
+	newCommits := newCommitsSince(prData, prevSHA)
 
 	if len(newCommits) == 0 {
 		return fmt.Sprintf("Latest commit: %s", prData.Commits.LatestSHA[:7])
@@ -783,4 +780,41 @@ func optional(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// newCommitsSince is the list of commits a pr_new_commits event covers: those
+// after prevSHA in the recent list, or every recent commit when prevSHA isn't
+// in it (a force-push, or more new commits than the query fetches). The body
+// and the event's attribution both use this list, so they always agree.
+func newCommitsSince(prData PRData, prevSHA string) []CommitEntry {
+	var out []CommitEntry
+	foundPrev := false
+	for _, c := range prData.Commits.Recent {
+		if c.SHA == prevSHA {
+			foundPrev = true
+			continue
+		}
+		if foundPrev {
+			out = append(out, c)
+		}
+	}
+	if !foundPrev {
+		return prData.Commits.Recent
+	}
+	return out
+}
+
+// commonCommitAuthor returns the GitHub user every commit in cs was authored
+// by. ok is false for an empty list, or when any commit is unlinked or has a
+// different author: then nobody can be credited with the push.
+func commonCommitAuthor(cs []CommitEntry) (login, id string, ok bool) {
+	if len(cs) == 0 {
+		return "", "", false
+	}
+	for _, c := range cs {
+		if c.AuthorID == "" || c.AuthorID != cs[0].AuthorID {
+			return "", "", false
+		}
+	}
+	return cs[0].AuthorLogin, cs[0].AuthorID, true
 }

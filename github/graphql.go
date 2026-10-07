@@ -20,14 +20,18 @@ type PRRef struct {
 
 // PRData contains pull request data from GitHub GraphQL API.
 type PRData struct {
-	Number              int
-	Owner               string
-	Repo                string
-	State               string
-	Title               string
-	Author              string
-	AuthorType          string
-	AuthorID            string // decimal databaseId; "" when unknown
+	Number     int
+	Owner      string
+	Repo       string
+	State      string
+	Title      string
+	Author     string
+	AuthorType string
+	AuthorID   string // decimal databaseId; "" when unknown
+	// MergedBy* identify who merged the PR; empty unless it is merged.
+	MergedBy            string
+	MergedByType        string
+	MergedByID          string
 	UpdatedAt           string
 	Reviews             []Review
 	Comments            []Comment
@@ -74,6 +78,10 @@ type CommitEntry struct {
 	SHA             string
 	Date            string
 	MessageHeadline string
+	// AuthorLogin and AuthorID are the commit author's linked GitHub user;
+	// both "" when the commit isn't linked to an account.
+	AuthorLogin string
+	AuthorID    string
 }
 
 // CommitInfo contains commit count, latest SHA, and recent commits.
@@ -227,6 +235,12 @@ func buildBatchedPRQuery(prs []PRRef) string {
           ... on User { databaseId }
           ... on Bot { databaseId }
         }
+        mergedBy {
+          __typename
+          login
+          ... on User { databaseId }
+          ... on Bot { databaseId }
+        }
         reviews(last: 20) {
           nodes {
             author {
@@ -276,6 +290,12 @@ func buildBatchedPRQuery(prs []PRRef) string {
               oid
               committedDate
               messageHeadline
+              author {
+                user {
+                  login
+                  databaseId
+                }
+              }
               statusCheckRollup {
                 contexts(first: 100) {
                   totalCount
@@ -400,6 +420,7 @@ type prNode struct {
 	Comments      commentsConnection      `json:"comments"`
 	ReviewThreads reviewThreadsConnection `json:"reviewThreads"`
 	Commits       commitsConnection       `json:"commits"`
+	MergedBy      *authorNode             `json:"mergedBy"`
 }
 
 type reviewsConnection struct {
@@ -449,9 +470,15 @@ type commitsConnection struct {
 
 type commitNode struct {
 	Commit struct {
-		OID               string             `json:"oid"`
-		CommittedDate     string             `json:"committedDate"`
-		MessageHeadline   string             `json:"messageHeadline"`
+		OID             string `json:"oid"`
+		CommittedDate   string `json:"committedDate"`
+		MessageHeadline string `json:"messageHeadline"`
+		Author          struct {
+			User *struct {
+				Login      string `json:"login"`
+				DatabaseID *int64 `json:"databaseId"`
+			} `json:"user"`
+		} `json:"author"`
 		StatusCheckRollup *statusCheckRollup `json:"statusCheckRollup"`
 	} `json:"commit"`
 }
@@ -512,6 +539,12 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 		UpdatedAt:  node.UpdatedAt,
 	}
 
+	if node.MergedBy != nil {
+		data.MergedBy = node.MergedBy.Login
+		data.MergedByType = authorType(node.MergedBy.Typename)
+		data.MergedByID = node.MergedBy.id()
+	}
+
 	// Parse reviews
 	for _, r := range node.Reviews.Nodes {
 		data.Reviews = append(data.Reviews, Review{
@@ -556,6 +589,8 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 			SHA:             cn.Commit.OID,
 			Date:            cn.Commit.CommittedDate,
 			MessageHeadline: cn.Commit.MessageHeadline,
+			AuthorLogin:     commitAuthorLogin(cn),
+			AuthorID:        commitAuthorID(cn),
 		})
 	}
 	if len(node.Commits.Nodes) > 0 {
@@ -691,4 +726,20 @@ func authorType(typename string) string {
 		return "bot"
 	}
 	return "user"
+}
+
+// commitAuthorLogin and commitAuthorID read a commit's linked GitHub user,
+// returning "" when the commit isn't linked to an account.
+func commitAuthorLogin(cn commitNode) string {
+	if cn.Commit.Author.User == nil {
+		return ""
+	}
+	return cn.Commit.Author.User.Login
+}
+
+func commitAuthorID(cn commitNode) string {
+	if u := cn.Commit.Author.User; u != nil && u.DatabaseID != nil {
+		return strconv.FormatInt(*u.DatabaseID, 10)
+	}
+	return ""
 }

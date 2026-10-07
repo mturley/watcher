@@ -1045,3 +1045,103 @@ func TestProcessPR_CommentCarriesAuthorID(t *testing.T) {
 	}
 	t.Fatal("no pr_comment emitted")
 }
+
+func TestProcessPR_MergedCarriesMergedBy(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	processPR(conn, PRData{Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "T",
+		UpdatedAt: "2026-06-17T08:00:00Z"}, prResource, "t", false, testLogger())
+	processPR(conn, PRData{Number: 123, Owner: "owner", Repo: "repo", State: "MERGED", Title: "T",
+		UpdatedAt: "2026-06-17T10:00:00Z", MergedBy: "alice", MergedByType: "user", MergedByID: "101"},
+		prResource, "t", false, testLogger())
+	evs, _ := db.EventsForResource(conn, "pr", prResource.ID)
+	for _, e := range evs {
+		if e.Type == watcher.EventTypePRMerged {
+			if e.AuthorID == nil || *e.AuthorID != "101" || e.Author == nil || *e.Author != "alice" {
+				t.Fatalf("pr_merged author = %v / %v", e.Author, e.AuthorID)
+			}
+			return
+		}
+	}
+	t.Fatal("no pr_merged emitted")
+}
+
+// newCommitsEvent runs a seed poll at head "a1", then a poll whose recent
+// commits are `recent`, and returns the pr_new_commits event (or nil).
+func newCommitsEvent(t *testing.T, recent []CommitEntry) *watcher.Event {
+	t.Helper()
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	seed := PRData{Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "T", UpdatedAt: "2026-06-17T08:00:00Z",
+		Commits: CommitInfo{TotalCount: 1, LatestSHA: "a1aaaaaa", LatestDate: "2026-06-17T08:00:00Z",
+			Recent: []CommitEntry{{SHA: "a1aaaaaa", Date: "2026-06-17T08:00:00Z", MessageHeadline: "seed"}}}}
+	// Twice: the first poll only emits watch_started and returns before it
+	// stores the head SHA that the next poll compares against.
+	for i := 0; i < 2; i++ {
+		if _, err := processPR(conn, seed, prResource, "t", false, testLogger()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	last := recent[len(recent)-1]
+	next := seed
+	next.UpdatedAt = "2026-06-17T10:00:00Z"
+	next.Commits = CommitInfo{TotalCount: len(recent), LatestSHA: last.SHA, LatestDate: last.Date, Recent: recent}
+	if _, err := processPR(conn, next, prResource, "t", false, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	evs, _ := db.EventsForResource(conn, "pr", prResource.ID)
+	for i := range evs {
+		if evs[i].Type == watcher.EventTypePRNewCommits {
+			return &evs[i]
+		}
+	}
+	return nil
+}
+
+func TestProcessPR_NewCommitsAttribution(t *testing.T) {
+	seed := CommitEntry{SHA: "a1aaaaaa", Date: "2026-06-17T08:00:00Z", MessageHeadline: "seed"}
+	mine := func(sha, date string) CommitEntry {
+		return CommitEntry{SHA: sha, Date: date, MessageHeadline: "m", AuthorLogin: "alice", AuthorID: "101"}
+	}
+	cases := []struct {
+		name   string
+		recent []CommitEntry
+		wantID string // "" = unattributed
+	}{
+		{"all new commits share one author", []CommitEntry{seed, mine("b2bbbbbb", "2026-06-17T09:00:00Z"), mine("c3cccccc", "2026-06-17T09:30:00Z")}, "101"},
+		{"mixed authors", []CommitEntry{seed, mine("b2bbbbbb", "2026-06-17T09:00:00Z"),
+			{SHA: "c3cccccc", Date: "2026-06-17T09:30:00Z", MessageHeadline: "x", AuthorLogin: "bob", AuthorID: "202"}}, ""},
+		{"an unlinked commit", []CommitEntry{seed, mine("b2bbbbbb", "2026-06-17T09:00:00Z"),
+			{SHA: "c3cccccc", Date: "2026-06-17T09:30:00Z", MessageHeadline: "x"}}, ""},
+		// Force-push: the old head is gone, so the event covers every recent
+		// commit, and the unlinked seed-like commit below breaks attribution.
+		{"force-push, one recent commit unlinked", []CommitEntry{
+			{SHA: "z9zzzzzz", Date: "2026-06-17T09:00:00Z", MessageHeadline: "rebased"}, mine("c3cccccc", "2026-06-17T09:30:00Z")}, ""},
+		{"force-push, all recent commits mine", []CommitEntry{mine("y8yyyyyy", "2026-06-17T09:00:00Z"), mine("c3cccccc", "2026-06-17T09:30:00Z")}, "101"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ev := newCommitsEvent(t, c.recent)
+			if ev == nil {
+				t.Fatal("no pr_new_commits emitted")
+			}
+			got := ""
+			if ev.AuthorID != nil {
+				got = *ev.AuthorID
+			}
+			if got != c.wantID {
+				t.Fatalf("AuthorID = %q, want %q", got, c.wantID)
+			}
+		})
+	}
+}
+
+func TestCommonCommitAuthorEmptyList(t *testing.T) {
+	if _, _, ok := commonCommitAuthor(nil); ok {
+		t.Fatal("an empty commit list must not be attributed")
+	}
+}

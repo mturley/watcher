@@ -140,3 +140,33 @@ func TestBuildBatchedPRQueryRequestsDatabaseIDs(t *testing.T) {
 		t.Fatalf("expected databaseId fragments at every author selection, found %d", n)
 	}
 }
+
+func TestParseGraphQLResponse_MergedByAndCommitAuthors(t *testing.T) {
+	raw := `{
+		"pr0": {"pullRequest": {
+			"number": 1, "state": "MERGED", "title": "T", "updatedAt": "2024-01-01T00:00:00Z",
+			"author": {"__typename": "User", "login": "alice", "databaseId": 101},
+			"mergedBy": {"__typename": "User", "login": "alice", "databaseId": 101},
+			"reviews": {"nodes": []}, "comments": {"nodes": []}, "reviewThreads": {"nodes": []},
+			"commits": {"totalCount": 2, "nodes": [
+				{"commit": {"oid": "aaa1111", "committedDate": "2024-01-01T00:00:00Z", "messageHeadline": "one", "author": {"user": {"login": "alice", "databaseId": 101}}}},
+				{"commit": {"oid": "bbb2222", "committedDate": "2024-01-02T00:00:00Z", "messageHeadline": "two", "author": {"user": null}}}
+			]}
+		}},
+		"rateLimit": {"remaining": 5000, "limit": 5000}
+	}`
+	res, _, err := parseGraphQLResponse(json.RawMessage(raw), []PRRef{{Owner: "o", Repo: "r", Number: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := res[0]
+	if pr.MergedBy != "alice" || pr.MergedByID != "101" || pr.MergedByType != "user" {
+		t.Fatalf("mergedBy = %q %q %q", pr.MergedBy, pr.MergedByID, pr.MergedByType)
+	}
+	if pr.Commits.Recent[0].AuthorID != "101" || pr.Commits.Recent[0].AuthorLogin != "alice" {
+		t.Fatalf("commit 0 author = %+v", pr.Commits.Recent[0])
+	}
+	if pr.Commits.Recent[1].AuthorID != "" {
+		t.Fatalf("an unlinked commit must have no AuthorID, got %q", pr.Commits.Recent[1].AuthorID)
+	}
+}
