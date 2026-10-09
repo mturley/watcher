@@ -33,3 +33,22 @@ func TestExtractURLs(t *testing.T) {
 		t.Fatalf("got %v\nwant %v", got, want)
 	}
 }
+
+func TestExtractURLsUnescapesMrkdwnEntities(t *testing.T) {
+	m := Message{
+		Text: "see <https://example.com/a?x=1&amp;y=2|label>",
+		Blocks: []Block{{Type: "section", Elements: []Element{
+			{Type: "link", URL: "https://example.com/a?x=1&y=2", Text: "label"},
+		}}},
+	}
+	got := ExtractURLs(m)
+	want := []string{"https://example.com/a?x=1&y=2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v\nwant %v", got, want)
+	}
+	// Block-less message: the mrkdwn URL alone must come out unescaped.
+	got = ExtractURLs(Message{Text: "<https://example.com/a?x=1&amp;y=2>"})
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("blockless: got %v\nwant %v", got, want)
+	}
+}

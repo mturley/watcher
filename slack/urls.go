@@ -1,6 +1,9 @@
 package slack
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // mrkdwnLinkPattern matches <url> and <url|label> in mrkdwn text. Mentions
 // (<@U…>, <#C…>, <!here>) never start with http so they don't match.
@@ -37,7 +40,7 @@ func ExtractURLs(m Message) []string {
 	}
 	walkBlocks(m.Blocks)
 	for _, mm := range mrkdwnLinkPattern.FindAllStringSubmatch(m.Text, -1) {
-		add(mm[1])
+		add(unescapeMrkdwnEntities(mm[1]))
 	}
 	for _, a := range m.Attachments {
 		add(a.FromURL)
@@ -47,4 +50,11 @@ func ExtractURLs(m Message) []string {
 		}
 	}
 	return out
+}
+
+// unescapeMrkdwnEntities reverses the HTML escaping Slack applies to message
+// text (& < >), so a mrkdwn URL equals the rich_text URL for the same link and
+// dedupes against it. &amp; is last so "&amp;lt;" becomes "&lt;", not "<".
+func unescapeMrkdwnEntities(s string) string {
+	return strings.NewReplacer("&lt;", "<", "&gt;", ">", "&amp;", "&").Replace(s)
 }
