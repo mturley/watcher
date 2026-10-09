@@ -71,6 +71,10 @@ func TestFetchLinkGraph(t *testing.T) {
 	if len(g.DescriptionURLs) != 1 || len(g.GitPRURLs) != 1 || g.GitPRURLs[0] != "https://github.com/example/repo/pull/9" {
 		t.Errorf("urls: desc=%v gitpr=%v", g.DescriptionURLs, g.GitPRURLs)
 	}
+	if len(g.DescriptionLinks) != len(g.DescriptionURLs) || len(g.GitPRLinks) != 1 ||
+		g.GitPRLinks[0].URL != g.GitPRURLs[0] || g.GitPRLinks[0].Label == "" {
+		t.Errorf("links: desc=%+v gitpr=%+v", g.DescriptionLinks, g.GitPRLinks)
+	}
 }
 
 func TestFetchLinkGraphNoGitPRField(t *testing.T) {

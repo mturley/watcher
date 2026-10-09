@@ -3,6 +3,8 @@ package slack
 import (
 	"reflect"
 	"testing"
+
+	"github.com/mturley/watcher"
 )
 
 func TestExtractURLs(t *testing.T) {
@@ -50,5 +52,53 @@ func TestExtractURLsUnescapesMrkdwnEntities(t *testing.T) {
 	got = ExtractURLs(Message{Text: "<https://example.com/a?x=1&amp;y=2>"})
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("blockless: got %v\nwant %v", got, want)
+	}
+}
+
+func TestExtractLinks_RichText(t *testing.T) {
+	m := Message{
+		Text: "ignored <https://ignored.example.com>",
+		Blocks: []Block{
+			{Type: "section", Elements: []Element{
+				{Type: "text", Text: "ping "}, {Type: "user", UserID: "U0TEST"},
+				{Type: "text", Text: " about "},
+				{Type: "link", URL: "https://example.com/a", Text: "the doc"},
+				{Type: "text", Text: " "}, {Type: "emoji", Name: "tada"},
+				{Type: "text", Text: " "}, {Type: "broadcast", Range: "here"},
+			}},
+			{Type: "list", Items: [][]Element{
+				{{Type: "text", Text: "first "}, {Type: "link", URL: "https://example.com/b"}},
+				{{Type: "link", URL: "https://example.com/c", Text: "C"}, {Type: "text", Text: " second"}},
+			}},
+		},
+		Attachments: []Attachment{
+			{Title: "Page title", TitleLink: "https://example.com/t", FromURL: "https://example.com/t"},
+			{FromURL: "https://example.com/u"},
+		},
+	}
+	got := ExtractLinks(m)
+	want := []watcher.LinkRef{
+		{URL: "https://example.com/a", Label: "the doc", Before: "ping @user about", After: ":tada: @here"},
+		{URL: "https://example.com/b", Label: "https://example.com/b", Before: "first"},
+		{URL: "https://example.com/c", Label: "C", After: "second"},
+		{URL: "https://example.com/t", Label: "Page title"},
+		{URL: "https://example.com/t", Label: "Page title"},
+		{URL: "https://example.com/u", Label: "https://example.com/u"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestExtractLinks_MrkdwnWhenNoBlocks(t *testing.T) {
+	m := Message{Text: "hey <@U0TEST> see <https://example.com/a?x=1&amp;y=2|the &lt;doc&gt;> in <#C0TEST|general>, <!here>\n" +
+		"and <https://example.com/b> too"}
+	got := ExtractLinks(m)
+	want := []watcher.LinkRef{
+		{URL: "https://example.com/a?x=1&y=2", Label: "the <doc>", Before: "hey @U0TEST see", After: "in #general, @here"},
+		{URL: "https://example.com/b", Label: "https://example.com/b", Before: "and", After: "too"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v\nwant %#v", got, want)
 	}
 }

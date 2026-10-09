@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+
+	"github.com/mturley/watcher"
 )
 
 // MaxAncestorHops bounds the parent walk. Real hierarchies are at most
@@ -43,6 +45,10 @@ type LinkGraph struct {
 	// GitPRURLs are the URLs in the Git Pull Request field; nil when no
 	// field ID was given.
 	GitPRURLs []string
+	// DescriptionLinks and GitPRLinks are the same links with their label
+	// and surrounding text, one entry per occurrence (not deduplicated).
+	DescriptionLinks []watcher.LinkRef
+	GitPRLinks       []watcher.LinkRef
 }
 
 const summaryFields = "summary,status,issuetype,parent"
@@ -145,14 +151,16 @@ func (c *Client) FetchLinkGraph(key, gitPRFieldID string) (*LinkGraph, error) {
 			g.Links = append(g.Links, IssueLink{Label: l.Type.Inward, Issue: l.InwardIssue.summary()})
 		}
 	}
-	g.DescriptionURLs = ExtractADFURLs(raw.Fields.Description)
+	g.DescriptionLinks = ExtractADFLinks(raw.Fields.Description)
+	g.DescriptionURLs = watcher.DedupeLinkURLs(g.DescriptionLinks)
 	if gitPRFieldID != "" {
 		var all map[string]json.RawMessage
 		var fieldsMap map[string]json.RawMessage
 		if json.Unmarshal(body, &all) == nil && json.Unmarshal(all["fields"], &fieldsMap) == nil {
 			var v interface{}
 			if rv, ok := fieldsMap[gitPRFieldID]; ok && json.Unmarshal(rv, &v) == nil {
-				g.GitPRURLs = ExtractADFURLs(v)
+				g.GitPRLinks = ExtractADFLinks(v)
+				g.GitPRURLs = watcher.DedupeLinkURLs(g.GitPRLinks)
 			}
 		}
 		if g.GitPRURLs == nil {
