@@ -409,6 +409,11 @@ func buildJiraStateJSON(issue *IssueData) string {
 	for k, v := range issue.CustomFields {
 		state[k] = v
 	}
+	// The Git Pull Request field is rich text (ADF). Consumers want the PR
+	// URLs in it, not the document, so cache them as a plain list too.
+	if v, ok := issue.CustomFields["git_pull_request"]; ok {
+		state["git_pull_request_urls"] = ExtractADFURLs(v)
+	}
 	data, _ := json.Marshal(state)
 	return string(data)
 }

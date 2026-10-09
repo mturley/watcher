@@ -649,3 +649,25 @@ func TestProcessIssue_EventsCarryAuthorID(t *testing.T) {
 		t.Fatalf("checked %d events, want 2", seen)
 	}
 }
+
+func TestBuildJiraStateJSONCachesGitPRURLs(t *testing.T) {
+	var adf interface{}
+	json.Unmarshal([]byte(`{"type":"doc","content":[{"type":"paragraph","content":[
+		{"type":"inlineCard","attrs":{"url":"https://github.com/example/repo/pull/5"}}]}]}`), &adf)
+	issue := &IssueData{Key: "PROJ-1", CustomFields: map[string]interface{}{"git_pull_request": adf}}
+	var state map[string]interface{}
+	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue)), &state); err != nil {
+		t.Fatal(err)
+	}
+	urls, ok := state["git_pull_request_urls"].([]interface{})
+	if !ok || len(urls) != 1 || urls[0] != "https://github.com/example/repo/pull/5" {
+		t.Fatalf("git_pull_request_urls = %#v", state["git_pull_request_urls"])
+	}
+}
+
+func TestBuildJiraStateJSONNoGitPRField(t *testing.T) {
+	issue := &IssueData{Key: "PROJ-1", CustomFields: map[string]interface{}{}}
+	if strings.Contains(buildJiraStateJSON(issue), "git_pull_request_urls") {
+		t.Fatal("must not emit git_pull_request_urls when the field is not configured")
+	}
+}
