@@ -19,11 +19,15 @@ type Client struct {
 
 // IssueData represents Jira issue data with changelog and comments.
 type IssueData struct {
-	Key       string
-	Summary   string
-	Status    string
-	Priority  string
-	IssueType string
+	Key      string
+	Summary  string
+	Status   string
+	Priority string
+	// PriorityIconURL is Jira's own icon for the priority. Its URL is not
+	// derivable from the priority name (custom priorities use avatar URLs),
+	// so it is cached as given. Like IssueTypeIconURL it may need auth.
+	PriorityIconURL string
+	IssueType       string
 	// IssueTypeID and IssueTypeIconURL support rendering Jira's own
 	// per-issue-type icon. The URL needs Basic auth, so it is never usable
 	// directly from a browser — a consumer must proxy it server-side. The id
@@ -107,7 +111,8 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 				Name string `json:"name"`
 			} `json:"status"`
 			Priority struct {
-				Name string `json:"name"`
+				Name    string `json:"name"`
+				IconURL string `json:"iconUrl"`
 			} `json:"priority"`
 			IssueType struct {
 				ID      string `json:"id"`
@@ -147,6 +152,7 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 		Summary:          raw.Fields.Summary,
 		Status:           raw.Fields.Status.Name,
 		Priority:         raw.Fields.Priority.Name,
+		PriorityIconURL:  raw.Fields.Priority.IconURL,
 		IssueType:        raw.Fields.IssueType.Name,
 		IssueTypeID:      raw.Fields.IssueType.ID,
 		IssueTypeIconURL: raw.Fields.IssueType.IconURL,
