@@ -54,13 +54,6 @@ type HTTPClient struct {
 }
 
 // New returns an HTTPClient pointed at the real Slack Web API.
-// WithTransport swaps the client's RoundTripper, keeping its timeout. Used by
-// the poller to log its own traffic; interactive callers never set it.
-func (c *HTTPClient) WithTransport(rt http.RoundTripper) *HTTPClient {
-	c.hc = &http.Client{Timeout: c.hc.Timeout, Transport: rt}
-	return c
-}
-
 func New(token, cookie string) *HTTPClient {
 	c := NewWithBaseURL(token, cookie, "https://slack.com/api")
 	c.edgeBaseURL = "https://edgeapi.slack.com"
@@ -77,6 +70,14 @@ func NewWithBaseURL(token, cookie, baseURL string) *HTTPClient {
 		edgeBaseURL: strings.TrimRight(baseURL, "/"),
 		hc:          &http.Client{Timeout: 20 * time.Second},
 	}
+}
+
+// WithTransport swaps the client's RoundTripper, keeping its timeout. Used by
+// the poller to log its own traffic; interactive callers never set it. It
+// mutates and returns the receiver; call it before the client is shared.
+func (c *HTTPClient) WithTransport(rt http.RoundTripper) *HTTPClient {
+	c.hc = &http.Client{Timeout: c.hc.Timeout, Transport: rt}
+	return c
 }
 
 // TeamInfo calls Slack's team.info and returns the workspace's canonical web

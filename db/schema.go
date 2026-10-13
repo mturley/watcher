@@ -202,6 +202,8 @@ CREATE TABLE IF NOT EXISTS watcher_poll_log (
 	error_body TEXT
 );
 
+-- ON DELETE CASCADE is inert: the library does not enable PRAGMA
+-- foreign_keys, so PrunePollLog deletes these join rows explicitly.
 CREATE TABLE IF NOT EXISTS watcher_poll_log_resources (
 	log_id INTEGER NOT NULL REFERENCES watcher_poll_log(id) ON DELETE CASCADE,
 	resource_type TEXT NOT NULL,
