@@ -2,6 +2,7 @@ package github
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -138,16 +139,36 @@ func ParsePRResourceID(resourceID string) (PRRef, error) {
 	}, nil
 }
 
+const graphqlEndpoint = "https://api.github.com/graphql"
+
+// ghHTTP carries the context (resource tags, call stats), client, and
+// endpoint for one poll's GitHub calls.
+type ghHTTP struct {
+	ctx      context.Context
+	hc       *http.Client
+	endpoint string
+}
+
+func defaultGHHTTP(endpoint string) ghHTTP {
+	if endpoint == "" {
+		endpoint = graphqlEndpoint
+	}
+	return ghHTTP{ctx: context.Background(), hc: &http.Client{}, endpoint: endpoint}
+}
+
 // FetchPRs fetches PR data for multiple PRs in a single batched GraphQL query.
 // Optional apiURL parameter allows overriding the GitHub API endpoint (for testing).
 func FetchPRs(token string, prs []PRRef, apiURL ...string) ([]PRData, *RateLimit, error) {
+	ep := ""
+	if len(apiURL) > 0 {
+		ep = apiURL[0]
+	}
+	return fetchPRs(defaultGHHTTP(ep), token, prs)
+}
+
+func fetchPRs(h ghHTTP, token string, prs []PRRef) ([]PRData, *RateLimit, error) {
 	if len(prs) == 0 {
 		return nil, nil, fmt.Errorf("no PRs to fetch")
-	}
-
-	endpoint := "https://api.github.com/graphql"
-	if len(apiURL) > 0 && apiURL[0] != "" {
-		endpoint = apiURL[0]
 	}
 
 	query := buildBatchedPRQuery(prs)
@@ -161,7 +182,7 @@ func FetchPRs(token string, prs []PRRef, apiURL ...string) ([]PRData, *RateLimit
 		return nil, nil, fmt.Errorf("failed to marshal request body: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(h.ctx, "POST", h.endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -169,8 +190,7 @@ func FetchPRs(token string, prs []PRRef, apiURL ...string) ([]PRData, *RateLimit
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := h.hc.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to execute request: %w", err)
 	}
@@ -657,6 +677,10 @@ func appendRollupNodes(runs []CheckRun, contexts []StatusContext, nodes []status
 // single contexts connection interleaves both node kinds and StatusContexts can
 // land beyond the first page.
 func FetchRemainingCheckContexts(token, owner, repo string, prNumber int, cursor string) ([]CheckRun, []StatusContext, error) {
+	return fetchRemainingCheckContexts(defaultGHHTTP(""), token, owner, repo, prNumber, cursor)
+}
+
+func fetchRemainingCheckContexts(h ghHTTP, token, owner, repo string, prNumber int, cursor string) ([]CheckRun, []StatusContext, error) {
 	var allRuns []CheckRun
 	var allContexts []StatusContext
 	currentCursor := cursor
@@ -665,15 +689,14 @@ func FetchRemainingCheckContexts(token, owner, repo string, prNumber int, cursor
 		query := fmt.Sprintf(`{"query":"{repository(owner:\"%s\",name:\"%s\"){pullRequest(number:%d){commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:\"%s\"){pageInfo{hasNextPage endCursor}nodes{__typename ... on CheckRun{name status conclusion completedAt} ... on StatusContext{context state targetUrl}}}}}}}}}}"}`,
 			owner, repo, prNumber, currentCursor)
 
-		req, err := http.NewRequest("POST", "https://api.github.com/graphql", bytes.NewReader([]byte(query)))
+		req, err := http.NewRequestWithContext(h.ctx, "POST", h.endpoint, bytes.NewReader([]byte(query)))
 		if err != nil {
 			return allRuns, allContexts, fmt.Errorf("failed to create request for page %d: %w", page+1, err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 
-		httpClient := &http.Client{}
-		resp, err := httpClient.Do(req)
+		resp, err := h.hc.Do(req)
 		if err != nil {
 			return allRuns, allContexts, fmt.Errorf("failed to fetch check contexts page %d: %w", page+1, err)
 		}

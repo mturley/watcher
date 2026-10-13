@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -12,17 +13,35 @@ import (
 	"github.com/google/uuid"
 	"github.com/mturley/watcher"
 	"github.com/mturley/watcher/db"
+	"github.com/mturley/watcher/polllog"
 )
 
 // Poll polls GitHub for PR updates and emits events. Each resource's
 // backfill flag is resolved from its live subscriptions.
 func Poll(conn *sql.DB, token string, resources []watcher.Resource, logger *log.Logger) error {
+	return pollWith(conn, token, resources, logger, graphqlEndpoint)
+}
+
+func pollWith(conn *sql.DB, token string, resources []watcher.Resource, logger *log.Logger, endpoint string) error {
 	if token == "" {
 		return fmt.Errorf("GitHub token not configured")
 	}
+	defer polllog.Prune(conn, logger)
+	logRow := func(level, msg string, rs ...watcher.Resource) {
+		if err := polllog.Write(conn, "github", level, msg, rs...); err != nil {
+			logger.Printf("WARNING: watcher log write failed: %v", err)
+		}
+	}
+	record := func(r watcher.Resource, ok bool, msg string, d db.ResourcePollDetail) {
+		if err := db.RecordResourcePoll(conn, r, ok, polllog.SanitizeMessage(msg), d); err != nil {
+			logger.Printf("WARNING: record resource poll %s: %v", r.ID, err)
+		}
+	}
+	logRow("info", fmt.Sprintf("github poll started: %d resources", len(resources)))
 
 	// Parse all resource IDs into PRRefs
 	var prRefs []PRRef
+	var valid []watcher.Resource
 	resourceMap := make(map[string]watcher.Resource) // key: "owner/repo#number"
 	for _, r := range resources {
 		ref, err := ParsePRResourceID(r.ID)
@@ -33,9 +52,12 @@ func Poll(conn *sql.DB, token string, resources []watcher.Resource, logger *log.
 			if err := emitError(conn, "Invalid PR resource ID", &errBody, r); err != nil {
 				logger.Printf("ERROR: failed to emit watcher error: %v", err)
 			}
+			record(r, false, "Invalid PR resource ID: "+err.Error(), db.ResourcePollDetail{Note: "invalid resource ID"})
+			logRow("error", "Invalid PR resource ID "+r.ID, r)
 			continue
 		}
 		prRefs = append(prRefs, ref)
+		valid = append(valid, r)
 		resourceMap[r.ID] = r
 	}
 
@@ -44,13 +66,18 @@ func Poll(conn *sql.DB, token string, resources []watcher.Resource, logger *log.
 		return nil
 	}
 
+	ctx, stats := polllog.WithStats(polllog.WithResources(context.Background(), valid...))
+	h := ghHTTP{ctx: ctx, hc: polllog.NewClient(conn, "github", 60*time.Second, logger), endpoint: endpoint}
+
 	// Fetch PR data
 	logger.Printf("Fetching data for %d PRs...", len(prRefs))
-	prDataList, rateLimit, err := FetchPRs(token, prRefs)
+	prDataList, rateLimit, err := fetchPRs(h, token, prRefs)
+	// Capture now: per-PR follow-up calls share these stats and overwrite them.
+	batchStatus, batchMS := stats.Get()
 	if err != nil {
 		logger.Printf("ERROR: failed to fetch PRs: %v", err)
 		// Emit error events for all resources
-		errBody := fmt.Sprintf("Failed to fetch PR data: %v", err)
+		errBody := polllog.SanitizeMessage(fmt.Sprintf("Failed to fetch PR data: %v", err))
 		for _, r := range resources {
 			if err := emitError(conn, "GitHub API error", &errBody, r); err != nil {
 				logger.Printf("ERROR: failed to emit watcher error: %v", err)
@@ -59,10 +86,17 @@ func Poll(conn *sql.DB, token string, resources []watcher.Resource, logger *log.
 		if err := db.RecordPollerError(conn, "github", errBody); err != nil {
 			logger.Printf("ERROR: failed to record poller error: %v", err)
 		}
+		for _, r := range valid {
+			record(r, false, errBody, db.ResourcePollDetail{HTTPStatus: batchStatus, DurationMS: batchMS, Note: "GitHub API error"})
+		}
+		logRow("error", errBody, valid...)
+		logRow("error", "github poll failed: "+errBody)
 		return err
 	}
 
-	logger.Printf("Rate limit: %d/%d remaining", rateLimit.Remaining, rateLimit.Limit)
+	if rateLimit != nil {
+		logger.Printf("Rate limit: %d/%d remaining", rateLimit.Remaining, rateLimit.Limit)
+	}
 
 	// A batched GraphQL query reports partial success: an unresolvable repo
 	// nulls its own alias while the rest of the batch succeeds. Those PRs are
@@ -78,6 +112,10 @@ func Poll(conn *sql.DB, token string, resources []watcher.Resource, logger *log.
 			id := fmt.Sprintf("%s/%s#%d", ref.Owner, ref.Repo, ref.Number)
 			if _, ok := returned[id]; !ok {
 				logger.Printf("WARNING: no data returned for %s (unresolvable repo, deleted PR, or no access) — it will stay un-enriched until the subscription is removed", id)
+				if r, ok := resourceMap[id]; ok {
+					record(r, false, "no data returned (unresolvable repo, deleted PR, or no access)", db.ResourcePollDetail{HTTPStatus: batchStatus, DurationMS: batchMS})
+					logRow("error", "no data returned for "+id, r)
+				}
 			}
 		}
 	}
@@ -97,23 +135,31 @@ func Poll(conn *sql.DB, token string, resources []watcher.Resource, logger *log.
 			logger.Printf("WARNING: failed to resolve backfill for %s: %v", resourceID, err)
 		}
 
-		count, err := processPR(conn, prData, resource, token, backfill, logger)
+		count, err := processPRWith(conn, h, prData, resource, token, backfill, logger)
 		if err != nil {
 			logger.Printf("ERROR: failed to process PR %s: %v", resourceID, err)
 			// Emit error event
-			errBody := fmt.Sprintf("Failed to process PR: %v", err)
+			errBody := polllog.SanitizeMessage(fmt.Sprintf("Failed to process PR: %v", err))
 			if err := emitError(conn, "PR processing error", &errBody, resource); err != nil {
 				logger.Printf("ERROR: failed to emit watcher error: %v", err)
 			}
+			record(resource, false, errBody, db.ResourcePollDetail{HTTPStatus: batchStatus, DurationMS: batchMS})
+			logRow("error", errBody, resource)
 			continue
 		}
 		eventCount += count
+		record(resource, true, "", db.ResourcePollDetail{HTTPStatus: batchStatus, DurationMS: batchMS, EventsEmitted: count})
 	}
 
 	logger.Printf("Emitted %d events", eventCount)
 	if err := db.RecordPollerSuccess(conn, "github"); err != nil {
 		logger.Printf("ERROR: failed to record poller success: %v", err)
 	}
+	finish := fmt.Sprintf("github poll finished: %d events", eventCount)
+	if rateLimit != nil {
+		finish += fmt.Sprintf(", rate limit %d/%d", rateLimit.Remaining, rateLimit.Limit)
+	}
+	logRow("info", finish)
 	return nil
 }
 
@@ -156,6 +202,12 @@ func emitError(conn *sql.DB, title string, body *string, r watcher.Resource) err
 // is true, all history is emitted; when backfill is false, only a
 // watch_started event is emitted on the first poll.
 func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token string, backfill bool, logger *log.Logger) (int, error) {
+	return processPRWith(conn, defaultGHHTTP(""), prData, resource, token, backfill, logger)
+}
+
+func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resource, token string, backfill bool, logger *log.Logger) (int, error) {
+	// Tag follow-up calls (check-context pages) with this one PR.
+	h.ctx = polllog.WithResources(h.ctx, resource)
 	eventCount := 0
 
 	// Get cursor (last seen external timestamp)
@@ -308,7 +360,7 @@ func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token str
 
 	// Fetch remaining check contexts if paginated
 	if prData.CheckRunsHasMore && prData.CheckRunsEndCursor != "" {
-		moreRuns, moreCtx, err := FetchRemainingCheckContexts(token, prData.Owner, prData.Repo, prData.Number, prData.CheckRunsEndCursor)
+		moreRuns, moreCtx, err := fetchRemainingCheckContexts(h, token, prData.Owner, prData.Repo, prData.Number, prData.CheckRunsEndCursor)
 		if err != nil {
 			logger.Printf("WARNING: failed to paginate check contexts for %s: %v", resource.ID, err)
 		} else {
