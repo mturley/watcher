@@ -40,14 +40,18 @@ package db
 // re-run the migration path and pick up the new column via
 // ensureAdditiveColumns.
 // Bumped to 5 to add watcher_events.author_id (see additiveColumns).
-const CurrentSchemaVersion = 5
+// Bumped to 6 to add watcher_resource_poll_status, watcher_poll_log and
+// watcher_poll_log_resources (the watcher log). Purely additive tables; the
+// bump is required for the same short-circuit reason as v3.
+const CurrentSchemaVersion = 6
 
 // managedTables is the exact set of tables Migrate owns.
 var managedTables = []string{
 	"watcher_schema_version", "watcher_events", "watcher_event_resources",
 	"watcher_resource_state", "watcher_subscriptions",
 	"watcher_resource_relationships", "watcher_poller_status",
-	"watcher_resource_meta",
+	"watcher_resource_meta", "watcher_resource_poll_status", "watcher_poll_log",
+	"watcher_poll_log_resources",
 }
 
 // managedColumns maps each managed table to its expected set of column
@@ -81,6 +85,15 @@ var managedColumns = map[string][]string{
 		"resource_type", "resource_id", "custom_name", "custom_description",
 		"updated_at",
 	},
+	"watcher_resource_poll_status": {
+		"resource_type", "resource_id", "last_attempt", "last_success",
+		"last_error", "last_error_message", "last_detail",
+	},
+	"watcher_poll_log": {
+		"id", "ts", "source", "level", "kind", "message", "method",
+		"endpoint", "http_status", "duration_ms", "bytes", "error_body",
+	},
+	"watcher_poll_log_resources": {"log_id", "resource_type", "resource_id"},
 }
 
 // schemaDDL creates all watcher_* tables and indexes if they don't
@@ -163,6 +176,39 @@ CREATE TABLE IF NOT EXISTS watcher_poller_status (
 	last_error_message TEXT
 );
 
+CREATE TABLE IF NOT EXISTS watcher_resource_poll_status (
+	resource_type TEXT NOT NULL,
+	resource_id TEXT NOT NULL,
+	last_attempt TEXT,
+	last_success TEXT,
+	last_error TEXT,
+	last_error_message TEXT,
+	last_detail TEXT,
+	PRIMARY KEY (resource_type, resource_id)
+);
+
+CREATE TABLE IF NOT EXISTS watcher_poll_log (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	ts TEXT NOT NULL,
+	source TEXT NOT NULL,
+	level TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	message TEXT NOT NULL,
+	method TEXT,
+	endpoint TEXT,
+	http_status INTEGER,
+	duration_ms INTEGER,
+	bytes INTEGER,
+	error_body TEXT
+);
+
+CREATE TABLE IF NOT EXISTS watcher_poll_log_resources (
+	log_id INTEGER NOT NULL REFERENCES watcher_poll_log(id) ON DELETE CASCADE,
+	resource_type TEXT NOT NULL,
+	resource_id TEXT NOT NULL,
+	PRIMARY KEY (log_id, resource_type, resource_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_watcher_events_ts ON watcher_events (ts);
 CREATE INDEX IF NOT EXISTS idx_watcher_events_source_type ON watcher_events (source, type);
 CREATE INDEX IF NOT EXISTS idx_watcher_event_resources_event_id ON watcher_event_resources (event_id);
@@ -170,4 +216,7 @@ CREATE INDEX IF NOT EXISTS idx_watcher_event_resources_resource ON watcher_event
 CREATE INDEX IF NOT EXISTS idx_watcher_subscriptions_resource ON watcher_subscriptions (resource_type, resource_id, deleted_at, expires_at);
 CREATE INDEX IF NOT EXISTS idx_watcher_subscriptions_subscriber ON watcher_subscriptions (subscriber);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_watcher_resource_relationships_unique ON watcher_resource_relationships (child_type, child_id, parent_type, parent_id, relationship);
+CREATE INDEX IF NOT EXISTS idx_watcher_poll_log_ts ON watcher_poll_log (ts);
+CREATE INDEX IF NOT EXISTS idx_watcher_poll_log_source ON watcher_poll_log (source, id);
+CREATE INDEX IF NOT EXISTS idx_watcher_poll_log_resources_res ON watcher_poll_log_resources (resource_type, resource_id, log_id);
 `

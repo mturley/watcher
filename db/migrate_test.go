@@ -318,8 +318,8 @@ func TestMigrateV4AddsEventAuthorID(t *testing.T) {
 	if !hasColumn(t, c, "watcher_events", "author_id") {
 		t.Fatal("watcher_events missing author_id after migrating from v4")
 	}
-	if v, _ := SchemaVersion(c); v != 5 {
-		t.Fatalf("version = %d, want 5", v)
+	if v, _ := SchemaVersion(c); v != 6 {
+		t.Fatalf("version = %d, want 6", v)
 	}
 }
 
@@ -342,5 +342,47 @@ func TestMigrateAcceptsNewerSchema(t *testing.T) {
 	}
 	if v, _ := SchemaVersion(c); v != CurrentSchemaVersion+1 {
 		t.Fatalf("version = %d, want it left at %d", v, CurrentSchemaVersion+1)
+	}
+}
+
+func TestMigrateV6AddsPollLogTables(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	for _, tbl := range []string{"watcher_resource_poll_status", "watcher_poll_log", "watcher_poll_log_resources"} {
+		ok, err := tableExists(c, tbl)
+		if err != nil || !ok {
+			t.Fatalf("table %s missing (err=%v)", tbl, err)
+		}
+	}
+	if !hasIndex(t, c, "idx_watcher_poll_log_ts") || !hasIndex(t, c, "idx_watcher_poll_log_resources_res") {
+		t.Fatal("poll log indexes missing")
+	}
+	v, err := SchemaVersion(c)
+	if err != nil || v != 6 {
+		t.Fatalf("version = %d (err=%v), want 6", v, err)
+	}
+}
+
+func TestMigrateV5DatabaseUpgradesToV6(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a v5 database: drop the new tables and rewind the version.
+	for _, tbl := range []string{"watcher_poll_log_resources", "watcher_poll_log", "watcher_resource_poll_status"} {
+		if _, err := c.Exec("DROP TABLE " + tbl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.Exec("UPDATE watcher_schema_version SET version = 5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(c); err != nil {
+		t.Fatalf("Migrate v5->v6: %v", err)
+	}
+	if ok, _ := tableExists(c, "watcher_poll_log"); !ok {
+		t.Fatal("watcher_poll_log not created on upgrade")
 	}
 }
