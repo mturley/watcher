@@ -1,6 +1,7 @@
 package jira
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,12 @@ type Client struct {
 	BaseURL string
 	Email   string
 	Token   string
+	// HTTP, when set, is used for every request (the poller passes an
+	// instrumented client). Nil keeps the 30s default client.
+	HTTP *http.Client
+	// Ctx, when set, is attached to every request (resource tags for the
+	// watcher log). Nil means context.Background().
+	Ctx context.Context
 }
 
 // IssueData represents Jira issue data with changelog and comments.
@@ -199,14 +206,21 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 // get performs an authenticated GET and returns the response body, or an
 // error if the request fails or returns a non-200 status.
 func (c *Client) get(reqURL string) ([]byte, error) {
-	req, err := http.NewRequest("GET", reqURL, nil)
+	ctx := c.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.SetBasicAuth(c.Email, c.Token)
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := c.HTTP
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute request: %w", err)

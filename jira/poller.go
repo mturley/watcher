@@ -1,6 +1,7 @@
 package jira
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/mturley/watcher"
 	"github.com/mturley/watcher/db"
+	"github.com/mturley/watcher/polllog"
 )
 
 // JiraAuth holds the credentials and configuration needed to poll Jira.
@@ -40,22 +42,44 @@ func Poll(conn *sql.DB, cfg JiraAuth, resources []watcher.Resource, logger *log.
 		customFields = make(map[string]string)
 	}
 
+	defer polllog.Prune(conn, logger)
+	client.HTTP = polllog.NewClient(conn, "jira", 30*time.Second, logger)
+	logRow := func(level, msg string, rs ...watcher.Resource) {
+		if err := polllog.Write(conn, "jira", level, msg, rs...); err != nil {
+			logger.Printf("WARNING: watcher log write failed: %v", err)
+		}
+	}
+	record := func(r watcher.Resource, ok bool, msg string, d db.ResourcePollDetail) {
+		if err := db.RecordResourcePoll(conn, r, ok, polllog.SanitizeMessage(msg), d); err != nil {
+			logger.Printf("WARNING: record resource poll %s: %v", r.ID, err)
+		}
+	}
+	logRow("info", fmt.Sprintf("jira poll started: %d resources", len(resources)))
+	failed := 0
+
 	eventCount := 0
 	for _, resource := range resources {
 		// The resource ID for a Jira issue is just the issue key.
 		issueKey := resource.ID
 
+		ctx, stats := polllog.WithStats(polllog.WithResources(context.Background(), resource))
+		client.Ctx = ctx
+
 		logger.Printf("Fetching issue %s...", issueKey)
 		issueData, err := client.FetchIssue(issueKey, customFields)
 		if err != nil {
 			logger.Printf("ERROR: failed to fetch issue %s: %v", issueKey, err)
-			errBody := fmt.Sprintf("Failed to fetch issue: %v", err)
+			errBody := polllog.SanitizeMessage(fmt.Sprintf("Failed to fetch issue: %v", err))
 			if err := emitError(conn, fmt.Sprintf("Failed to fetch %s", issueKey), &errBody, resource); err != nil {
 				logger.Printf("ERROR: failed to emit watcher error: %v", err)
 			}
 			if err := db.RecordPollerError(conn, "jira", errBody); err != nil {
 				logger.Printf("ERROR: failed to record poller error: %v", err)
 			}
+			status, ms := stats.Get()
+			record(resource, false, errBody, db.ResourcePollDetail{HTTPStatus: status, DurationMS: ms})
+			logRow("error", errBody, resource)
+			failed++
 			continue
 		}
 
@@ -67,10 +91,14 @@ func Poll(conn *sql.DB, cfg JiraAuth, resources []watcher.Resource, logger *log.
 		count, err := processIssue(conn, cfg, *issueData, resource, backfill, logger)
 		if err != nil {
 			logger.Printf("ERROR: failed to process issue %s: %v", issueKey, err)
-			errBody := fmt.Sprintf("Failed to process issue: %v", err)
+			errBody := polllog.SanitizeMessage(fmt.Sprintf("Failed to process issue: %v", err))
 			if err := emitError(conn, fmt.Sprintf("Error processing %s", issueKey), &errBody, resource); err != nil {
 				logger.Printf("ERROR: failed to emit watcher error: %v", err)
 			}
+			status, ms := stats.Get()
+			record(resource, false, errBody, db.ResourcePollDetail{HTTPStatus: status, DurationMS: ms})
+			logRow("error", errBody, resource)
+			failed++
 			continue
 		}
 		eventCount += count
@@ -81,9 +109,16 @@ func Poll(conn *sql.DB, cfg JiraAuth, resources []watcher.Resource, logger *log.
 		if err := db.UpsertResourceState(conn, "jira", issueKey, stateJSON, issueData.UpdatedAt, now); err != nil {
 			logger.Printf("WARNING: failed to upsert resource state for %s: %v", issueKey, err)
 		}
+		status, ms := stats.Get()
+		record(resource, true, "", db.ResourcePollDetail{HTTPStatus: status, DurationMS: ms, EventsEmitted: count})
 	}
 
 	logger.Printf("Emitted %d events", eventCount)
+	level := "info"
+	if failed > 0 {
+		level = "warn"
+	}
+	logRow(level, fmt.Sprintf("jira poll finished: %d events, %d of %d resources failed", eventCount, failed, len(resources)))
 	if err := db.RecordPollerSuccess(conn, "jira"); err != nil {
 		logger.Printf("ERROR: failed to record poller success: %v", err)
 	}
