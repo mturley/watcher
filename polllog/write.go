@@ -28,7 +28,10 @@ func Write(conn *sql.DB, source, level, message string, rs ...watcher.Resource) 
 
 // Prune applies the watcher log's retention policy (7 days, 50k rows).
 func Prune(conn *sql.DB, logger *log.Logger) {
-	if err := db.PrunePollLog(conn, retention, maxRows); err != nil && logger != nil {
+	if logger == nil {
+		logger = log.Default()
+	}
+	if err := db.PrunePollLog(conn, retention, maxRows); err != nil {
 		logger.Printf("WARNING: %v", err)
 	}
 }

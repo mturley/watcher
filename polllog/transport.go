@@ -32,8 +32,18 @@ func ResourcesFrom(ctx context.Context) []watcher.Resource {
 // call made with its context, so a poller can put them in a resource's detail.
 type CallStats struct {
 	mu         sync.Mutex
-	Status     int
-	DurationMS int
+	status     int
+	durationMS int
+}
+
+// Get returns the status and duration (ms) of the last call; nil-safe.
+func (s *CallStats) Get() (status, durationMS int) {
+	if s == nil {
+		return 0, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.status, s.durationMS
 }
 
 func (s *CallStats) set(status, ms int) {
@@ -41,7 +51,7 @@ func (s *CallStats) set(status, ms int) {
 		return
 	}
 	s.mu.Lock()
-	s.Status, s.DurationMS = status, ms
+	s.status, s.durationMS = status, ms
 	s.mu.Unlock()
 }
 
@@ -102,10 +112,14 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		stats.set(0, e.DurationMS)
 		return nil, err
 	}
-	if resp.StatusCode/100 != 2 {
-		body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		body, rerr := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+		var rd io.Reader = bytes.NewReader(body)
+		if rerr != nil {
+			rd = io.MultiReader(rd, errReader{rerr})
+		}
+		resp.Body = io.NopCloser(rd)
 		e.Level, e.HTTPStatus, e.Bytes, e.DurationMS = "error", resp.StatusCode, int64(len(body)), elapsed()
 		e.ErrorBody = Sanitize(body, resp.Header.Get("Content-Type"))
 		e.Message = fmt.Sprintf("%s %s → %d", req.Method, endpoint, resp.StatusCode)
@@ -143,3 +157,7 @@ func (c *countingBody) Close() error {
 	c.once.Do(func() { c.done(c.n) })
 	return err
 }
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }

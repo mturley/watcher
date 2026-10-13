@@ -2,6 +2,7 @@ package polllog
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -70,8 +71,8 @@ func TestTransport_LogsSuccessAndFailureWithTags(t *testing.T) {
 	if len(fail.Resources) != 1 || fail.Resources[0] != (watcher.Resource{Type: "pr", ID: "o/r#1"}) {
 		t.Fatalf("tags: %+v", fail.Resources)
 	}
-	if stats.Status != 504 {
-		t.Fatalf("stats.Status = %d, want 504 (last call)", stats.Status)
+	if st, _ := stats.Get(); st != 504 {
+		t.Fatalf("stats status = %d, want 504 (last call)", st)
 	}
 }
 
@@ -131,8 +132,99 @@ func TestWrite_KindFromResources(t *testing.T) {
 	if err := Write(conn, "github", "error", "no data returned", watcher.Resource{Type: "pr", ID: "o/r#2"}); err != nil {
 		t.Fatal(err)
 	}
-	got, _, _ := db.QueryPollLog(conn, db.PollLogQuery{})
+	got, _, err := db.QueryPollLog(conn, db.PollLogQuery{})
+	if err != nil || len(got) != 2 {
+		t.Fatalf("got %d entries err=%v", len(got), err)
+	}
 	if got[0].Kind != "resource" || got[1].Kind != "poll" {
 		t.Fatalf("kinds: %q %q", got[0].Kind, got[1].Kind)
+	}
+}
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type failingBody struct {
+	r   io.Reader
+	err error
+}
+
+func (f *failingBody) Read(p []byte) (int, error) {
+	n, err := f.r.Read(p)
+	if err == io.EOF {
+		return n, f.err
+	}
+	return n, err
+}
+func (f *failingBody) Close() error { return nil }
+
+func TestTransport_ErrorBodyReadFailureSurfaces(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	boom := errors.New("boom")
+	tr := &Transport{Conn: conn, Source: "github", Logger: quiet, Base: rtFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 503, Header: http.Header{}, Request: r,
+			Body: &failingBody{r: strings.NewReader("partial"), err: boom}}, nil
+	})}
+	req, _ := http.NewRequest("GET", "http://example.invalid/x", nil)
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(resp.Body)
+	if !errors.Is(err, boom) || string(b) != "partial" {
+		t.Fatalf("got %q err=%v", b, err)
+	}
+	got, _, _ := db.QueryPollLog(conn, db.PollLogQuery{})
+	if len(got) != 1 || got[0].Level != "error" || got[0].Bytes != 7 {
+		t.Fatalf("rows: %+v", got)
+	}
+}
+
+func TestTransport_StatsAfter2xx(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	ts := server(t)
+	hc := NewClient(conn, "github", 5*time.Second, quiet)
+	ctx, stats := WithStats(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/ok", nil)
+	resp, err := hc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if st, _ := stats.Get(); st != 200 {
+		t.Fatalf("status = %d", st)
+	}
+	if st, d := (*CallStats)(nil).Get(); st != 0 || d != 0 {
+		t.Fatal("nil Get not zero")
+	}
+}
+
+func TestTransport_RedirectIsNotError(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/old" {
+			http.Redirect(w, r, "/new", http.StatusFound)
+			return
+		}
+		io.WriteString(w, "ok")
+	}))
+	defer ts.Close()
+	hc := NewClient(conn, "github", 5*time.Second, quiet)
+	resp, err := hc.Get(ts.URL + "/old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	got, _, _ := db.QueryPollLog(conn, db.PollLogQuery{})
+	if len(got) != 2 {
+		t.Fatalf("rows: %d", len(got))
+	}
+	for _, e := range got {
+		if e.Level != "info" {
+			t.Fatalf("unexpected level: %+v", e)
+		}
 	}
 }
