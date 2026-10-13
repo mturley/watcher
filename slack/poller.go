@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/mturley/watcher"
 	"github.com/mturley/watcher/db"
+	"github.com/mturley/watcher/polllog"
 )
 
 // SlackAuth holds the credentials needed to poll Slack.
@@ -27,25 +28,55 @@ func Poll(conn *sql.DB, cfg SlackAuth, resources []watcher.Resource, logger *log
 		return fmt.Errorf("slack not configured")
 	}
 
-	client := New(cfg.Token, cfg.Cookie)
+	client := New(cfg.Token, cfg.Cookie).WithTransport(&polllog.Transport{Conn: conn, Source: "slack", Logger: logger})
+	return pollWith(conn, client, resources, logger)
+}
+
+// pollWith polls the given resources using client, recording per-thread
+// outcomes and watcher log rows.
+func pollWith(conn *sql.DB, client Client, resources []watcher.Resource, logger *log.Logger) error {
+	defer polllog.Prune(conn, logger)
+	logRow := func(level, msg string, rs ...watcher.Resource) {
+		if err := polllog.Write(conn, "slack", level, msg, rs...); err != nil {
+			logger.Printf("WARNING: watcher log write failed: %v", err)
+		}
+	}
+	record := func(r watcher.Resource, ok bool, msg string, d db.ResourcePollDetail) {
+		if err := db.RecordResourcePoll(conn, r, ok, polllog.SanitizeMessage(msg), d); err != nil {
+			logger.Printf("WARNING: record resource poll %s: %v", r.ID, err)
+		}
+	}
+	logRow("info", fmt.Sprintf("slack poll started: %d resources", len(resources)))
+	failed := 0
+
 	eventCount := 0
 	for _, resource := range resources {
 		channel, threadTS, ok := parseResourceID(resource.ID)
 		if !ok {
 			logger.Printf("ERROR: bad slack resource id %q", resource.ID)
+			record(resource, false, "invalid slack resource id", db.ResourcePollDetail{})
+			logRow("error", "invalid slack resource id "+resource.ID, resource)
+			failed++
 			continue
 		}
 
-		thread, err := client.Replies(context.Background(), channel, threadTS)
+		ctx, stats := polllog.WithStats(polllog.WithResources(context.Background(), resource))
+		thread, err := client.Replies(ctx, channel, threadTS)
 		if err != nil {
+			// Slack reports API errors as HTTP 200 with "ok": false, so the
+			// http log row is info; this per-thread row carries the failure.
 			logger.Printf("ERROR: fetch thread %s: %v", resource.ID, err)
-			errBody := fmt.Sprintf("Failed to fetch thread: %v", err)
+			errBody := polllog.SanitizeMessage(fmt.Sprintf("Failed to fetch thread: %v", err))
 			if e := emitError(conn, fmt.Sprintf("Failed to fetch %s", resource.ID), &errBody, resource); e != nil {
 				logger.Printf("ERROR: emit watcher error: %v", e)
 			}
 			if e := db.RecordPollerError(conn, "slack", errBody); e != nil {
 				logger.Printf("ERROR: record poller error: %v", e)
 			}
+			status, ms := stats.Get()
+			record(resource, false, errBody, db.ResourcePollDetail{HTTPStatus: status, DurationMS: ms})
+			logRow("error", errBody, resource)
+			failed++
 			continue
 		}
 
@@ -56,6 +87,11 @@ func Poll(conn *sql.DB, cfg SlackAuth, resources []watcher.Resource, logger *log
 		// this resource this cycle rather than caching/emitting empty state.
 		if len(thread.Messages) == 0 {
 			logger.Printf("WARNING: slack thread %s has no messages; skipping this cycle", resource.ID)
+			status, ms := stats.Get()
+			msg := "thread has no messages (root deleted?)"
+			record(resource, false, msg, db.ResourcePollDetail{HTTPStatus: status, DurationMS: ms})
+			logRow("warn", msg, resource)
+			failed++
 			continue
 		}
 
@@ -72,10 +108,14 @@ func Poll(conn *sql.DB, cfg SlackAuth, resources []watcher.Resource, logger *log
 		count, err := processThread(conn, thread, names, resource, backfill, logger)
 		if err != nil {
 			logger.Printf("ERROR: process thread %s: %v", resource.ID, err)
-			errBody := fmt.Sprintf("Failed to process thread: %v", err)
+			errBody := polllog.SanitizeMessage(fmt.Sprintf("Failed to process thread: %v", err))
 			if e := emitError(conn, fmt.Sprintf("Error processing %s", resource.ID), &errBody, resource); e != nil {
 				logger.Printf("ERROR: emit watcher error: %v", e)
 			}
+			status, ms := stats.Get()
+			record(resource, false, errBody, db.ResourcePollDetail{HTTPStatus: status, DurationMS: ms})
+			logRow("error", errBody, resource)
+			failed++
 			continue
 		}
 		eventCount += count
@@ -99,9 +139,16 @@ func Poll(conn *sql.DB, cfg SlackAuth, resources []watcher.Resource, logger *log
 		if err := db.UpsertResourceState(conn, "slack", resource.ID, stateJSON, latestTS, now); err != nil {
 			logger.Printf("WARNING: upsert resource state %s: %v", resource.ID, err)
 		}
+		status, ms := stats.Get()
+		record(resource, true, "", db.ResourcePollDetail{HTTPStatus: status, DurationMS: ms, EventsEmitted: count})
 	}
 
 	logger.Printf("Emitted %d events", eventCount)
+	level := "info"
+	if failed > 0 {
+		level = "warn"
+	}
+	logRow(level, fmt.Sprintf("slack poll finished: %d events, %d of %d resources failed", eventCount, failed, len(resources)))
 	if err := db.RecordPollerSuccess(conn, "slack"); err != nil {
 		logger.Printf("ERROR: record poller success: %v", err)
 	}

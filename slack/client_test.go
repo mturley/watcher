@@ -449,3 +449,22 @@ func TestSearchChannelsFiltersArchivedAndKeepsPrivate(t *testing.T) {
 		t.Errorf("private channel should be kept and flagged: %+v", chans[1])
 	}
 }
+
+func TestWithTransport_UsesGivenRoundTripper(t *testing.T) {
+	var called bool
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Header: http.Header{}}, nil
+	})
+	c := NewWithBaseURL("xoxc-t", "xoxd-c", "http://example.invalid/api").WithTransport(rt)
+	if err := c.AuthTest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("custom transport not used")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
