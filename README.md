@@ -380,6 +380,49 @@ you supply the full argv, e.g. `[]string{"/usr/local/bin/mytool", "poll",
 on Linux. `scheduler.Uninstall`, `Start`, `Stop`, `IsInstalled`, and
 `IsRunning` round out lifecycle management.
 
+## Watcher log
+
+Schema v6 adds three tables that record what the pollers are doing:
+
+- `watcher_resource_poll_status`: the latest poll outcome per resource
+  (last attempt, last success, last error and message, and a JSON detail
+  with duration, HTTP status and events emitted).
+- `watcher_poll_log`: one row per poll lifecycle message, per-resource
+  message, or outbound HTTP call (`kind` is `poll`, `resource` or `http`;
+  `level` is `info`, `warn` or `error`).
+- `watcher_poll_log_resources`: join table linking log rows to the
+  resources they concern.
+
+The `polllog` package writes the log:
+
+- `polllog.NewClient(conn, source, timeout, logger)` returns an
+  `*http.Client` whose `polllog.Transport` records every request. Only
+  HTTP status >= 400 is logged as `error`.
+- `polllog.WithResources(ctx, ...)` tags requests made under that context
+  with the resources they serve; `polllog.WithStats(ctx)` returns a
+  `*CallStats` whose `Get()` yields the last call's status and duration.
+- `polllog.Write(conn, source, level, message, resources...)` records a
+  poll-lifecycle row (no resources) or a per-resource row.
+- `polllog.Prune(conn, logger)` applies retention: 7 days and 50,000 rows.
+  Every `Poll` prunes at the end.
+- `polllog.Sanitize` (response bodies, HTML-aware) and
+  `polllog.SanitizeMessage` collapse whitespace and cap text at 500 runes.
+
+Never recorded: query strings (the endpoint is host + path only), request
+headers, or full response bodies (only a sanitized excerpt of error
+bodies).
+
+Read APIs in `db`: `QueryPollLog` (filters by source, minimum level and
+resources; newest first, or, with `AfterID` and no `BeforeID`, a live tail
+that never skips rows, where `hasMore` means more newer rows),
+`RecordResourcePoll` and `GetResourcePollStatuses` (with
+`ResourcePollStatus.Failing()`), and `PrunePollLog`.
+
+The GitHub, Jira and Slack pollers are instrumented. Interactive Slack
+clients (`slack.New`) are not; only a client given
+`(*HTTPClient).WithTransport(...)` logs. `validate.go` credential checks
+and GitHub linked-resource summaries are not logged either.
+
 ## Run modes
 
 There are three ways to drive polling, depending on how your consumer
