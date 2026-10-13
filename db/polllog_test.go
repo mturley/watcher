@@ -18,9 +18,8 @@ func migrated(t *testing.T) *sql.DB {
 }
 
 var (
-	prA   = watcher.Resource{Type: "pr", ID: "o/r#1"}
-	prB   = watcher.Resource{Type: "pr", ID: "o/r#2"}
-	jiraA = watcher.Resource{Type: "jira", ID: "ABC-1"}
+	prA = watcher.Resource{Type: "pr", ID: "o/r#1"}
+	prB = watcher.Resource{Type: "pr", ID: "o/r#2"}
 )
 
 func ins(t *testing.T, c *sql.DB, e PollLogEntry) int64 {
@@ -82,6 +81,28 @@ func TestQueryPollLog_NewestFirstCursorsAndHasMore(t *testing.T) {
 	}
 }
 
+func TestQueryPollLog_AfterIDPagesOldestFirstWithoutGaps(t *testing.T) {
+	c := migrated(t)
+	var all []int64
+	for i := 0; i < 5; i++ {
+		all = append(all, ins(t, c, PollLogEntry{Source: "jira", Level: "info", Kind: "http", Message: "x"}))
+	}
+	got, more, err := QueryPollLog(c, PollLogQuery{AfterID: all[0], Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []int64{all[2], all[1]}; !equalInt64(ids(got), want) || !more {
+		t.Fatalf("page1 = %v more=%v, want %v true", ids(got), more, want)
+	}
+	got, more, err = QueryPollLog(c, PollLogQuery{AfterID: all[2], Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []int64{all[4], all[3]}; !equalInt64(ids(got), want) || more {
+		t.Fatalf("page2 = %v more=%v, want %v false", ids(got), more, want)
+	}
+}
+
 func TestQueryPollLog_SourceAndLevelFilters(t *testing.T) {
 	c := migrated(t)
 	ins(t, c, PollLogEntry{Source: "github", Level: "info", Kind: "poll", Message: "a"})
@@ -100,11 +121,9 @@ func TestQueryPollLog_SourceAndLevelFilters(t *testing.T) {
 func TestQueryPollLog_ResourceScopeIncludesSameSourcePollRows(t *testing.T) {
 	c := migrated(t)
 	ghStart := ins(t, c, PollLogEntry{Source: "github", Level: "info", Kind: "poll", Message: "github poll started"})
-	jiraStart := ins(t, c, PollLogEntry{Source: "jira", Level: "info", Kind: "poll", Message: "jira poll started"})
+	_ = ins(t, c, PollLogEntry{Source: "jira", Level: "info", Kind: "poll", Message: "jira poll started"})
 	mine := ins(t, c, PollLogEntry{Source: "github", Level: "info", Kind: "http", Message: "batch", Resources: []watcher.Resource{prA, prB}})
-	other := ins(t, c, PollLogEntry{Source: "github", Level: "error", Kind: "resource", Message: "B failed", Resources: []watcher.Resource{prB}})
-	_ = jiraStart
-	_ = other
+	_ = ins(t, c, PollLogEntry{Source: "github", Level: "error", Kind: "resource", Message: "B failed", Resources: []watcher.Resource{prB}})
 	got, _, err := QueryPollLog(c, PollLogQuery{ResourceScoped: true, Resources: []watcher.Resource{prA}})
 	if err != nil {
 		t.Fatal(err)
@@ -134,7 +153,9 @@ func TestPrunePollLog_ByAgeAndCount(t *testing.T) {
 		t.Fatalf("after prune = %v, want %v", ids(got), want)
 	}
 	var orphans int
-	c.QueryRow(`SELECT COUNT(*) FROM watcher_poll_log_resources WHERE log_id NOT IN (SELECT id FROM watcher_poll_log)`).Scan(&orphans)
+	if err := c.QueryRow(`SELECT COUNT(*) FROM watcher_poll_log_resources WHERE log_id NOT IN (SELECT id FROM watcher_poll_log)`).Scan(&orphans); err != nil {
+		t.Fatal(err)
+	}
 	if orphans != 0 {
 		t.Fatalf("%d orphan join rows", orphans)
 	}

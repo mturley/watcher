@@ -166,7 +166,15 @@ func QueryPollLog(conn *sql.DB, q PollLogQuery) ([]PollLogEntry, bool, error) {
 	if len(where) > 0 {
 		sqlStr += " WHERE " + strings.Join(where, " AND ")
 	}
-	sqlStr += " ORDER BY l.id DESC LIMIT ?"
+	// A pure "newer than AfterID" page must take the OLDEST rows after the
+	// cursor, so a caller advancing its cursor to the max id doesn't skip any.
+	// Fetch ascending, then reverse below to keep the newest-first contract.
+	ascending := q.AfterID > 0 && q.BeforeID == 0
+	if ascending {
+		sqlStr += " ORDER BY l.id ASC LIMIT ?"
+	} else {
+		sqlStr += " ORDER BY l.id DESC LIMIT ?"
+	}
 	args = append(args, limit+1)
 	rows, err := conn.Query(sqlStr, args...)
 	if err != nil {
@@ -190,8 +198,12 @@ func QueryPollLog(conn *sql.DB, q PollLogQuery) ([]PollLogEntry, bool, error) {
 	if more {
 		out = out[:limit]
 	}
-	// Ascending queries for AfterID still return newest first (ORDER BY id DESC);
-	// callers merge by id. Attach resource tags.
+	if ascending {
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+	}
+	// Attach resource tags.
 	for i := range out {
 		rs, err := conn.Query(`SELECT resource_type, resource_id FROM watcher_poll_log_resources WHERE log_id = ? ORDER BY resource_type, resource_id`, out[i].ID)
 		if err != nil {
