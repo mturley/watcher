@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -255,5 +256,23 @@ func TestRegisterConsumerRoundTrip(t *testing.T) {
 	}
 	if loadedConsumers["worktree"] != "~/.config/worktree/worktree.db" {
 		t.Fatalf("round-tripped worktree db path mismatch: %q", loadedConsumers["worktree"])
+	}
+}
+
+func TestSaveConfigRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "config.yaml")
+	in := &ConfigFile{Jira: &JiraBehavior{
+		BotUsernames: []string{"bot-a"},
+		CustomFields: map[string]string{"epic_key": "customfield_10014"},
+	}}
+	if err := SaveConfig(path, in); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, in) {
+		t.Fatalf("got %+v, want %+v", got, in)
 	}
 }

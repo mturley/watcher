@@ -102,6 +102,10 @@ func repairGitHub(cfg *config.Config, p Prompter) (bool, error) {
 		}
 	}
 
+	return promptGitHub(cfg, p)
+}
+
+func promptGitHub(cfg *config.Config, p Prompter) (bool, error) {
 	tok := p.PromptToken(GitHub, "Create a token at https://github.com/settings/tokens (needs repo/read scopes)")
 	if tok == "" {
 		return false, nil
@@ -116,6 +120,37 @@ func repairGitHub(cfg *config.Config, p Prompter) (bool, error) {
 	cfg.Services.GitHub.Token = tok
 	p.Info("GitHub: ok")
 	return true, nil
+}
+
+// Replace prompts for new credentials for svc, validates them and applies
+// them to cfg, without first testing what is stored — for an operator who
+// wants fresh credentials even though the current ones work. Like
+// TestAndRepair it never saves; changed reports whether cfg was modified.
+// For Jira, a configured host/email is reused; otherwise they are prompted
+// for as in greenfield setup.
+func Replace(cfg *config.Config, svc Service, p Prompter) (bool, error) {
+	switch svc {
+	case GitHub:
+		return promptGitHub(cfg, p)
+	case Jira:
+		host, email := "", ""
+		if j := cfg.Services.Jira; j != nil {
+			host, email = j.Host, j.Email
+		}
+		if host == "" || email == "" {
+			host, email = p.PromptJira("Enter your Jira site URL (e.g. https://yourorg.atlassian.net) and the account email")
+			host = strings.TrimRight(host, "/")
+			if host == "" || email == "" {
+				p.Info("Jira: skipped")
+				return false, nil
+			}
+		}
+		return promptJira(cfg, p, host, email)
+	case Slack:
+		return promptSlack(cfg, p)
+	default:
+		return false, fmt.Errorf("unknown service %q", svc)
+	}
 }
 
 func repairJira(cfg *config.Config, p Prompter) (bool, error) {
@@ -154,6 +189,10 @@ func repairJira(cfg *config.Config, p Prompter) (bool, error) {
 		}
 	}
 
+	return promptJira(cfg, p, host, email)
+}
+
+func promptJira(cfg *config.Config, p Prompter, host, email string) (bool, error) {
 	tok := p.PromptToken(Jira, "Create an API token at https://id.atlassian.com/manage-profile/security/api-tokens")
 	if tok == "" {
 		return false, nil
@@ -196,6 +235,10 @@ func repairSlack(cfg *config.Config, p Prompter) (bool, error) {
 		}
 	}
 
+	return promptSlack(cfg, p)
+}
+
+func promptSlack(cfg *config.Config, p Prompter) (bool, error) {
 	tok, cookie := p.PromptSlack("Extract your Slack session token (xoxc-...) and d= cookie (xoxd-...) from a logged-in browser session")
 	if tok == "" || cookie == "" {
 		return false, nil

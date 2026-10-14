@@ -152,6 +152,23 @@ func LoadConfig(path string) (*ConfigFile, error) {
 	return &cfg, nil
 }
 
+// SaveConfig writes c to path as YAML, creating the parent directory (0700)
+// if needed. config.yaml holds no credentials, so the file is 0644.
+func SaveConfig(path string, c *ConfigFile) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("failed to create config dir %s: %w", dir, err)
+	}
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write config %s: %w", path, err)
+	}
+	return nil
+}
+
 // DefaultPath returns the default credentials file path,
 // "~/.config/watcher/auth.yaml". Honors WATCHER_HOME (used by tests)
 // to override the base directory.

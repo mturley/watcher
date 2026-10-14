@@ -6,6 +6,7 @@ import (
 	"github.com/mturley/watcher/config"
 	wgithub "github.com/mturley/watcher/github"
 	wjira "github.com/mturley/watcher/jira"
+	wslack "github.com/mturley/watcher/slack"
 )
 
 // fakePrompter records calls and returns scripted responses.
@@ -427,6 +428,62 @@ func TestTestAndRepair_Jira_UnconfiguredConfirmYesPromptJiraAborted(t *testing.T
 	}
 	if cfg.Services.Jira != nil {
 		t.Fatalf("expected cfg to remain unconfigured, got %+v", cfg.Services.Jira)
+	}
+}
+
+func TestReplace_GitHub_SkipsTestOfStoredToken(t *testing.T) {
+	var validated []string
+	withGitHubSeam(t, func(token string, apiURL ...string) error {
+		validated = append(validated, token)
+		return nil
+	})
+	cfg := &config.Config{Services: config.Services{GitHub: &config.GitHubConfig{Token: "old"}}}
+	p := &fakePrompter{tokenResults: []string{"new"}}
+	changed, err := Replace(cfg, GitHub, p)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if cfg.Services.GitHub.Token != "new" {
+		t.Fatalf("token = %q", cfg.Services.GitHub.Token)
+	}
+	if len(validated) != 1 || validated[0] != "new" {
+		t.Fatalf("validated %v, want only the new token", validated)
+	}
+	if len(p.confirmCalls) != 0 {
+		t.Fatalf("Replace must not ask for confirmation, got %v", p.confirmCalls)
+	}
+}
+
+func TestReplace_Slack_InvalidLeavesConfig(t *testing.T) {
+	withSlackSeam(t,
+		func(token, cookie string) error { return wslack.ErrAuth },
+		func(token, cookie string) string { return "x" },
+	)
+	orig := &config.SlackConfig{Token: "t", Cookie: "c", WorkspaceDomain: "d"}
+	cfg := &config.Config{Services: config.Services{Slack: orig}}
+	p := &fakePrompter{slackTokenResult: "t2", slackCookieResult: "c2"}
+	changed, err := Replace(cfg, Slack, p)
+	if err != nil || changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if *cfg.Services.Slack != (config.SlackConfig{Token: "t", Cookie: "c", WorkspaceDomain: "d"}) {
+		t.Fatalf("config changed: %+v", cfg.Services.Slack)
+	}
+}
+
+func TestReplace_Jira_ReusesHostEmail(t *testing.T) {
+	withJiraSeam(t, func(host, email, token string) error { return nil })
+	cfg := &config.Config{Services: config.Services{Jira: &config.JiraConfig{Host: "h", Email: "e", Token: "old"}}}
+	p := &fakePrompter{tokenResults: []string{"new"}}
+	changed, err := Replace(cfg, Jira, p)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if *cfg.Services.Jira != (config.JiraConfig{Host: "h", Email: "e", Token: "new"}) {
+		t.Fatalf("got %+v", cfg.Services.Jira)
+	}
+	if p.jiraCalls != 0 {
+		t.Fatal("configured host/email must not be re-prompted")
 	}
 }
 
