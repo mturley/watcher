@@ -43,12 +43,15 @@ type IssueData struct {
 	IssueTypeIconURL string
 	Assignee         *string
 	Reporter         *string
-	Labels           []string
-	CreatedAt        string
-	UpdatedAt        string
-	Comments         []IssueComment
-	Changelog        []ChangelogEntry
-	CustomFields     map[string]interface{}
+	// AssigneeID and ReporterID are Jira accountIds; "" when unset or absent.
+	AssigneeID   string
+	ReporterID   string
+	Labels       []string
+	CreatedAt    string
+	UpdatedAt    string
+	Comments     []IssueComment
+	Changelog    []ChangelogEntry
+	CustomFields map[string]interface{}
 }
 
 // IssueComment represents a Jira issue comment.
@@ -128,9 +131,11 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 			} `json:"issuetype"`
 			Assignee *struct {
 				DisplayName string `json:"displayName"`
+				AccountID   string `json:"accountId"`
 			} `json:"assignee"`
 			Reporter *struct {
 				DisplayName string `json:"displayName"`
+				AccountID   string `json:"accountId"`
 			} `json:"reporter"`
 			Labels  []string `json:"labels"`
 			Created string   `json:"created"`
@@ -174,9 +179,11 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 
 	if raw.Fields.Assignee != nil {
 		issue.Assignee = &raw.Fields.Assignee.DisplayName
+		issue.AssigneeID = raw.Fields.Assignee.AccountID
 	}
 	if raw.Fields.Reporter != nil {
 		issue.Reporter = &raw.Fields.Reporter.DisplayName
+		issue.ReporterID = raw.Fields.Reporter.AccountID
 	}
 
 	// Extract custom fields

@@ -1005,6 +1005,8 @@ func TestBuildPRStateJSON_Author(t *testing.T) {
 		Title:      "Test PR",
 		Author:     "alice",
 		AuthorType: "User",
+		AuthorID:   "42",
+		CreatedAt:  "2023-12-01T00:00:00Z",
 		UpdatedAt:  "2024-01-01T00:00:00Z",
 	}
 
@@ -1017,6 +1019,21 @@ func TestBuildPRStateJSON_Author(t *testing.T) {
 
 	if got, want := state["author"], "alice"; got != want {
 		t.Errorf("state[\"author\"] = %v, want %v", got, want)
+	}
+	// Consumers match author_id against the viewer to tell "my PRs" apart,
+	// and sort by created_at.
+	if got, want := state["author_id"], "42"; got != want {
+		t.Errorf("state[\"author_id\"] = %v, want %v", got, want)
+	}
+	if got, want := state["created_at"], "2023-12-01T00:00:00Z"; got != want {
+		t.Errorf("state[\"created_at\"] = %v, want %v", got, want)
+	}
+}
+
+func TestParsePRNode_CreatedAt(t *testing.T) {
+	got := parsePRNode(&prNode{Number: 1, CreatedAt: "2023-12-01T00:00:00Z"}, "o", "r")
+	if got.CreatedAt != "2023-12-01T00:00:00Z" {
+		t.Errorf("CreatedAt = %q", got.CreatedAt)
 	}
 }
 

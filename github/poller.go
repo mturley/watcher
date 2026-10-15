@@ -759,6 +759,8 @@ func buildPRStateJSON(prData PRData) string {
 	state := map[string]interface{}{
 		"title":                        prData.Title,
 		"author":                       prData.Author,
+		"author_id":                    prData.AuthorID,
+		"created_at":                   prData.CreatedAt,
 		"state":                        prData.State,
 		"review_decision":              derivePRReviewDecision(prData.Reviews),
 		"has_new_commits_since_review": hasNewCommitsSinceReview(prData),

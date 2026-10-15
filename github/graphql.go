@@ -33,6 +33,7 @@ type PRData struct {
 	MergedBy            string
 	MergedByType        string
 	MergedByID          string
+	CreatedAt           string
 	UpdatedAt           string
 	Reviews             []Review
 	Comments            []Comment
@@ -248,6 +249,7 @@ func buildBatchedPRQuery(prs []PRRef) string {
         number
         state
         title
+        createdAt
         updatedAt
         author {
           __typename
@@ -435,6 +437,7 @@ type prNode struct {
 	State         string                  `json:"state"`
 	Title         string                  `json:"title"`
 	Author        authorNode              `json:"author"`
+	CreatedAt     string                  `json:"createdAt"`
 	UpdatedAt     string                  `json:"updatedAt"`
 	Reviews       reviewsConnection       `json:"reviews"`
 	Comments      commentsConnection      `json:"comments"`
@@ -556,6 +559,7 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 		Author:     node.Author.Login,
 		AuthorType: authorType(node.Author.Typename),
 		AuthorID:   node.Author.id(),
+		CreatedAt:  node.CreatedAt,
 		UpdatedAt:  node.UpdatedAt,
 	}
 

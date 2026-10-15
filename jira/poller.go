@@ -434,6 +434,8 @@ func buildJiraStateJSON(issue *IssueData) string {
 		"priority_icon_url": issue.PriorityIconURL,
 		"assignee":          issue.Assignee,
 		"reporter":          issue.Reporter,
+		"assignee_id":       issue.AssigneeID,
+		"reporter_id":       issue.ReporterID,
 		"issue_type":        issue.IssueType,
 		// Cached so the UI can render Jira's own icon for the type. Requires
 		// auth to fetch, so consumers proxy it rather than using it directly.

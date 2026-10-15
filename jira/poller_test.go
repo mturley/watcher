@@ -488,7 +488,8 @@ func TestFetchIssue_Reporter(t *testing.T) {
 				"fields": map[string]interface{}{
 					"summary":  "Issue with reporter",
 					"status":   map[string]interface{}{"name": "Open"},
-					"reporter": map[string]interface{}{"displayName": "Bob Reporter"},
+					"reporter": map[string]interface{}{"displayName": "Bob Reporter", "accountId": "acct-bob"},
+					"assignee": map[string]interface{}{"displayName": "Ann Assignee", "accountId": "acct-ann"},
 				},
 			})
 		case r.URL.Path == "/rest/api/3/issue/RHOAIENG-456/changelog":
@@ -515,6 +516,9 @@ func TestFetchIssue_Reporter(t *testing.T) {
 	if got, want := *issue.Reporter, "Bob Reporter"; got != want {
 		t.Errorf("Reporter = %q, want %q", got, want)
 	}
+	if issue.ReporterID != "acct-bob" || issue.AssigneeID != "acct-ann" {
+		t.Errorf("ReporterID, AssigneeID = %q, %q", issue.ReporterID, issue.AssigneeID)
+	}
 }
 
 // TestBuildJiraStateJSON_Reporter verifies the cached Jira state JSON
@@ -522,10 +526,12 @@ func TestFetchIssue_Reporter(t *testing.T) {
 func TestBuildJiraStateJSON_Reporter(t *testing.T) {
 	reporter := "Bob Reporter"
 	issue := &IssueData{
-		Key:      "RHOAIENG-456",
-		Summary:  "Issue with reporter",
-		Status:   "Open",
-		Reporter: &reporter,
+		Key:        "RHOAIENG-456",
+		Summary:    "Issue with reporter",
+		Status:     "Open",
+		Reporter:   &reporter,
+		ReporterID: "acct-bob",
+		AssigneeID: "acct-ann",
 	}
 
 	stateJSON := buildJiraStateJSON(issue)
@@ -537,6 +543,9 @@ func TestBuildJiraStateJSON_Reporter(t *testing.T) {
 
 	if got, want := state["reporter"], reporter; got != want {
 		t.Errorf("state[\"reporter\"] = %v, want %v", got, want)
+	}
+	if state["reporter_id"] != "acct-bob" || state["assignee_id"] != "acct-ann" {
+		t.Errorf("reporter_id, assignee_id = %v, %v", state["reporter_id"], state["assignee_id"])
 	}
 }
 
