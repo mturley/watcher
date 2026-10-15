@@ -33,6 +33,7 @@ var slackResource = watcher.Resource{
 type fakeClient struct {
 	thread       Thread
 	users        map[string]User
+	groups       map[string]UserGroup
 	channelName  string
 	channelCalls int
 	repliesErr   error
@@ -74,7 +75,13 @@ func (f *fakeClient) Channel(ctx context.Context, id string) (string, error) {
 func (f *fakeClient) Emoji(ctx context.Context) (map[string]string, error)               { return nil, nil }
 func (f *fakeClient) UserGroups(ctx context.Context) (map[string]UserGroup, error)       { return nil, nil }
 func (f *fakeClient) UserGroupsInfo(ctx context.Context, ids []string) (map[string]UserGroup, error) {
-	return nil, nil
+	out := make(map[string]UserGroup, len(ids))
+	for _, id := range ids {
+		if g, ok := f.groups[id]; ok {
+			out[id] = g
+		}
+	}
+	return out, nil
 }
 func (f *fakeClient) SearchUsers(ctx context.Context, query, currentChannel string, limit int) ([]User, error) {
 	return nil, nil
@@ -480,7 +487,8 @@ func pollOnce(conn *sql.DB, client Client, resource watcher.Resource, logger *lo
 		logger.Printf("WARNING: backfill resolve %s: %v", resource.ID, err)
 	}
 	names := resolveAuthors(client, thread.Messages)
-	if _, err := processThread(conn, thread, names, resource, backfill, logger); err != nil {
+	_, resolvedRoot, err := processThread(conn, client, thread, names, resource, backfill, logger)
+	if err != nil {
 		errBody := "Failed to process thread: " + err.Error()
 		if e := emitError(conn, "Error processing "+resource.ID, &errBody, resource); e != nil {
 			logger.Printf("ERROR: emit watcher error: %v", e)
@@ -492,7 +500,7 @@ func pollOnce(conn *sql.DB, client Client, resource watcher.Resource, logger *lo
 	if len(thread.Messages) > 0 {
 		rootAuthor = names[thread.Messages[0].UserID]
 	}
-	stateJSON := buildSlackStateJSON(thread, channelName, rootAuthor, rootText(thread))
+	stateJSON := buildSlackStateJSON(thread, channelName, rootAuthor, resolvedRoot)
 	latestTS := latestThreadTS(thread)
 	return db.UpsertResourceState(conn, "slack", resource.ID, stateJSON, latestTS, "2026-08-19T00:00:00Z")
 }
@@ -517,6 +525,72 @@ func TestCachedTitleResolvesMentions(t *testing.T) {
 	}
 	if !strings.Contains(stateJSON, "@bo") || !strings.Contains(stateJSON, "@platform") {
 		t.Fatalf("cached title missing resolved names: %s", stateJSON)
+	}
+}
+
+// TestEventTextResolvesMentions pins that event titles and reply bodies are
+// stored with mention tokens already resolved. Consumers read them as plain
+// strings with no user directory, so a raw "<@U3>" stored here is shown raw.
+// The mentioned people never posted in the thread, so their names must come
+// from a directory lookup, not the author map.
+func TestEventTextResolvesMentions(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	root := Message{TS: "1699000000.000100", UserID: "U1", Text: "hey <@U3> can <!subteam^S1> look"}
+	reply := Message{TS: "1699000001.000200", UserID: "U2", Text: "<@U4> agreed"}
+	client := &fakeClient{
+		thread: Thread{Channel: "C1", ThreadTS: root.TS, Messages: []Message{root}},
+		users: map[string]User{
+			"U1": {ID: "U1", DisplayName: "Alice"},
+			"U2": {ID: "U2", DisplayName: "Bob"},
+			"U3": {ID: "U3", DisplayName: "cy"},
+			"U4": {ID: "U4", RealName: "Dee"},
+		},
+		groups:      map[string]UserGroup{"S1": {ID: "S1", Handle: "platform"}},
+		channelName: "eng",
+	}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatalf("poll #1: %v", err)
+	}
+	client.thread.Messages = []Message{root, reply}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatalf("poll #2: %v", err)
+	}
+
+	events, err := db.EventsForResource(conn, "slack", slackResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	const wantTitle = "hey @cy can @platform look"
+	got := map[watcher.EventType]watcher.Event{}
+	for _, e := range events {
+		got[e.Type] = e
+	}
+	// EventsForResource hides bookkeeping types like watch_started.
+	var wsTitle string
+	if err := conn.QueryRow(`SELECT title FROM watcher_events WHERE type = ?`,
+		watcher.EventTypeWatchStarted).Scan(&wsTitle); err != nil {
+		t.Fatalf("watch_started: %v", err)
+	}
+	if wsTitle != "Started watching thread: "+wantTitle {
+		t.Errorf("watch_started title = %q", wsTitle)
+	}
+	r := got[watcher.EventTypeSlackReply]
+	if r.Title != "New reply in "+wantTitle {
+		t.Errorf("slack_reply title = %q", r.Title)
+	}
+	if r.Body == nil || *r.Body != "Bob: @Dee agreed" {
+		t.Errorf("slack_reply body = %v, want %q", r.Body, "Bob: @Dee agreed")
+	}
+
+	st, err := db.GetResourceState(conn, "slack", slackResource.ID)
+	if err != nil || st == nil {
+		t.Fatalf("GetResourceState: %v, %v", st, err)
+	}
+	if !strings.Contains(st.StateJSON, `"title":"`+wantTitle+`"`) {
+		t.Errorf("cached title not resolved: %s", st.StateJSON)
 	}
 }
 

@@ -105,7 +105,7 @@ func pollWith(conn *sql.DB, client Client, resources []watcher.Resource, logger 
 		// authors and the cached root author.
 		names := resolveAuthors(client, thread.Messages)
 
-		count, err := processThread(conn, thread, names, resource, backfill, logger)
+		count, resolvedRoot, err := processThread(conn, client, thread, names, resource, backfill, logger)
 		if err != nil {
 			logger.Printf("ERROR: process thread %s: %v", resource.ID, err)
 			errBody := polllog.SanitizeMessage(fmt.Sprintf("Failed to process thread: %v", err))
@@ -128,12 +128,9 @@ func pollWith(conn *sql.DB, client Client, resources []watcher.Resource, logger 
 		if len(thread.Messages) > 0 {
 			rootAuthor = names[thread.Messages[0].UserID]
 		}
-		// Resolve mention tokens before the title is cached. Without this the
-		// card title shows raw "<@U…>" / "<!subteam^S…>" for the very text
-		// that renders as names in the thread view — fallbackTitle is a Go
-		// port precisely so the two titles agree.
-		stateJSON := buildSlackStateJSON(thread, channelName, rootAuthor,
-			resolvedRootText(client, thread, names))
+		// The root text arrives with its mention tokens already resolved, so
+		// the cached title agrees with the event titles and the thread view.
+		stateJSON := buildSlackStateJSON(thread, channelName, rootAuthor, resolvedRoot)
 		latestTS := latestThreadTS(thread)
 		now := time.Now().UTC().Format(time.RFC3339)
 		if err := db.UpsertResourceState(conn, "slack", resource.ID, stateJSON, latestTS, now); err != nil {
@@ -202,43 +199,59 @@ func parseResourceID(id string) (channel, threadTS string, ok bool) {
 }
 
 // processThread processes a single Slack thread's replies and emits events.
-// Returns the count of events emitted. When cursor is empty and backfill is
+// Returns the count of events emitted, and the root text with its mentions
+// resolved for the caller to cache. When cursor is empty and backfill is
 // false, only a watch_started event is emitted on the first poll.
-func processThread(conn *sql.DB, thread Thread, names map[string]string, resource watcher.Resource, backfill bool, logger *log.Logger) (int, error) {
+//
+// Mention tokens ("<@U…>", "<!subteam^S…>") are resolved to names before any
+// text is stored: an event's title and body are read by consumers that have no
+// user directory, and would otherwise show raw ids for the very text that
+// renders as names in the thread view.
+func processThread(conn *sql.DB, client Client, thread Thread, names map[string]string, resource watcher.Resource, backfill bool, logger *log.Logger) (int, string, error) {
 	eventCount := 0
 
 	cursor, err := db.EventCursor(conn, "slack", resource.Type, resource.ID)
 	if err != nil {
-		return 0, fmt.Errorf("event cursor: %w", err)
+		return 0, "", fmt.Errorf("event cursor: %w", err)
 	}
 
-	title := threadTitle(thread)
+	firstPoll := cursor == "" && !backfill
 
-	if cursor == "" && !backfill {
+	// Only replies past the cursor get events, so only their mentions (and
+	// the root's, which titles every event) need a directory lookup.
+	var fresh []Message
+	if !firstPoll && len(thread.Messages) > 1 {
+		for _, m := range thread.Messages[1:] { // skip the root
+			if m.TS > cursor { // raw Slack ts string compare — the invariant
+				fresh = append(fresh, m)
+			}
+		}
+	}
+	texts := []string{rootText(thread)}
+	for _, m := range fresh {
+		texts = append(texts, m.Text)
+	}
+	mentions := newMentionResolver(client, names, texts...)
+	resolvedRoot := mentions.resolve(rootText(thread))
+	title := fallbackTitle(resolvedRoot)
+
+	if firstPoll {
 		wsTitle := fmt.Sprintf("Started watching thread: %s", title)
 		body := title
 		if err := emitEvent(conn, watcher.EventTypeWatchStarted, wsTitle, &body, latestThreadTS(thread), nil, nil, nil, resource); err != nil {
-			return 0, fmt.Errorf("emit watch_started: %w", err)
+			return 0, resolvedRoot, fmt.Errorf("emit watch_started: %w", err)
 		}
-		return 1, nil
+		return 1, resolvedRoot, nil
 	}
 
-	replies := thread.Messages
-	if len(replies) > 0 {
-		replies = replies[1:] // skip the root
-	}
-
-	for _, m := range replies {
-		if m.TS <= cursor { // raw Slack ts string compare — the invariant
-			continue
-		}
+	for _, m := range fresh {
 
 		dup, err := db.IsDuplicate(conn, db.DedupCheck{
 			Source: "slack", ResourceType: resource.Type, ResourceID: resource.ID,
 			Type: watcher.EventTypeSlackReply, ExternalTS: &m.TS,
 		})
 		if err != nil {
-			return eventCount, fmt.Errorf("dedup: %w", err)
+			return eventCount, resolvedRoot, fmt.Errorf("dedup: %w", err)
 		}
 		if dup {
 			continue
@@ -246,7 +259,7 @@ func processThread(conn *sql.DB, thread Thread, names map[string]string, resourc
 
 		author := names[m.UserID]
 		evTitle := fmt.Sprintf("New reply in %s", title)
-		snippet := fallbackTitle(m.Text)
+		snippet := fallbackTitle(mentions.resolve(m.Text))
 		body := snippet
 		if author != "" {
 			body = author + ": " + snippet
@@ -256,19 +269,13 @@ func processThread(conn *sql.DB, thread Thread, names map[string]string, resourc
 			authorPtr = &author
 		}
 		if err := emitEvent(conn, watcher.EventTypeSlackReply, evTitle, &body, m.TS, authorPtr, nil, optional(m.UserID), resource); err != nil {
-			return eventCount, fmt.Errorf("emit slack_reply: %w", err)
+			return eventCount, resolvedRoot, fmt.Errorf("emit slack_reply: %w", err)
 		}
 		eventCount++
 		logger.Printf("Emitted slack_reply for %s", resource.ID)
 	}
 
-	return eventCount, nil
-}
-
-// threadTitle returns the fallback title derived from the thread's root
-// message text.
-func threadTitle(thread Thread) string {
-	return fallbackTitle(rootText(thread))
+	return eventCount, resolvedRoot, nil
 }
 
 // rootText returns the root message's text, or "" if the thread has no
@@ -348,26 +355,40 @@ func resolveChannelName(conn *sql.DB, client Client, resource watcher.Resource, 
 
 // buildSlackStateJSON builds a JSON representation of a Slack thread's
 // current state, cached to resource_state for the Overview card.
-// resolvedRootText returns the thread's root message text with mentions
-// rewritten to names. Directories are fetched only for the ids the text
-// actually references, and any lookup failure degrades to bare ids rather
-// than failing the poll — a title is a nicety, the events are the point.
-func resolvedRootText(client Client, thread Thread, names map[string]string) string {
-	text := rootText(thread)
-	userIDs, groupIDs := MentionIDs(text)
-	if len(userIDs) == 0 && len(groupIDs) == 0 {
-		return text
-	}
+// mentionResolver rewrites mention tokens in message text to names, from
+// directories fetched once for a whole batch of texts.
+type mentionResolver struct {
+	users  map[string]string
+	groups map[string]UserGroup
+}
 
-	// names already covers message AUTHORS; a mention may be someone who
-	// never posted, so look up only the ids still missing.
-	users := make(map[string]string, len(userIDs))
-	var missing []string
-	for _, id := range userIDs {
-		if n, ok := names[id]; ok && n != "" {
-			users[id] = n
-		} else {
-			missing = append(missing, id)
+// newMentionResolver fetches the directories the given texts reference, in one
+// batched call per kind. names already covers message AUTHORS; a mention may be
+// someone who never posted, so only the ids still missing are looked up. Any
+// lookup failure degrades to bare ids rather than failing the poll — a title is
+// a nicety, the events are the point.
+func newMentionResolver(client Client, names map[string]string, texts ...string) mentionResolver {
+	r := mentionResolver{users: map[string]string{}, groups: map[string]UserGroup{}}
+	seenU, seenG := map[string]bool{}, map[string]bool{}
+	var missing, groupIDs []string
+	for _, text := range texts {
+		userIDs, gIDs := MentionIDs(text)
+		for _, id := range userIDs {
+			if seenU[id] {
+				continue
+			}
+			seenU[id] = true
+			if n, ok := names[id]; ok && n != "" {
+				r.users[id] = n
+			} else {
+				missing = append(missing, id)
+			}
+		}
+		for _, id := range gIDs {
+			if !seenG[id] {
+				seenG[id] = true
+				groupIDs = append(groupIDs, id)
+			}
 		}
 	}
 	if len(missing) > 0 {
@@ -378,19 +399,21 @@ func resolvedRootText(client Client, thread Thread, names map[string]string) str
 					name = u.RealName
 				}
 				if name != "" {
-					users[id] = name
+					r.users[id] = name
 				}
 			}
 		}
 	}
-
-	groups := map[string]UserGroup{}
 	if len(groupIDs) > 0 {
 		if fetched, err := client.UserGroupsInfo(context.Background(), groupIDs); err == nil {
-			groups = fetched
+			r.groups = fetched
 		}
 	}
-	return ResolveMentions(text, users, groups)
+	return r
+}
+
+func (r mentionResolver) resolve(text string) string {
+	return ResolveMentions(text, r.users, r.groups)
 }
 
 func buildSlackStateJSON(thread Thread, channelName, rootAuthor, resolvedRoot string) string {
