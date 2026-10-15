@@ -12,19 +12,22 @@ import (
 )
 
 // PRSummary is the minimum needed to render a PR as a row, plus its body
-// (which callers scan for links).
+// (which callers scan for links) and its head branch (which callers check
+// out, e.g. worktree creating a worktree from a PR).
 type PRSummary struct {
-	Title   string
-	State   string // OPEN | CLOSED | MERGED
-	IsDraft bool
-	URL     string
-	Body    string
+	Title       string
+	State       string // OPEN | CLOSED | MERGED
+	IsDraft     bool
+	URL         string
+	Body        string
+	HeadRefName string
 }
 
-// FetchPRSummaries fetches title/state/draft/url/body for many PRs in ONE
-// GraphQL request (one alias per PR). PRs that can't be resolved (deleted,
-// private, typo'd) are simply absent from the result; only a response with
-// nothing usable at all is an error.
+// FetchPRSummaries fetches title/state/draft/url/body/head branch for many
+// PRs in ONE GraphQL request (one alias per PR). PRs that can't be resolved
+// (deleted, private, typo'd) are simply absent from the result; only a
+// response with nothing usable at all is an error. A rejected token (401)
+// wraps ErrAuth.
 func FetchPRSummaries(token string, refs []PRRef, apiURL ...string) (map[PRRef]PRSummary, error) {
 	out := map[PRRef]PRSummary{}
 	if len(refs) == 0 {
@@ -37,7 +40,7 @@ func FetchPRSummaries(token string, refs []PRRef, apiURL ...string) (map[PRRef]P
 	var q strings.Builder
 	q.WriteString("query {\n")
 	for i, r := range refs {
-		fmt.Fprintf(&q, "  pr%d: repository(owner: %s, name: %s) { pullRequest(number: %d) { title state isDraft url body } }\n",
+		fmt.Fprintf(&q, "  pr%d: repository(owner: %s, name: %s) { pullRequest(number: %d) { title state isDraft url body headRefName } }\n",
 			i, strconv.Quote(r.Owner), strconv.Quote(r.Repo), r.Number)
 	}
 	q.WriteString("}")
@@ -57,6 +60,9 @@ func FetchPRSummaries(token string, refs []PRRef, apiURL ...string) (map[PRRef]P
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("GitHub token rejected: %w", ErrAuth)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, string(body))

@@ -2,6 +2,7 @@ package github
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,11 +19,12 @@ func TestFetchPRSummaries(t *testing.T) {
 		var req struct{ Query string }
 		json.Unmarshal(b, &req)
 		if !strings.Contains(req.Query, `pr0: repository(owner: "example", name: "repo")`) ||
-			!strings.Contains(req.Query, "pullRequest(number: 1)") || !strings.Contains(req.Query, "pr1:") {
+			!strings.Contains(req.Query, "pullRequest(number: 1)") || !strings.Contains(req.Query, "pr1:") ||
+			!strings.Contains(req.Query, "headRefName") {
 			t.Errorf("query: %s", req.Query)
 		}
 		w.Write([]byte(`{"data":{
-			"pr0":{"pullRequest":{"title":"One","state":"OPEN","isDraft":true,"url":"https://github.com/example/repo/pull/1","body":"see https://example.com"}},
+			"pr0":{"pullRequest":{"title":"One","state":"OPEN","isDraft":true,"url":"https://github.com/example/repo/pull/1","body":"see https://example.com","headRefName":"feature-x"}},
 			"pr1":null},
 			"errors":[{"message":"Could not resolve to a Repository"}]}`))
 	}))
@@ -34,7 +36,7 @@ func TestFetchPRSummaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("partial failure must not fail: %v", err)
 	}
-	if s, ok := got[a]; !ok || s.Title != "One" || !s.IsDraft || s.State != "OPEN" || s.Body != "see https://example.com" {
+	if s, ok := got[a]; !ok || s.Title != "One" || !s.IsDraft || s.State != "OPEN" || s.Body != "see https://example.com" || s.HeadRefName != "feature-x" {
 		t.Errorf("a = %+v ok=%v", got[a], ok)
 	}
 	if _, ok := got[b]; ok {
@@ -53,5 +55,19 @@ func TestFetchPRSummariesEmptyAndTotalFailure(t *testing.T) {
 	defer srv.Close()
 	if _, err := FetchPRSummaries("tok", []PRRef{{Owner: "o", Repo: "r", Number: 1}}, srv.URL); err == nil {
 		t.Fatal("total failure must error")
+	}
+}
+
+// A rejected token is ErrAuth, so callers can tell "replace your token"
+// apart from a network or server problem.
+func TestFetchPRSummariesUnauthorizedIsErrAuth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message":"Bad credentials"}`))
+	}))
+	defer srv.Close()
+	_, err := FetchPRSummaries("tok", []PRRef{{Owner: "o", Repo: "r", Number: 1}}, srv.URL)
+	if !errors.Is(err, ErrAuth) {
+		t.Fatalf("err = %v, want ErrAuth", err)
 	}
 }
