@@ -209,6 +209,29 @@ tombstone model rather than deleting rows outright:
   lookup: every subscription (any state) for a given resource, useful
   for "who's watching this" tooling.
 
+## Reading resources and events
+
+Event reads exclude bookkeeping types (`watch_started`, `watcher_error`)
+unless noted. Single-row reads return `nil, nil` when nothing matches.
+
+- **`db.ActiveResources(conn, resourceType)`** — resources with a live
+  subscription, once per resource ID (URL: lexically first non-empty live
+  URL, else `""`). This is what pollers are fed.
+- **`db.ResourceURL(conn, resourceType, resourceID)`** — a resource's URL:
+  live subscriptions first, then any subscription, then
+  `watcher_event_resources`; lexically first within each; else `""`.
+- **`db.EventsForResource(conn, resourceType, resourceID)`** — all of a
+  resource's events, oldest first.
+- **`db.RecentEventsForResource(conn, resourceType, resourceID, limit)`** —
+  a resource's newest `limit` events, newest first.
+- **`db.EventsForSubscriberSince(conn, subscriber, since)`** — events with
+  `ts > since` on resources the subscriber has a live subscription to.
+- **`db.GetEvent(conn, id)`** — one event by ID (bookkeeping included).
+- **`db.EventByExternalTS(conn, resourceType, resourceIDPrefix, externalTS)`**
+  — the newest event with that `external_ts` on a resource whose ID starts
+  with the (literal, wildcard-safe) prefix; e.g. a Slack message's event
+  from `"<channel>:"` and the message `ts`.
+
 ## Config
 
 Config is a single shared YAML credentials file, by default at

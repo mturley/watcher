@@ -312,6 +312,121 @@ func EventsForSubscriberSince(conn *sql.DB, subscriber, since string) ([]watcher
 	return scanEvents(rows)
 }
 
+// eventColumns is the column list scanEvents expects, qualified by the
+// watcher_events alias e.
+const eventColumns = `e.id, e.ts, e.external_ts, e.source, e.type, e.title, e.body, e.author, e.author_type, e.tags, e.author_id`
+
+// RecentEventsForResource returns up to limit non-bookkeeping events
+// recorded for the given resource, newest first (ts descending, ties
+// broken by id descending).
+func RecentEventsForResource(conn *sql.DB, resourceType, resourceID string, limit int) ([]watcher.Event, error) {
+	exclClause, exclArgs := bookkeepingExclusionClause()
+	args := append([]any{resourceType, resourceID}, exclArgs...)
+	args = append(args, limit)
+	rows, err := conn.Query(`
+		SELECT `+eventColumns+`
+		FROM watcher_events e
+		JOIN watcher_event_resources er ON er.event_id = e.id
+		WHERE er.resource_type = ? AND er.resource_id = ?
+		  AND `+exclClause+`
+		ORDER BY e.ts DESC, e.id DESC
+		LIMIT ?
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent events for resource: %w", err)
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
+// GetEvent returns the event with the given id, of any type (bookkeeping
+// included). Like GetResourceState it returns nil, nil when no such event
+// exists.
+func GetEvent(conn *sql.DB, id string) (*watcher.Event, error) {
+	rows, err := conn.Query(`SELECT `+eventColumns+` FROM watcher_events e WHERE e.id = ?`, id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query event: %w", err)
+	}
+	defer rows.Close()
+	return firstEvent(scanEvents(rows))
+}
+
+// EventByExternalTS returns the newest non-bookkeeping event whose
+// external_ts equals externalTS and which is recorded against a resource of
+// resourceType whose resource_id starts with resourceIDPrefix. It returns
+// nil, nil when none matches.
+//
+// The prefix is matched literally (no LIKE wildcards), so "_" and "%" in it
+// are safe. The intended use is finding a Slack message's event from its
+// channel and message ts: Slack thread resource ids are
+// "<channel>:<thread_ts>", so the caller passes "<channel>:".
+func EventByExternalTS(conn *sql.DB, resourceType, resourceIDPrefix, externalTS string) (*watcher.Event, error) {
+	exclClause, exclArgs := bookkeepingExclusionClause()
+	// length(?) rather than Go's len: SQLite's substr counts characters,
+	// not bytes.
+	args := []any{resourceType, resourceIDPrefix, resourceIDPrefix, externalTS}
+	args = append(args, exclArgs...)
+	rows, err := conn.Query(`
+		SELECT `+eventColumns+`
+		FROM watcher_events e
+		JOIN watcher_event_resources er ON er.event_id = e.id
+		WHERE er.resource_type = ?
+		  AND substr(er.resource_id, 1, length(?)) = ?
+		  AND e.external_ts = ?
+		  AND `+exclClause+`
+		ORDER BY e.ts DESC, e.id DESC
+		LIMIT 1
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query event by external ts: %w", err)
+	}
+	defer rows.Close()
+	return firstEvent(scanEvents(rows))
+}
+
+// firstEvent adapts scanEvents' result to the single-event nil-when-absent
+// convention.
+func firstEvent(events []watcher.Event, err error) (*watcher.Event, error) {
+	if err != nil || len(events) == 0 {
+		return nil, err
+	}
+	return &events[0], nil
+}
+
+// ResourceURL returns the URL recorded for a resource, deterministically:
+// the lexically first non-empty URL among its live subscriptions, else among
+// any of its subscriptions (soft-deleted or lease-expired), else the
+// lexically first non-empty URL any watcher_event_resources row records for
+// it. It returns "" (and a nil error) when none records one.
+func ResourceURL(conn *sql.DB, resourceType, resourceID string) (string, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	var url string
+	err := conn.QueryRow(`
+		SELECT resource_url FROM watcher_subscriptions
+		WHERE resource_type = ? AND resource_id = ?
+		  AND resource_url IS NOT NULL AND resource_url != ''
+		ORDER BY (deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)) DESC,
+		         resource_url ASC
+		LIMIT 1
+	`, resourceType, resourceID, now).Scan(&url)
+	if err == nil {
+		return url, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", fmt.Errorf("failed to query subscription url: %w", err)
+	}
+
+	var evURL sql.NullString
+	if err := conn.QueryRow(`
+		SELECT MIN(NULLIF(resource_url, ''))
+		FROM watcher_event_resources
+		WHERE resource_type = ? AND resource_id = ?
+	`, resourceType, resourceID).Scan(&evURL); err != nil {
+		return "", fmt.Errorf("failed to query event resource url: %w", err)
+	}
+	return evURL.String, nil
+}
+
 // Subscription is a row of watcher_subscriptions with lifecycle metadata.
 type Subscription struct {
 	ID                 string
