@@ -54,19 +54,24 @@ type LinkGraph struct {
 const summaryFields = "summary,status,issuetype,parent"
 
 type rawSummaryFields struct {
-	Summary string `json:"summary"`
-	Status  struct {
-		Name           string `json:"name"`
-		StatusCategory struct {
-			Key string `json:"key"`
-		} `json:"statusCategory"`
-	} `json:"status"`
+	Summary   string    `json:"summary"`
+	Status    rawStatus `json:"status"`
 	IssueType struct {
 		Name           string `json:"name"`
 		IconURL        string `json:"iconUrl"`
 		HierarchyLevel int    `json:"hierarchyLevel"`
 	} `json:"issuetype"`
 	Parent *rawIssueRef `json:"parent"`
+}
+
+// rawStatus is Jira's status object. The statusCategory comes back nested
+// inside "status" whenever the status field is requested, so no extra field
+// name is needed. Shared by IssueSummary and FetchIssue's IssueData.
+type rawStatus struct {
+	Name           string `json:"name"`
+	StatusCategory struct {
+		Key string `json:"key"` // "new" | "indeterminate" | "done"
+	} `json:"statusCategory"`
 }
 
 type rawIssueRef struct {

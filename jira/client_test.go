@@ -95,3 +95,49 @@ func TestPriorityIconCaptured(t *testing.T) {
 		t.Errorf("state[\"priority_icon_url\"] = %v, want %q", state["priority_icon_url"], want)
 	}
 }
+
+// TestStatusCategoryCaptured pins that FetchIssue requests the status field
+// (which carries statusCategory nested inside it), keeps its key, and caches
+// it in state as status_category.
+func TestStatusCategoryCaptured(t *testing.T) {
+	var gotFields string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/comment") || strings.HasSuffix(r.URL.Path, "/changelog") {
+			w.Write([]byte(`{"comments": [], "values": [], "total": 0, "isLast": true}`))
+			return
+		}
+		gotFields = r.URL.Query().Get("fields")
+		w.Write([]byte(`{
+			"key": "PROJ-1",
+			"fields": {
+				"summary": "A bug",
+				"status": {"name": "Review", "statusCategory": {"id": 4, "key": "indeterminate", "name": "In Progress"}},
+				"issuetype": {"id": "10004", "name": "Bug"},
+				"labels": [],
+				"created": "2026-01-01T00:00:00.000+0000",
+				"updated": "2026-01-02T00:00:00.000+0000"
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, Email: "user@example.com", Token: "token"}
+	issue, err := c.FetchIssue("PROJ-1", nil)
+	if err != nil {
+		t.Fatalf("FetchIssue: %v", err)
+	}
+	if !strings.Contains(","+gotFields+",", ",status,") {
+		t.Errorf("fields = %q, want it to request status", gotFields)
+	}
+	if issue.StatusCategory != "indeterminate" {
+		t.Errorf("StatusCategory = %q, want indeterminate", issue.StatusCategory)
+	}
+	var state map[string]interface{}
+	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue)), &state); err != nil {
+		t.Fatalf("unmarshal state: %v", err)
+	}
+	if state["status_category"] != "indeterminate" {
+		t.Errorf("state[\"status_category\"] = %v, want indeterminate", state["status_category"])
+	}
+}

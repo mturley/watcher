@@ -427,9 +427,11 @@ func latestTimestamp(issue IssueData) string {
 // buildJiraStateJSON builds a JSON representation of a Jira issue's current state.
 func buildJiraStateJSON(issue *IssueData) string {
 	state := map[string]interface{}{
-		"summary":  issue.Summary,
-		"status":   issue.Status,
-		"priority": issue.Priority,
+		"summary": issue.Summary,
+		"status":  issue.Status,
+		// "new" | "indeterminate" | "done" | "" — workflow-independent.
+		"status_category": issue.StatusCategory,
+		"priority":        issue.Priority,
 		// Cached for the same reason as the issue-type icon below.
 		"priority_icon_url": issue.PriorityIconURL,
 		"assignee":          issue.Assignee,

@@ -26,10 +26,14 @@ type Client struct {
 
 // IssueData represents Jira issue data with changelog and comments.
 type IssueData struct {
-	Key      string
-	Summary  string
-	Status   string
-	Priority string
+	Key     string
+	Summary string
+	Status  string
+	// StatusCategory is Jira's status category key (fields.status.
+	// statusCategory.key): "new" | "indeterminate" | "done", or "" when
+	// absent. Unlike Status it is stable across workflows.
+	StatusCategory string
+	Priority       string
 	// PriorityIconURL is Jira's own icon for the priority. Its URL is not
 	// derivable from the priority name (custom priorities use avatar URLs),
 	// so it is cached as given. Like IssueTypeIconURL it may need auth.
@@ -116,10 +120,8 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 	var raw struct {
 		Key    string `json:"key"`
 		Fields struct {
-			Summary string `json:"summary"`
-			Status  struct {
-				Name string `json:"name"`
-			} `json:"status"`
+			Summary  string    `json:"summary"`
+			Status   rawStatus `json:"status"`
 			Priority struct {
 				Name    string `json:"name"`
 				IconURL string `json:"iconUrl"`
@@ -163,6 +165,7 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 		Key:              raw.Key,
 		Summary:          raw.Fields.Summary,
 		Status:           raw.Fields.Status.Name,
+		StatusCategory:   raw.Fields.Status.StatusCategory.Key,
 		Priority:         raw.Fields.Priority.Name,
 		PriorityIconURL:  raw.Fields.Priority.IconURL,
 		IssueType:        raw.Fields.IssueType.Name,
