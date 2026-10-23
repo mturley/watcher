@@ -26,6 +26,62 @@ func TestSubscribeAndActiveResources(t *testing.T) {
 	}
 }
 
+// TestActiveResourcesOncePerResource pins that a resource subscribed under
+// different URLs (or with and without one) is returned — and so polled —
+// once, with the lexically first non-empty live URL.
+func TestActiveResourcesOncePerResource(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	id := "owner/repo#9"
+	subs := []struct{ sub, url string }{
+		{"sub-a", "https://example.com/b"},
+		{"sub-b", ""},
+		{"sub-c", "https://example.com/a"},
+		{"sub-d", "https://example.com/0-dead"},
+	}
+	for _, s := range subs {
+		r := watcher.Resource{Type: "pr", ID: id, URL: s.url}
+		if err := Subscribe(c, s.sub, r, SubscribeOpts{TTL: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A dead subscription's URL must not be chosen, even though it sorts first.
+	if err := Revoke(c, "sub-d"); err != nil {
+		t.Fatal(err)
+	}
+	// An empty-string URL (as opposed to NULL) must not win either.
+	if _, err := c.Exec(`UPDATE watcher_subscriptions SET resource_url = '' WHERE subscriber = 'sub-b'`); err != nil {
+		t.Fatal(err)
+	}
+
+	resources, err := ActiveResources(c, "pr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("got %d resources %+v, want 1", len(resources), resources)
+	}
+	if got := resources[0]; got.ID != id || got.URL != "https://example.com/a" {
+		t.Errorf("got %+v, want ID %q URL https://example.com/a", got, id)
+	}
+
+	// With only URL-less live subscriptions left, the URL is "".
+	for _, s := range []string{"sub-a", "sub-c"} {
+		if err := Revoke(c, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resources, err = ActiveResources(c, "pr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 || resources[0].URL != "" {
+		t.Fatalf("got %+v, want one resource with empty URL", resources)
+	}
+}
+
 func TestActiveResourcesExcludesExpiredLease(t *testing.T) {
 	c := mem(t)
 	if err := Migrate(c); err != nil {

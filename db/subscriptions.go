@@ -195,16 +195,22 @@ func Unsubscribe(conn *sql.DB, subscriber string, r watcher.Resource) error {
 	return nil
 }
 
-// ActiveResources returns the distinct set of resources of resourceType
-// with at least one live (not soft-deleted, not lease-expired)
-// subscription.
+// ActiveResources returns the resources of resourceType with at least one
+// live (not soft-deleted, not lease-expired) subscription, exactly once per
+// (resource_type, resource_id) even when subscribers recorded different
+// URLs. The URL is chosen deterministically: the lexically first non-empty
+// URL among the live subscriptions, else "". Rows are ordered by resource_id.
 func ActiveResources(conn *sql.DB, resourceType string) ([]watcher.Resource, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
+	// MIN ignores NULLs; NULLIF folds '' into NULL so an empty URL never
+	// beats a real one.
 	rows, err := conn.Query(`
-		SELECT DISTINCT resource_type, resource_id, resource_url
+		SELECT resource_type, resource_id, MIN(NULLIF(resource_url, ''))
 		FROM watcher_subscriptions
 		WHERE resource_type = ? AND deleted_at IS NULL
 		  AND (expires_at IS NULL OR expires_at > ?)
+		GROUP BY resource_type, resource_id
+		ORDER BY resource_id
 	`, resourceType, now)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active resources: %w", err)
