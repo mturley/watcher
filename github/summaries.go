@@ -45,27 +45,9 @@ func FetchPRSummaries(token string, refs []PRRef, apiURL ...string) (map[PRRef]P
 	}
 	q.WriteString("}")
 
-	payload, _ := json.Marshal(map[string]string{"query": q.String()})
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
+	body, err := postGraphQL(token, endpoint, q.String())
 	if err != nil {
 		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("github graphql: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, fmt.Errorf("GitHub token rejected: %w", ErrAuth)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, string(body))
 	}
 	var result struct {
 		Data map[string]*struct {
@@ -87,4 +69,32 @@ func FetchPRSummaries(token string, refs []PRRef, apiURL ...string) (map[PRRef]P
 		return nil, fmt.Errorf("github graphql: %s", result.Errors[0].Message)
 	}
 	return out, nil
+}
+
+// postGraphQL POSTs one GraphQL query and returns the raw response body. A
+// rejected token (401) wraps ErrAuth; any other non-200 is an error.
+func postGraphQL(token, endpoint, query string) ([]byte, error) {
+	payload, _ := json.Marshal(map[string]string{"query": query})
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("github graphql: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("GitHub token rejected: %w", ErrAuth)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, string(body))
+	}
+	return body, nil
 }
