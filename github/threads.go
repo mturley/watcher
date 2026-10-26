@@ -36,12 +36,12 @@ type ThreadComment struct {
 }
 
 type threadCommentNode struct {
-	DatabaseID int64  `json:"databaseId"`
-	Body       string `json:"body"`
-	CreatedAt  string `json:"createdAt"`
-	UpdatedAt  string `json:"updatedAt"`
-	URL        string `json:"url"`
-	State      string `json:"state"`
+	DatabaseID fullDatabaseID `json:"fullDatabaseId"`
+	Body       string         `json:"body"`
+	CreatedAt  string         `json:"createdAt"`
+	UpdatedAt  string         `json:"updatedAt"`
+	URL        string         `json:"url"`
+	State      string         `json:"state"`
 	Commit     *struct {
 		Oid string `json:"oid"`
 	} `json:"commit"`
@@ -64,11 +64,11 @@ type threadCommentsConn struct {
 	Nodes    []threadCommentNode `json:"nodes"`
 }
 
-const threadCommentFields = `databaseId body createdAt updatedAt url state commit{oid} originalCommit{oid} author{__typename login avatarUrl ... on User{databaseId} ... on Bot{databaseId}}`
+const threadCommentFields = `fullDatabaseId body createdAt updatedAt url state commit{oid} originalCommit{oid} author{__typename login avatarUrl ... on User{databaseId} ... on Bot{databaseId}}`
 
 func (n threadCommentNode) toComment() ThreadComment {
 	c := ThreadComment{
-		DatabaseID: n.DatabaseID, Body: n.Body, CreatedAt: n.CreatedAt,
+		DatabaseID: int64(n.DatabaseID), Body: n.Body, CreatedAt: n.CreatedAt,
 		UpdatedAt: n.UpdatedAt, URL: n.URL, Pending: n.State == "PENDING",
 	}
 	if n.Commit != nil {

@@ -170,3 +170,27 @@ func TestParseGraphQLResponse_MergedByAndCommitAuthors(t *testing.T) {
 		t.Fatalf("an unlinked commit must have no AuthorID, got %q", pr.Commits.Recent[1].AuthorID)
 	}
 }
+
+func TestParseGraphQLResponse_ReviewCommentFullDatabaseID(t *testing.T) {
+	raw := `{
+		"pr0": {"pullRequest": {
+			"number": 1, "state": "OPEN", "title": "T", "updatedAt": "2024-01-01T00:00:00Z",
+			"reviews": {"nodes": []}, "comments": {"nodes": []},
+			"reviewThreads": {"nodes": [{"comments": {"nodes": [
+				{"fullDatabaseId": "4379800172", "author": {"__typename": "User", "login": "a"}, "createdAt": "2024-01-01T00:00:00Z", "path": "x.go", "body": "big"},
+				{"fullDatabaseId": null, "author": {"__typename": "User", "login": "a"}, "createdAt": "2024-01-01T00:00:00Z", "path": "y.go", "body": "null"},
+				{"fullDatabaseId": "oops", "author": {"__typename": "User", "login": "a"}, "createdAt": "2024-01-01T00:00:00Z", "path": "z.go", "body": "bad"}
+			]}}]},
+			"commits": {"totalCount": 0, "nodes": []}
+		}},
+		"rateLimit": {"remaining": 5000, "limit": 5000}
+	}`
+	res, _, err := parseGraphQLResponse(json.RawMessage(raw), []PRRef{{Owner: "o", Repo: "r", Number: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc := res[0].ReviewComments
+	if len(rc) != 3 || rc[0].DatabaseID != 4379800172 || rc[1].DatabaseID != 0 || rc[2].DatabaseID != 0 {
+		t.Fatalf("ids = %+v", rc)
+	}
+}

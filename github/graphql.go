@@ -293,7 +293,7 @@ func buildBatchedPRQuery(prs []PRRef) string {
           nodes {
             comments(last: 20) {
               nodes {
-                databaseId
+                fullDatabaseId
                 author {
                   __typename
                   login
@@ -481,12 +481,29 @@ type reviewCommentsConnection struct {
 	Nodes []reviewCommentNode `json:"nodes"`
 }
 
+// fullDatabaseID decodes GitHub's BigInt fullDatabaseId, which is sent as a
+// JSON string (the 32-bit databaseId overflows on modern comment ids). A null,
+// missing or unparseable value decodes to 0, meaning unknown.
+type fullDatabaseID int64
+
+func (f *fullDatabaseID) UnmarshalJSON(b []byte) error {
+	*f = 0
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return nil
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil && n > 0 {
+		*f = fullDatabaseID(n)
+	}
+	return nil
+}
+
 type reviewCommentNode struct {
-	DatabaseID int64      `json:"databaseId"`
-	Author     authorNode `json:"author"`
-	CreatedAt  string     `json:"createdAt"`
-	Path       string     `json:"path"`
-	Body       string     `json:"body"`
+	DatabaseID fullDatabaseID `json:"fullDatabaseId"`
+	Author     authorNode     `json:"author"`
+	CreatedAt  string         `json:"createdAt"`
+	Path       string         `json:"path"`
+	Body       string         `json:"body"`
 }
 
 type commitsConnection struct {
@@ -599,7 +616,7 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 	for _, thread := range node.ReviewThreads.Nodes {
 		for _, rc := range thread.Comments.Nodes {
 			data.ReviewComments = append(data.ReviewComments, ReviewComment{
-				DatabaseID: rc.DatabaseID,
+				DatabaseID: int64(rc.DatabaseID),
 				Author:     rc.Author.Login,
 				AuthorType: authorType(rc.Author.Typename),
 				AuthorID:   rc.Author.id(),

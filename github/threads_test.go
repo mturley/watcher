@@ -60,7 +60,7 @@ func TestFetchReviewThreadsFields(t *testing.T) {
 		return 200, `{"data":{"repository":{"pullRequest":{"headRefName":"f","headRefOid":"h","baseRefOid":"b",
 		"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"T1","isResolved":true,"isOutdated":true,"path":"a.go","diffSide":"LEFT",
 		"line":null,"startLine":null,"originalLine":12,"originalStartLine":10,
-		"comments":{"pageInfo":{"hasNextPage":false},"nodes":[{"databaseId":99,"body":"hi","createdAt":"c","updatedAt":"u","url":"https://x/y","state":"PENDING",
+		"comments":{"pageInfo":{"hasNextPage":false},"nodes":[{"fullDatabaseId":"99","body":"hi","createdAt":"c","updatedAt":"u","url":"https://x/y","state":"PENDING",
 		"commit":null,"originalCommit":{"oid":"abc"},"author":{"__typename":"Bot","login":"bot","avatarUrl":"https://av","databaseId":5}}]}}]}}}}}`
 	})
 	got, err := FetchReviewThreads("tok", threadsRef, srv.URL)
@@ -83,12 +83,12 @@ func TestFetchReviewThreadsMoreComments(t *testing.T) {
 		if n == 0 {
 			return 200, `{"data":{"repository":{"pullRequest":{"headRefName":"f","headRefOid":"h","baseRefOid":"b",
 			"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"T1","path":"a.go",
-			"comments":{"pageInfo":{"hasNextPage":true,"endCursor":"cc1"},"nodes":[{"databaseId":1,"body":"one","author":{"__typename":"User","login":"u"}}]}}]}}}}}`
+			"comments":{"pageInfo":{"hasNextPage":true,"endCursor":"cc1"},"nodes":[{"fullDatabaseId":"1","body":"one","author":{"__typename":"User","login":"u"}}]}}]}}}}}`
 		}
 		if !strings.Contains(q, `node(id: "T1")`) || !strings.Contains(q, `after: "cc1"`) {
 			t.Errorf("follow-up query: %s", q)
 		}
-		return 200, `{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false},"nodes":[{"databaseId":2,"body":"two","author":{"__typename":"User","login":"u"}}]}}}}`
+		return 200, `{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false},"nodes":[{"fullDatabaseId":"2","body":"two","author":{"__typename":"User","login":"u"}}]}}}}`
 	})
 	got, err := FetchReviewThreads("tok", threadsRef, srv.URL)
 	if err != nil {
