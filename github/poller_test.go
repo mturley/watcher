@@ -1162,3 +1162,42 @@ func TestCommonCommitAuthorEmptyList(t *testing.T) {
 		t.Fatal("an empty commit list must not be attributed")
 	}
 }
+
+// TestProcessPR_ReviewCommentTag: a review comment event carries its GitHub
+// database id as a "comment:<id>" tag; one without a known id has no tag.
+func TestProcessPR_ReviewCommentTag(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if _, err := processPR(conn, PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T08:00:00Z",
+	}, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("seed processPR: %v", err)
+	}
+	if _, err := processPR(conn, PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T10:00:00Z",
+		ReviewComments: []ReviewComment{
+			{Author: "r", AuthorType: "user", CreatedAt: "2026-06-17T09:00:00Z", Path: "a.go", Body: "x", DatabaseID: 4242},
+			{Author: "r", AuthorType: "user", CreatedAt: "2026-06-17T09:00:00Z", Path: "b.go", Body: "y"},
+		},
+	}, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR: %v", err)
+	}
+	events, err := db.EventsForResourceByType(conn, "pr", prResource.ID, string(watcher.EventTypePRReviewComment))
+	if err != nil || len(events) != 2 {
+		t.Fatalf("events = %d, err = %v", len(events), err)
+	}
+	tags := map[string]*string{}
+	for _, e := range events {
+		tags[e.Title] = e.Tags
+	}
+	if p := tags["Review comment by r on a.go"]; p == nil || *p != "comment:4242" {
+		t.Errorf("a.go tags = %v, want comment:4242", p)
+	}
+	if p := tags["Review comment by r on b.go"]; p != nil {
+		t.Errorf("b.go tags = %q, want nil", *p)
+	}
+}

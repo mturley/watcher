@@ -165,7 +165,7 @@ func pollWith(conn *sql.DB, token string, resources []watcher.Resource, logger *
 
 // emitEvent inserts a watcher event for the given resource, setting the
 // ID and recording timestamp that db.InsertEvent does not set.
-func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType, authorID *string, r watcher.Resource) error {
+func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType, authorID, tags *string, r watcher.Resource) error {
 	extTS := externalTS
 	return db.InsertEvent(conn, watcher.Event{
 		ID:         uuid.New().String(),
@@ -178,7 +178,18 @@ func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, ex
 		Author:     author,
 		AuthorType: authorType,
 		AuthorID:   authorID,
+		Tags:       tags,
 	}, r)
+}
+
+// commentTag returns the "comment:<databaseId>" tag for a review comment, or
+// nil when the id is unknown.
+func commentTag(id int64) *string {
+	if id == 0 {
+		return nil
+	}
+	tag := fmt.Sprintf("comment:%d", id)
+	return &tag
 }
 
 // emitError inserts a watcher_error event, guarded by db.HasPollerError to
@@ -223,7 +234,7 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 	if cursor == "" && !backfill {
 		title := fmt.Sprintf("Started watching PR: %s", prData.Title)
 		body := fmt.Sprintf("PR #%d in %s/%s\nState: %s", prData.Number, prData.Owner, prData.Repo, prData.State)
-		if err := emitEvent(conn, watcher.EventTypeWatchStarted, title, &body, prData.UpdatedAt, nil, nil, nil, resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypeWatchStarted, title, &body, prData.UpdatedAt, nil, nil, nil, nil, resource); err != nil {
 			return eventCount, fmt.Errorf("failed to emit watch_started event: %w", err)
 		}
 		eventCount++
@@ -274,7 +285,7 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 			title = fmt.Sprintf("PR review by %s", review.Author)
 		}
 
-		if err := emitEvent(conn, eventType, title, &review.Body, review.SubmittedAt, &review.Author, &review.AuthorType, optional(review.AuthorID), resource); err != nil {
+		if err := emitEvent(conn, eventType, title, &review.Body, review.SubmittedAt, &review.Author, &review.AuthorType, optional(review.AuthorID), nil, resource); err != nil {
 			return eventCount, fmt.Errorf("failed to emit %s event: %w", eventType, err)
 		}
 		eventCount++
@@ -302,7 +313,7 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 		}
 
 		title := fmt.Sprintf("Comment by %s", comment.Author)
-		if err := emitEvent(conn, watcher.EventTypePRComment, title, &comment.Body, comment.CreatedAt, &comment.Author, &comment.AuthorType, optional(comment.AuthorID), resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypePRComment, title, &comment.Body, comment.CreatedAt, &comment.Author, &comment.AuthorType, optional(comment.AuthorID), nil, resource); err != nil {
 			return eventCount, fmt.Errorf("failed to emit pr_comment event: %w", err)
 		}
 		eventCount++
@@ -338,7 +349,7 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 			continue
 		}
 
-		if err := emitEvent(conn, watcher.EventTypePRReviewComment, title, &reviewComment.Body, reviewComment.CreatedAt, &reviewComment.Author, &reviewComment.AuthorType, optional(reviewComment.AuthorID), resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypePRReviewComment, title, &reviewComment.Body, reviewComment.CreatedAt, &reviewComment.Author, &reviewComment.AuthorType, optional(reviewComment.AuthorID), commentTag(reviewComment.DatabaseID), resource); err != nil {
 			return eventCount, fmt.Errorf("failed to emit pr_review_comment event: %w", err)
 		}
 		eventCount++
@@ -573,7 +584,7 @@ skipCIBundle:
 			if eventType == watcher.EventTypePRMerged && prData.MergedBy != "" {
 				author, authorType, authorID = &prData.MergedBy, &prData.MergedByType, optional(prData.MergedByID)
 			}
-			if err := emitEvent(conn, eventType, title, &body, prData.UpdatedAt, author, authorType, authorID, resource); err != nil {
+			if err := emitEvent(conn, eventType, title, &body, prData.UpdatedAt, author, authorType, authorID, nil, resource); err != nil {
 				return eventCount, fmt.Errorf("failed to emit %s event: %w", eventType, err)
 			}
 			eventCount++
@@ -621,7 +632,7 @@ skipCIBundle:
 					user := "user"
 					author, authorType, authorID = &login, &user, &id
 				}
-				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, author, authorType, authorID, resource); err != nil {
+				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, author, authorType, authorID, nil, resource); err != nil {
 					logger.Printf("WARNING: failed to emit new commits event: %v", err)
 				} else {
 					eventCount++

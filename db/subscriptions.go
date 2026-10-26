@@ -339,6 +339,24 @@ func RecentEventsForResource(conn *sql.DB, resourceType, resourceID string, limi
 	return scanEvents(rows)
 }
 
+// EventsForResourceByType returns every event of eventType recorded for the
+// given resource, oldest first (ts ascending, ties broken by id), with no
+// limit.
+func EventsForResourceByType(conn *sql.DB, resourceType, resourceID, eventType string) ([]watcher.Event, error) {
+	rows, err := conn.Query(`
+		SELECT `+eventColumns+`
+		FROM watcher_events e
+		JOIN watcher_event_resources er ON er.event_id = e.id
+		WHERE er.resource_type = ? AND er.resource_id = ? AND e.type = ?
+		ORDER BY e.ts ASC, e.id ASC
+	`, resourceType, resourceID, eventType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query events by type for resource: %w", err)
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
 // GetEvent returns the event with the given id, of any type (bookkeeping
 // included). Like GetResourceState it returns nil, nil when no such event
 // exists.

@@ -169,3 +169,22 @@ func TestResourceURL(t *testing.T) {
 		t.Fatalf("live subs: got %q, %v; want https://sub/a", got, err)
 	}
 }
+
+func TestEventsForResourceByType(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	r := watcher.Resource{Type: "pr", ID: "owner/repo#1"}
+	insertTestEvent(t, c, "e3", "2026-01-01T00:00:03Z", "", watcher.EventTypePRReviewComment, r)
+	insertTestEvent(t, c, "e1", "2026-01-01T00:00:01Z", "", watcher.EventTypePRReviewComment, r)
+	insertTestEvent(t, c, "e2", "2026-01-01T00:00:02Z", "", watcher.EventTypePRComment, r)
+
+	got, err := EventsForResourceByType(c, "pr", r.ID, string(watcher.EventTypePRReviewComment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := eventIDs(got); len(ids) != 2 || ids[0] != "e1" || ids[1] != "e3" {
+		t.Errorf("got %v, want [e1 e3] (oldest first, other types excluded)", ids)
+	}
+}

@@ -67,6 +67,7 @@ type Comment struct {
 
 // ReviewComment represents a PR review comment (inline comment on code).
 type ReviewComment struct {
+	DatabaseID int64 // GitHub comment databaseId; 0 when unknown
 	Author     string
 	AuthorType string
 	AuthorID   string // decimal databaseId; "" when unknown
@@ -292,6 +293,7 @@ func buildBatchedPRQuery(prs []PRRef) string {
           nodes {
             comments(last: 20) {
               nodes {
+                databaseId
                 author {
                   __typename
                   login
@@ -480,10 +482,11 @@ type reviewCommentsConnection struct {
 }
 
 type reviewCommentNode struct {
-	Author    authorNode `json:"author"`
-	CreatedAt string     `json:"createdAt"`
-	Path      string     `json:"path"`
-	Body      string     `json:"body"`
+	DatabaseID int64      `json:"databaseId"`
+	Author     authorNode `json:"author"`
+	CreatedAt  string     `json:"createdAt"`
+	Path       string     `json:"path"`
+	Body       string     `json:"body"`
 }
 
 type commitsConnection struct {
@@ -596,6 +599,7 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 	for _, thread := range node.ReviewThreads.Nodes {
 		for _, rc := range thread.Comments.Nodes {
 			data.ReviewComments = append(data.ReviewComments, ReviewComment{
+				DatabaseID: rc.DatabaseID,
 				Author:     rc.Author.Login,
 				AuthorType: authorType(rc.Author.Typename),
 				AuthorID:   rc.Author.id(),
