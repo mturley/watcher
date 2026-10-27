@@ -1201,3 +1201,40 @@ func TestProcessPR_ReviewCommentTag(t *testing.T) {
 		t.Errorf("b.go tags = %q, want nil", *p)
 	}
 }
+
+func TestPRReviewDecision(t *testing.T) {
+	rev := func(author, state, at string) Review {
+		return Review{Author: author, State: state, SubmittedAt: at}
+	}
+	tests := []struct {
+		name string
+		pr   PRData
+		want string
+	}{
+		{"GitHub's decision wins", PRData{ReviewDecision: "REVIEW_REQUIRED", Reviews: []Review{rev("a", "APPROVED", "1")}}, "REVIEW_REQUIRED"},
+		{"no reviews", PRData{}, "NONE"},
+		{"comment only is not review required", PRData{Reviews: []Review{rev("a", "COMMENTED", "1")}}, "NONE"},
+		{"approval plus another's comment", PRData{Reviews: []Review{rev("a", "APPROVED", "1"), rev("b", "COMMENTED", "2")}}, "APPROVED"},
+		{"later comment keeps approval", PRData{Reviews: []Review{rev("a", "APPROVED", "1"), rev("a", "COMMENTED", "2")}}, "APPROVED"},
+		{"any changes requested", PRData{Reviews: []Review{rev("a", "APPROVED", "1"), rev("b", "CHANGES_REQUESTED", "2")}}, "CHANGES_REQUESTED"},
+		{"re-approval clears changes requested", PRData{Reviews: []Review{rev("a", "CHANGES_REQUESTED", "1"), rev("a", "APPROVED", "2")}}, "APPROVED"},
+		{"dismissed approval", PRData{Reviews: []Review{rev("a", "DISMISSED", "1")}}, "NONE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := prReviewDecision(tt.pr); got != tt.want {
+				t.Errorf("prReviewDecision() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParsePRNode_ReviewDecision(t *testing.T) {
+	d := "CHANGES_REQUESTED"
+	if got := parsePRNode(&prNode{ReviewDecision: &d}, "o", "r"); got.ReviewDecision != d {
+		t.Errorf("ReviewDecision = %q, want %q", got.ReviewDecision, d)
+	}
+	if got := parsePRNode(&prNode{}, "o", "r"); got.ReviewDecision != "" {
+		t.Errorf("null reviewDecision = %q, want empty", got.ReviewDecision)
+	}
+}

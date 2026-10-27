@@ -30,11 +30,15 @@ type PRData struct {
 	AuthorType string
 	AuthorID   string // decimal databaseId; "" when unknown
 	// MergedBy* identify who merged the PR; empty unless it is merged.
-	MergedBy            string
-	MergedByType        string
-	MergedByID          string
-	CreatedAt           string
-	UpdatedAt           string
+	MergedBy     string
+	MergedByType string
+	MergedByID   string
+	CreatedAt    string
+	UpdatedAt    string
+	// ReviewDecision is GitHub's own review decision (APPROVED,
+	// CHANGES_REQUESTED or REVIEW_REQUIRED), set by the repo's review
+	// requirements; "" when the repo has none.
+	ReviewDecision      string
 	Reviews             []Review
 	Comments            []Comment
 	ReviewComments      []ReviewComment
@@ -252,6 +256,7 @@ func buildBatchedPRQuery(prs []PRRef) string {
         title
         createdAt
         updatedAt
+        reviewDecision
         author {
           __typename
           login
@@ -435,17 +440,18 @@ func parseGraphQLResponse(data json.RawMessage, prs []PRRef) ([]PRData, *RateLim
 
 // prNode represents a PR node in the GraphQL response.
 type prNode struct {
-	Number        int                     `json:"number"`
-	State         string                  `json:"state"`
-	Title         string                  `json:"title"`
-	Author        authorNode              `json:"author"`
-	CreatedAt     string                  `json:"createdAt"`
-	UpdatedAt     string                  `json:"updatedAt"`
-	Reviews       reviewsConnection       `json:"reviews"`
-	Comments      commentsConnection      `json:"comments"`
-	ReviewThreads reviewThreadsConnection `json:"reviewThreads"`
-	Commits       commitsConnection       `json:"commits"`
-	MergedBy      *authorNode             `json:"mergedBy"`
+	Number         int                     `json:"number"`
+	State          string                  `json:"state"`
+	Title          string                  `json:"title"`
+	Author         authorNode              `json:"author"`
+	CreatedAt      string                  `json:"createdAt"`
+	UpdatedAt      string                  `json:"updatedAt"`
+	ReviewDecision *string                 `json:"reviewDecision"`
+	Reviews        reviewsConnection       `json:"reviews"`
+	Comments       commentsConnection      `json:"comments"`
+	ReviewThreads  reviewThreadsConnection `json:"reviewThreads"`
+	Commits        commitsConnection       `json:"commits"`
+	MergedBy       *authorNode             `json:"mergedBy"`
 }
 
 type reviewsConnection struct {
@@ -581,6 +587,10 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 		AuthorID:   node.Author.id(),
 		CreatedAt:  node.CreatedAt,
 		UpdatedAt:  node.UpdatedAt,
+	}
+
+	if node.ReviewDecision != nil {
+		data.ReviewDecision = *node.ReviewDecision
 	}
 
 	if node.MergedBy != nil {

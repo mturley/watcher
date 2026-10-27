@@ -673,11 +673,22 @@ func checkRunEventType(conclusion string) (watcher.EventType, bool) {
 	}
 }
 
-// derivePRReviewDecision computes the overall review decision based on latest review per author.
-func derivePRReviewDecision(reviews []Review) string {
+// prReviewDecision returns the PR's overall review decision. GitHub's own
+// reviewDecision wins: it reflects the repo's review requirements (required
+// approvals, CODEOWNERS), which the reviews alone cannot. GitHub returns
+// null when the repo has no requirements, so then it falls back to each
+// author's latest approving or change-requesting review, as GitHub's merge
+// box does: CHANGES_REQUESTED if any requests changes, APPROVED if any
+// approves, otherwise NONE. Comment-only reviews neither cancel an earlier
+// verdict nor make a review "required": with no requirements, none is.
+func prReviewDecision(prData PRData) string {
+	if prData.ReviewDecision != "" {
+		return prData.ReviewDecision
+	}
+
 	latestByAuthor := make(map[string]Review)
-	for _, r := range reviews {
-		if r.State == "DISMISSED" {
+	for _, r := range prData.Reviews {
+		if r.State != "APPROVED" && r.State != "CHANGES_REQUESTED" {
 			continue
 		}
 		existing, ok := latestByAuthor[r.Author]
@@ -686,28 +697,14 @@ func derivePRReviewDecision(reviews []Review) string {
 		}
 	}
 
-	if len(latestByAuthor) == 0 {
-		return "NONE"
-	}
-
+	decision := "NONE"
 	for _, r := range latestByAuthor {
 		if r.State == "CHANGES_REQUESTED" {
 			return "CHANGES_REQUESTED"
 		}
+		decision = "APPROVED"
 	}
-
-	allApproved := true
-	for _, r := range latestByAuthor {
-		if r.State != "APPROVED" {
-			allApproved = false
-			break
-		}
-	}
-	if allApproved {
-		return "APPROVED"
-	}
-
-	return "REVIEW_REQUIRED"
+	return decision
 }
 
 // deriveCIStatus computes the overall CI status based on check runs.
@@ -773,7 +770,7 @@ func buildPRStateJSON(prData PRData) string {
 		"author_id":                    prData.AuthorID,
 		"created_at":                   prData.CreatedAt,
 		"state":                        prData.State,
-		"review_decision":              derivePRReviewDecision(prData.Reviews),
+		"review_decision":              prReviewDecision(prData),
 		"has_new_commits_since_review": hasNewCommitsSinceReview(prData),
 		"ci_status":                    deriveCIStatus(prData.CheckRuns),
 		"latest_commit_sha":            prData.Commits.LatestSHA,
