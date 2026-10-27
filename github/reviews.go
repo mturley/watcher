@@ -1,8 +1,12 @@
 package github
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"time"
 )
 
 // PRWriteContext is what a client needs before writing to a PR's review:
@@ -309,4 +313,91 @@ func SubmitReview(token, reviewID, event, body string, apiURL ...string) error {
 		return fmt.Errorf("github graphql: submitPullRequestReview returned no review")
 	}
 	return nil
+}
+
+const restBase = "https://api.github.com"
+
+func restBaseFor(apiURL []string) string {
+	if len(apiURL) > 0 && apiURL[0] != "" {
+		return apiURL[0]
+	}
+	return restBase
+}
+
+// postREST POSTs a JSON body and returns the response body. A 401 wraps
+// ErrAuth; any other non-2xx carries the response's "message".
+func postREST(token, url string, body any) ([]byte, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("github rest: unauthorized: %w", ErrAuth)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		var e struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(b, &e) == nil && e.Message != "" {
+			return nil, fmt.Errorf("github rest: %s (HTTP %d)", e.Message, resp.StatusCode)
+		}
+		return nil, fmt.Errorf("github rest: HTTP %d", resp.StatusCode)
+	}
+	return b, nil
+}
+
+func restID(b []byte) (int64, error) {
+	var r struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return 0, fmt.Errorf("decode github rest: %w", err)
+	}
+	if r.ID == 0 {
+		return 0, fmt.Errorf("github rest: response has no id")
+	}
+	return r.ID, nil
+}
+
+// PostComment posts one review comment on the PR now (not part of a review)
+// against commitOid and returns its database id.
+func PostComment(token string, ref PRRef, commitOid string, c NewReviewComment, apiURL ...string) (int64, error) {
+	body := map[string]any{"body": c.Body, "commit_id": commitOid, "path": c.Path, "line": c.Line, "side": c.Side}
+	if c.StartLine != 0 {
+		body["start_line"] = c.StartLine
+		body["start_side"] = c.Side
+	}
+	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/comments", restBaseFor(apiURL), ref.Owner, ref.Repo, ref.Number)
+	b, err := postREST(token, url, body)
+	if err != nil {
+		return 0, err
+	}
+	return restID(b)
+}
+
+// PostReply posts a reply to an existing review comment now and returns its
+// database id.
+func PostReply(token string, ref PRRef, inReplyTo int64, body string, apiURL ...string) (int64, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/comments/%d/replies", restBaseFor(apiURL), ref.Owner, ref.Repo, ref.Number, inReplyTo)
+	b, err := postREST(token, url, map[string]any{"body": body})
+	if err != nil {
+		return 0, err
+	}
+	return restID(b)
 }

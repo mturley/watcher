@@ -293,3 +293,104 @@ func TestFetchPRWriteContextPartialErrorFails(t *testing.T) {
 		t.Errorf("got %+v, err = %v; want the partial error", got, err)
 	}
 }
+
+type restReq struct {
+	Method, Path, Auth, Accept string
+	Body                       map[string]any
+}
+
+func restServer(t *testing.T, code int, resp string) (*httptest.Server, *[]restReq) {
+	t.Helper()
+	var reqs []restReq
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		if err := json.Unmarshal(b, &body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		reqs = append(reqs, restReq{r.Method, r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("Accept"), body})
+		w.WriteHeader(code)
+		w.Write([]byte(resp))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &reqs
+}
+
+func TestPostComment(t *testing.T) {
+	srv, reqs := restServer(t, 201, `{"id": 9000000001}`)
+	ref := PRRef{Owner: "o", Repo: "r", Number: 7}
+	id, err := PostComment("tok", ref, "abc", NewReviewComment{Path: "a.go", Side: "RIGHT", Line: 5, Body: "hi"}, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 9000000001 {
+		t.Errorf("id = %d", id)
+	}
+	r := (*reqs)[0]
+	if r.Method != "POST" || r.Path != "/repos/o/r/pulls/7/comments" {
+		t.Errorf("request = %s %s", r.Method, r.Path)
+	}
+	if r.Auth != "Bearer tok" || r.Accept != "application/vnd.github+json" {
+		t.Errorf("headers = %q %q", r.Auth, r.Accept)
+	}
+	want := map[string]any{"body": "hi", "commit_id": "abc", "path": "a.go", "line": float64(5), "side": "RIGHT"}
+	if len(r.Body) != len(want) {
+		t.Errorf("body = %v", r.Body)
+	}
+	for k, v := range want {
+		if r.Body[k] != v {
+			t.Errorf("body[%s] = %v, want %v", k, r.Body[k], v)
+		}
+	}
+
+	_, err = PostComment("tok", ref, "abc", NewReviewComment{Path: "a.go", Side: "LEFT", Line: 9, StartLine: 6, Body: "x"}, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := (*reqs)[1].Body
+	if b["start_line"] != float64(6) || b["start_side"] != "LEFT" || b["line"] != float64(9) {
+		t.Errorf("range body = %v", b)
+	}
+}
+
+func TestPostReply(t *testing.T) {
+	srv, reqs := restServer(t, 201, `{"id": 77}`)
+	id, err := PostReply("tok", PRRef{Owner: "o", Repo: "r", Number: 7}, 55, "re", srv.URL)
+	if err != nil || id != 77 {
+		t.Fatalf("id=%d err=%v", id, err)
+	}
+	r := (*reqs)[0]
+	if r.Method != "POST" || r.Path != "/repos/o/r/pulls/7/comments/55/replies" {
+		t.Errorf("request = %s %s", r.Method, r.Path)
+	}
+	if len(r.Body) != 1 || r.Body["body"] != "re" {
+		t.Errorf("body = %v", r.Body)
+	}
+}
+
+func TestRESTWriteErrors(t *testing.T) {
+	ref := PRRef{Owner: "o", Repo: "r", Number: 7}
+	srv, _ := restServer(t, 422, `{"message":"Validation Failed"}`)
+	if _, err := PostReply("tok", ref, 1, "x", srv.URL); err == nil || !strings.Contains(err.Error(), "Validation Failed") {
+		t.Errorf("err = %v", err)
+	}
+	if _, err := PostComment("tok", ref, "c", NewReviewComment{Path: "a", Side: "RIGHT", Line: 1}, srv.URL); err == nil || !strings.Contains(err.Error(), "Validation Failed") {
+		t.Errorf("err = %v", err)
+	}
+	srv401, _ := restServer(t, 401, `{"message":"Bad credentials"}`)
+	if _, err := PostReply("tok", ref, 1, "x", srv401.URL); !errors.Is(err, ErrAuth) {
+		t.Errorf("401 err = %v, want ErrAuth", err)
+	}
+	if _, err := PostComment("tok", ref, "c", NewReviewComment{}, srv401.URL); !errors.Is(err, ErrAuth) {
+		t.Errorf("401 err = %v, want ErrAuth", err)
+	}
+}
+
+func TestRESTBaseDefault(t *testing.T) {
+	if restBaseFor(nil) != "https://api.github.com" || restBaseFor([]string{""}) != "https://api.github.com" {
+		t.Error("default base wrong")
+	}
+	if restBaseFor([]string{"http://x"}) != "http://x" {
+		t.Error("override ignored")
+	}
+}
