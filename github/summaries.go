@@ -72,9 +72,18 @@ func FetchPRSummaries(token string, refs []PRRef, apiURL ...string) (map[PRRef]P
 }
 
 // postGraphQL POSTs one GraphQL query and returns the raw response body. A
-// rejected token (401) wraps ErrAuth; any other non-200 is an error.
-func postGraphQL(token, endpoint, query string) ([]byte, error) {
-	payload, _ := json.Marshal(map[string]string{"query": query})
+// rejected token (401) wraps ErrAuth; any other non-200 is an error. An
+// optional variables map is sent as "variables"; pass user-supplied strings
+// that way, never by interpolating them into the query.
+func postGraphQL(token, endpoint, query string, variables ...map[string]any) ([]byte, error) {
+	reqBody := map[string]any{"query": query}
+	if len(variables) > 0 && variables[0] != nil {
+		reqBody["variables"] = variables[0]
+	}
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("encode graphql: %w", err)
+	}
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
