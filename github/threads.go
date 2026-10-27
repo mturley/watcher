@@ -88,7 +88,8 @@ func (n threadCommentNode) toComment() ThreadComment {
 
 // FetchReviewThreads fetches every review thread of one PR (all pages, and
 // every page of each thread's comments). A rejected token wraps ErrAuth; a
-// PR that can't be resolved is an error.
+// PR that can't be resolved is an error, as is any GraphQL error on any
+// page, even a partial result.
 func FetchReviewThreads(token string, ref PRRef, apiURL ...string) (*PRReviewThreads, error) {
 	endpoint := "https://api.github.com/graphql"
 	if len(apiURL) > 0 && apiURL[0] != "" {
@@ -141,11 +142,13 @@ func FetchReviewThreads(token string, ref PRRef, apiURL ...string) (*PRReviewThr
 		if err := json.Unmarshal(body, &res); err != nil {
 			return nil, fmt.Errorf("decode graphql: %w", err)
 		}
+		// Fail closed on any error, even with the PR resolved: a partial
+		// result would read as comments GitHub no longer has.
+		if len(res.Errors) > 0 {
+			return nil, fmt.Errorf("github graphql: %s", res.Errors[0].Message)
+		}
 		repo := res.Data.Repository
 		if repo == nil || repo.PullRequest == nil {
-			if len(res.Errors) > 0 {
-				return nil, fmt.Errorf("github graphql: %s", res.Errors[0].Message)
-			}
 			return nil, fmt.Errorf("github graphql: pull request %s/%s#%d not found", ref.Owner, ref.Repo, ref.Number)
 		}
 		pr := repo.PullRequest
@@ -200,9 +203,15 @@ func fetchMoreThreadComments(token, endpoint, threadID, cursor string) ([]Thread
 					Comments threadCommentsConn `json:"comments"`
 				} `json:"node"`
 			} `json:"data"`
+			Errors []struct {
+				Message string `json:"message"`
+			} `json:"errors"`
 		}
 		if err := json.Unmarshal(body, &res); err != nil {
 			return nil, fmt.Errorf("decode graphql: %w", err)
+		}
+		if len(res.Errors) > 0 {
+			return nil, fmt.Errorf("github graphql: %s", res.Errors[0].Message)
 		}
 		if res.Data.Node == nil {
 			return nil, fmt.Errorf("github graphql: review thread %s not found", threadID)

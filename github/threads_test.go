@@ -116,3 +116,34 @@ func TestFetchReviewThreadsMissingPR(t *testing.T) {
 		t.Error("want error")
 	}
 }
+
+// A partial result (the PR resolves, but GraphQL reports errors, e.g. a
+// comment it could not load) must fail closed: a caller reconciling what
+// GitHub has would otherwise read a missing comment as discarded.
+func TestFetchReviewThreadsPartialErrorsFail(t *testing.T) {
+	srv, _ := threadsServer(t, func(n int, q string) (int, string) {
+		return 200, `{"data":{"repository":{"pullRequest":{"headRefName":"f","headRefOid":"h","baseRefOid":"b",
+		"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}},
+		"errors":[{"message":"Something went wrong loading a comment"}]}`
+	})
+	_, err := FetchReviewThreads("tok", threadsRef, srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "Something went wrong loading a comment") {
+		t.Errorf("err = %v, want the GraphQL error", err)
+	}
+}
+
+func TestFetchReviewThreadsMoreCommentsErrorsFail(t *testing.T) {
+	srv, _ := threadsServer(t, func(n int, q string) (int, string) {
+		if n == 0 {
+			return 200, `{"data":{"repository":{"pullRequest":{"headRefName":"f","headRefOid":"h","baseRefOid":"b",
+			"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"T1","path":"a.go",
+			"comments":{"pageInfo":{"hasNextPage":true,"endCursor":"cc1"},"nodes":[{"fullDatabaseId":"1","body":"one","author":{"__typename":"User","login":"u"}}]}}]}}}}}`
+		}
+		return 200, `{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false},"nodes":[]}}},
+		"errors":[{"message":"page failed"}]}`
+	})
+	_, err := FetchReviewThreads("tok", threadsRef, srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "page failed") {
+		t.Errorf("err = %v, want the follow-up's GraphQL error", err)
+	}
+}
