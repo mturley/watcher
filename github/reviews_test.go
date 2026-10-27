@@ -229,3 +229,67 @@ func TestPostGraphQLWithoutVariables(t *testing.T) {
 		t.Errorf("payload = %v", raw)
 	}
 }
+
+// A pending review with more than one page of comments is read in full: the
+// newest comments (the ones just added) live on the later pages.
+func TestFetchPRWriteContextPagesPendingComments(t *testing.T) {
+	var reqs []gqlReq
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var req gqlReq
+		json.Unmarshal(b, &req)
+		reqs = append(reqs, req)
+		switch len(reqs) {
+		case 1:
+			w.Write([]byte(`{"data":{"repository":{"pullRequest":{"id":"PR_1","headRefOid":"h","baseRefOid":"b","viewerDidAuthor":false,
+			"reviews":{"nodes":[{"id":"R_1","commit":{"oid":"c1"},"comments":{"pageInfo":{"hasNextPage":true,"endCursor":"cur1"},
+			"nodes":[{"fullDatabaseId":"1","path":"a.go","body":"one"}]}}]}}}}}`))
+		case 2:
+			w.Write([]byte(`{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":true,"endCursor":"cur2"},
+			"nodes":[{"fullDatabaseId":"2","path":"b.go","body":"two"}]}}}}`))
+		default:
+			w.Write([]byte(`{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},
+			"nodes":[{"fullDatabaseId":"3","path":"c.go","body":"three"}]}}}}`))
+		}
+	}))
+	defer srv.Close()
+	got, err := FetchPRWriteContext("tok", threadsRef, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reqs[0].Query, "hasNextPage") {
+		t.Errorf("first query lacks pageInfo: %s", reqs[0].Query)
+	}
+	if len(reqs) != 3 {
+		t.Fatalf("requests = %d, want 3", len(reqs))
+	}
+	for i, cur := range []string{"cur1", "cur2"} {
+		r := reqs[i+1]
+		if !strings.Contains(r.Query, "PullRequestReview") || !strings.Contains(r.Query, "after: $cursor") {
+			t.Errorf("page query %d = %s", i+1, r.Query)
+		}
+		if r.Variables["id"] != "R_1" || r.Variables["cursor"] != cur {
+			t.Errorf("page %d variables = %+v", i+1, r.Variables)
+		}
+	}
+	want := []PendingComment{{1, "a.go", "one"}, {2, "b.go", "two"}, {3, "c.go", "three"}}
+	if got.Pending == nil || len(got.Pending.Comments) != 3 {
+		t.Fatalf("pending = %+v", got.Pending)
+	}
+	for i, c := range want {
+		if got.Pending.Comments[i] != c {
+			t.Errorf("comment %d = %+v, want %+v", i, got.Pending.Comments[i], c)
+		}
+	}
+}
+
+// A partial error (the PR resolves but a sub-field failed) is an error, so
+// a failed reviews field never reads as "no pending review".
+func TestFetchPRWriteContextPartialErrorFails(t *testing.T) {
+	srv, _ := writeServer(t, 200, `{"data":{"repository":{"pullRequest":{"id":"PR_1","headRefOid":"h","baseRefOid":"b","viewerDidAuthor":false,"reviews":null}}},
+	"errors":[{"message":"reviews failed"}]}`)
+	got, err := FetchPRWriteContext("tok", threadsRef, srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "reviews failed") {
+		t.Errorf("got %+v, err = %v; want the partial error", got, err)
+	}
+}

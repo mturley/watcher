@@ -54,16 +54,40 @@ func endpointFor(apiURL []string) string {
 	return graphqlEndpoint
 }
 
+const pendingCommentFields = `pageInfo { hasNextPage endCursor } nodes { fullDatabaseId path body }`
+
 const prWriteContextQuery = `query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { ` +
 	`id headRefOid baseRefOid viewerDidAuthor ` +
-	`reviews(states: PENDING, first: 1) { nodes { id commit { oid } comments(first: 100) { nodes { fullDatabaseId path body } } } } } } }`
+	`reviews(states: PENDING, first: 1) { nodes { id commit { oid } comments(first: 100) { ` + pendingCommentFields + ` } } } } } }`
+
+const pendingCommentsPageQuery = `query($id: ID!, $cursor: String!) { node(id: $id) { ... on PullRequestReview { comments(first: 100, after: $cursor) { ` +
+	pendingCommentFields + ` } } } }`
+
+type pendingCommentsConn struct {
+	PageInfo threadPageInfo `json:"pageInfo"`
+	Nodes    []struct {
+		DatabaseID fullDatabaseID `json:"fullDatabaseId"`
+		Path       string         `json:"path"`
+		Body       string         `json:"body"`
+	} `json:"nodes"`
+}
+
+func (c pendingCommentsConn) comments() []PendingComment {
+	var out []PendingComment
+	for _, n := range c.Nodes {
+		out = append(out, PendingComment{DatabaseID: int64(n.DatabaseID), Path: n.Path, Body: n.Body})
+	}
+	return out
+}
 
 // FetchPRWriteContext reads one PR's node id, refs, viewerDidAuthor and the
 // viewer's pending review (GitHub returns only the viewer's own pending
-// review). A rejected token wraps ErrAuth; a PR that can't be resolved is
-// an error.
+// review), with every page of its comments. A rejected token wraps ErrAuth;
+// any GraphQL error, even alongside data, is an error, so a failed field
+// never reads as "no pending review".
 func FetchPRWriteContext(token string, ref PRRef, apiURL ...string) (*PRWriteContext, error) {
-	body, err := postGraphQL(token, endpointFor(apiURL), prWriteContextQuery, map[string]any{
+	endpoint := endpointFor(apiURL)
+	body, err := postGraphQL(token, endpoint, prWriteContextQuery, map[string]any{
 		"owner": ref.Owner, "repo": ref.Repo, "number": ref.Number,
 	})
 	if err != nil {
@@ -83,13 +107,7 @@ func FetchPRWriteContext(token string, ref PRRef, apiURL ...string) (*PRWriteCon
 							Commit *struct {
 								Oid string `json:"oid"`
 							} `json:"commit"`
-							Comments struct {
-								Nodes []struct {
-									DatabaseID fullDatabaseID `json:"fullDatabaseId"`
-									Path       string         `json:"path"`
-									Body       string         `json:"body"`
-								} `json:"nodes"`
-							} `json:"comments"`
+							Comments pendingCommentsConn `json:"comments"`
 						} `json:"nodes"`
 					} `json:"reviews"`
 				} `json:"pullRequest"`
@@ -100,11 +118,11 @@ func FetchPRWriteContext(token string, ref PRRef, apiURL ...string) (*PRWriteCon
 	if err := json.Unmarshal(body, &res); err != nil {
 		return nil, fmt.Errorf("decode graphql: %w", err)
 	}
+	if err := res.Errors.err(); err != nil {
+		return nil, err
+	}
 	repo := res.Data.Repository
 	if repo == nil || repo.PullRequest == nil {
-		if err := res.Errors.err(); err != nil {
-			return nil, err
-		}
 		return nil, fmt.Errorf("github graphql: pull request %s/%s#%d not found", ref.Owner, ref.Repo, ref.Number)
 	}
 	pr := repo.PullRequest
@@ -114,14 +132,53 @@ func FetchPRWriteContext(token string, ref PRRef, apiURL ...string) (*PRWriteCon
 	}
 	if len(pr.Reviews.Nodes) > 0 {
 		n := pr.Reviews.Nodes[0]
-		p := &PendingReview{ID: n.ID}
+		p := &PendingReview{ID: n.ID, Comments: n.Comments.comments()}
 		if n.Commit != nil {
 			p.CommitOid = n.Commit.Oid
 		}
-		for _, c := range n.Comments.Nodes {
-			p.Comments = append(p.Comments, PendingComment{DatabaseID: int64(c.DatabaseID), Path: c.Path, Body: c.Body})
+		if n.Comments.PageInfo.HasNextPage {
+			more, err := fetchMorePendingComments(token, endpoint, n.ID, n.Comments.PageInfo.EndCursor)
+			if err != nil {
+				return nil, err
+			}
+			p.Comments = append(p.Comments, more...)
 		}
 		out.Pending = p
+	}
+	return out, nil
+}
+
+// fetchMorePendingComments pages through the rest of a pending review's
+// comments, starting after cursor.
+func fetchMorePendingComments(token, endpoint, reviewID, cursor string) ([]PendingComment, error) {
+	var out []PendingComment
+	for cursor != "" {
+		body, err := postGraphQL(token, endpoint, pendingCommentsPageQuery, map[string]any{"id": reviewID, "cursor": cursor})
+		if err != nil {
+			return nil, err
+		}
+		var res struct {
+			Data struct {
+				Node *struct {
+					Comments pendingCommentsConn `json:"comments"`
+				} `json:"node"`
+			} `json:"data"`
+			Errors gqlErrors `json:"errors"`
+		}
+		if err := json.Unmarshal(body, &res); err != nil {
+			return nil, fmt.Errorf("decode graphql: %w", err)
+		}
+		if err := res.Errors.err(); err != nil {
+			return nil, err
+		}
+		if res.Data.Node == nil {
+			return nil, fmt.Errorf("github graphql: pending review %s not found", reviewID)
+		}
+		out = append(out, res.Data.Node.Comments.comments()...)
+		cursor = ""
+		if res.Data.Node.Comments.PageInfo.HasNextPage {
+			cursor = res.Data.Node.Comments.PageInfo.EndCursor
+		}
 	}
 	return out, nil
 }
