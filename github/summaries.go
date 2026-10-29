@@ -21,9 +21,14 @@ type PRSummary struct {
 	URL         string
 	Body        string
 	HeadRefName string
+	// HeadRepoOwner and HeadRepoName are the repository the head branch
+	// lives in: the base repo for a same-repo PR, the fork otherwise. Both
+	// are empty when GitHub no longer has it (a deleted fork).
+	HeadRepoOwner string
+	HeadRepoName  string
 }
 
-// FetchPRSummaries fetches title/state/draft/url/body/head branch for many
+// FetchPRSummaries fetches title/state/draft/url/body/head branch and repo for many
 // PRs in ONE GraphQL request (one alias per PR). PRs that can't be resolved
 // (deleted, private, typo'd) are simply absent from the result; only a
 // response with nothing usable at all is an error. A rejected token (401)
@@ -40,7 +45,7 @@ func FetchPRSummaries(token string, refs []PRRef, apiURL ...string) (map[PRRef]P
 	var q strings.Builder
 	q.WriteString("query {\n")
 	for i, r := range refs {
-		fmt.Fprintf(&q, "  pr%d: repository(owner: %s, name: %s) { pullRequest(number: %d) { title state isDraft url body headRefName } }\n",
+		fmt.Fprintf(&q, "  pr%d: repository(owner: %s, name: %s) { pullRequest(number: %d) { title state isDraft url body headRefName headRepository { name owner { login } } } }\n",
 			i, strconv.Quote(r.Owner), strconv.Quote(r.Repo), r.Number)
 	}
 	q.WriteString("}")
@@ -51,7 +56,13 @@ func FetchPRSummaries(token string, refs []PRRef, apiURL ...string) (map[PRRef]P
 	}
 	var result struct {
 		Data map[string]*struct {
-			PullRequest *PRSummary `json:"pullRequest"`
+			PullRequest *struct {
+				PRSummary
+				HeadRepository *struct {
+					Name  string
+					Owner struct{ Login string }
+				} `json:"headRepository"`
+			} `json:"pullRequest"`
 		} `json:"data"`
 		Errors []struct {
 			Message string `json:"message"`
@@ -62,7 +73,11 @@ func FetchPRSummaries(token string, refs []PRRef, apiURL ...string) (map[PRRef]P
 	}
 	for i, r := range refs {
 		if a := result.Data[fmt.Sprintf("pr%d", i)]; a != nil && a.PullRequest != nil {
-			out[r] = *a.PullRequest
+			s := a.PullRequest.PRSummary
+			if h := a.PullRequest.HeadRepository; h != nil {
+				s.HeadRepoOwner, s.HeadRepoName = h.Owner.Login, h.Name
+			}
+			out[r] = s
 		}
 	}
 	if len(out) == 0 && len(result.Errors) > 0 {

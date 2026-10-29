@@ -20,11 +20,11 @@ func TestFetchPRSummaries(t *testing.T) {
 		json.Unmarshal(b, &req)
 		if !strings.Contains(req.Query, `pr0: repository(owner: "example", name: "repo")`) ||
 			!strings.Contains(req.Query, "pullRequest(number: 1)") || !strings.Contains(req.Query, "pr1:") ||
-			!strings.Contains(req.Query, "headRefName") {
+			!strings.Contains(req.Query, "headRefName") || !strings.Contains(req.Query, "headRepository { name owner { login } }") {
 			t.Errorf("query: %s", req.Query)
 		}
 		w.Write([]byte(`{"data":{
-			"pr0":{"pullRequest":{"title":"One","state":"OPEN","isDraft":true,"url":"https://github.com/example/repo/pull/1","body":"see https://example.com","headRefName":"feature-x"}},
+			"pr0":{"pullRequest":{"title":"One","state":"OPEN","isDraft":true,"url":"https://github.com/example/repo/pull/1","body":"see https://example.com","headRefName":"feature-x","headRepository":{"name":"repo-fork","owner":{"login":"someone"}}}},
 			"pr1":null},
 			"errors":[{"message":"Could not resolve to a Repository"}]}`))
 	}))
@@ -36,7 +36,8 @@ func TestFetchPRSummaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("partial failure must not fail: %v", err)
 	}
-	if s, ok := got[a]; !ok || s.Title != "One" || !s.IsDraft || s.State != "OPEN" || s.Body != "see https://example.com" || s.HeadRefName != "feature-x" {
+	if s, ok := got[a]; !ok || s.Title != "One" || !s.IsDraft || s.State != "OPEN" || s.Body != "see https://example.com" || s.HeadRefName != "feature-x" ||
+		s.HeadRepoOwner != "someone" || s.HeadRepoName != "repo-fork" {
 		t.Errorf("a = %+v ok=%v", got[a], ok)
 	}
 	if _, ok := got[b]; ok {
