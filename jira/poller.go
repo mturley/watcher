@@ -54,6 +54,7 @@ func Poll(conn *sql.DB, cfg JiraAuth, resources []watcher.Resource, logger *log.
 			logger.Printf("WARNING: record resource poll %s: %v", r.ID, err)
 		}
 	}
+	ranker := &priorityRanker{client: client, logger: logger}
 	logRow("info", fmt.Sprintf("jira poll started: %d resources", len(resources)))
 	failed := 0
 
@@ -104,7 +105,7 @@ func Poll(conn *sql.DB, cfg JiraAuth, resources []watcher.Resource, logger *log.
 		eventCount += count
 
 		// Write resource state
-		stateJSON := buildJiraStateJSON(issueData)
+		stateJSON := buildJiraStateJSON(issueData, ranker.ranksFor(issueKey))
 		now := time.Now().UTC().Format(time.RFC3339)
 		if err := db.UpsertResourceState(conn, "jira", issueKey, stateJSON, issueData.UpdatedAt, now); err != nil {
 			logger.Printf("WARNING: failed to upsert resource state for %s: %v", issueKey, err)
@@ -425,7 +426,8 @@ func latestTimestamp(issue IssueData) string {
 }
 
 // buildJiraStateJSON builds a JSON representation of a Jira issue's current state.
-func buildJiraStateJSON(issue *IssueData) string {
+// ranks maps priority name to rank (0 = highest); nil omits priority_rank.
+func buildJiraStateJSON(issue *IssueData, ranks map[string]int) string {
 	state := map[string]interface{}{
 		"summary": issue.Summary,
 		"status":  issue.Status,
@@ -447,6 +449,9 @@ func buildJiraStateJSON(issue *IssueData) string {
 		"created_at":          issue.CreatedAt,
 		"updated_at":          issue.UpdatedAt,
 	}
+	if rank, ok := ranks[issue.Priority]; ok {
+		state["priority_rank"] = rank
+	}
 	for k, v := range issue.CustomFields {
 		state[k] = v
 	}
@@ -457,6 +462,53 @@ func buildJiraStateJSON(issue *IssueData) string {
 	}
 	data, _ := json.Marshal(state)
 	return string(data)
+}
+
+// priorityRanker resolves priority ranks once per project per poll run. The
+// first issue of each project fetches its scheme order from editmeta; the
+// instance-wide list is fetched at most once, lazily, when an editmeta has no
+// priority field. Failures are logged and yield nil (rank omitted).
+type priorityRanker struct {
+	client      *Client
+	logger      *log.Logger
+	byProject   map[string]map[string]int
+	global      map[string]int
+	globalTried bool
+}
+
+func (r *priorityRanker) ranksFor(issueKey string) map[string]int {
+	project := issueKey
+	if i := strings.Index(issueKey, "-"); i >= 0 {
+		project = issueKey[:i]
+	}
+	if ranks, done := r.byProject[project]; done {
+		return ranks
+	}
+	if r.byProject == nil {
+		r.byProject = make(map[string]map[string]int)
+	}
+	ranks, ok, err := r.client.FetchPriorityOrder(issueKey)
+	if err != nil {
+		r.logger.Printf("WARNING: priority order for %s: %v", issueKey, err)
+		ranks = nil
+	} else if !ok {
+		ranks = r.globalRanks()
+	}
+	r.byProject[project] = ranks
+	return ranks
+}
+
+func (r *priorityRanker) globalRanks() map[string]int {
+	if !r.globalTried {
+		r.globalTried = true
+		g, err := r.client.FetchGlobalPriorities()
+		if err != nil {
+			r.logger.Printf("WARNING: global priorities: %v", err)
+		} else {
+			r.global = g
+		}
+	}
+	return r.global
 }
 
 // optional returns &s, or nil for "", so an unknown ID stores NULL.

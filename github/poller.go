@@ -764,6 +764,10 @@ func formatNewCommitsBody(prData PRData, prevSHA string) string {
 }
 
 func buildPRStateJSON(prData PRData) string {
+	requested := prData.RequestedReviewerIDs
+	if requested == nil {
+		requested = []string{}
+	}
 	state := map[string]interface{}{
 		"title":                        prData.Title,
 		"author":                       prData.Author,
@@ -776,6 +780,7 @@ func buildPRStateJSON(prData PRData) string {
 		"latest_commit_sha":            prData.Commits.LatestSHA,
 		"ci_pending_fingerprint":       pendingCIFingerprint(prData),
 		"ci_workflow_fingerprint":      workflowFingerprint(prData),
+		"requested_reviewer_ids":       requested,
 	}
 	data, _ := json.Marshal(state)
 	return string(data)

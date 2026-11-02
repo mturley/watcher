@@ -276,3 +276,16 @@ func TestSaveConfigRoundTrip(t *testing.T) {
 		t.Fatalf("got %+v, want %+v", got, in)
 	}
 }
+
+func TestUnregisterConsumer(t *testing.T) {
+	cfg := &Config{}
+	cfg.UnregisterConsumer("absent") // no-op on empty registry
+	cfg.RegisterConsumer("worktree", "w.db")
+	cfg.RegisterConsumer("handler", "h.db")
+	cfg.UnregisterConsumer("worktree")
+	cfg.UnregisterConsumer("worktree")
+	got := cfg.Consumers()
+	if len(got) != 1 || got["handler"] != "h.db" {
+		t.Errorf("got %v, want only handler", got)
+	}
+}

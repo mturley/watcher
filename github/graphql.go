@@ -48,6 +48,9 @@ type PRData struct {
 	CheckRunsTotalCount int
 	CheckRunsHasMore    bool
 	CheckRunsEndCursor  string
+	// RequestedReviewerIDs are the decimal databaseIds of users whose review
+	// is currently requested; teams are ignored.
+	RequestedReviewerIDs []string
 }
 
 // Review represents a PR review.
@@ -294,6 +297,13 @@ func buildBatchedPRQuery(prs []PRRef) string {
             body
           }
         }
+        reviewRequests(first: 50) {
+          nodes {
+            requestedReviewer {
+              ... on User { databaseId }
+            }
+          }
+        }
         reviewThreads(last: 20) {
           nodes {
             comments(last: 20) {
@@ -452,6 +462,13 @@ type prNode struct {
 	ReviewThreads  reviewThreadsConnection `json:"reviewThreads"`
 	Commits        commitsConnection       `json:"commits"`
 	MergedBy       *authorNode             `json:"mergedBy"`
+	ReviewRequests struct {
+		Nodes []struct {
+			RequestedReviewer struct {
+				DatabaseID int64 `json:"databaseId"`
+			} `json:"requestedReviewer"`
+		} `json:"nodes"`
+	} `json:"reviewRequests"`
 }
 
 type reviewsConnection struct {
@@ -597,6 +614,12 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 		data.MergedBy = node.MergedBy.Login
 		data.MergedByType = authorType(node.MergedBy.Typename)
 		data.MergedByID = node.MergedBy.id()
+	}
+
+	for _, rr := range node.ReviewRequests.Nodes {
+		if id := rr.RequestedReviewer.DatabaseID; id != 0 {
+			data.RequestedReviewerIDs = append(data.RequestedReviewerIDs, strconv.FormatInt(id, 10))
+		}
 	}
 
 	// Parse reviews

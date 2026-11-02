@@ -282,6 +282,12 @@ func (c *Config) RegisterConsumer(name, dbPath string) {
 	c.ConsumerRegistry[name] = Consumer{DB: dbPath}
 }
 
+// UnregisterConsumer removes a consumer from the registry; an absent name is
+// a no-op.
+func (c *Config) UnregisterConsumer(name string) {
+	delete(c.ConsumerRegistry, name)
+}
+
 // Consumers returns a map of consumer name to DB path.
 func (c *Config) Consumers() map[string]string {
 	out := make(map[string]string, len(c.ConsumerRegistry))

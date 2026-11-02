@@ -534,7 +534,7 @@ func TestBuildJiraStateJSON_Reporter(t *testing.T) {
 		AssigneeID: "acct-ann",
 	}
 
-	stateJSON := buildJiraStateJSON(issue)
+	stateJSON := buildJiraStateJSON(issue, nil)
 
 	var state map[string]interface{}
 	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
@@ -665,7 +665,7 @@ func TestBuildJiraStateJSONCachesGitPRURLs(t *testing.T) {
 		{"type":"inlineCard","attrs":{"url":"https://github.com/example/repo/pull/5"}}]}]}`), &adf)
 	issue := &IssueData{Key: "PROJ-1", CustomFields: map[string]interface{}{"git_pull_request": adf}}
 	var state map[string]interface{}
-	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue)), &state); err != nil {
+	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue, nil)), &state); err != nil {
 		t.Fatal(err)
 	}
 	urls, ok := state["git_pull_request_urls"].([]interface{})
@@ -676,7 +676,82 @@ func TestBuildJiraStateJSONCachesGitPRURLs(t *testing.T) {
 
 func TestBuildJiraStateJSONNoGitPRField(t *testing.T) {
 	issue := &IssueData{Key: "PROJ-1", CustomFields: map[string]interface{}{}}
-	if strings.Contains(buildJiraStateJSON(issue), "git_pull_request_urls") {
+	if strings.Contains(buildJiraStateJSON(issue, nil), "git_pull_request_urls") {
 		t.Fatal("must not emit git_pull_request_urls when the field is not configured")
+	}
+}
+
+func TestPollerRanksOncePerProject(t *testing.T) {
+	calls := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls[r.URL.Path]++
+		switch r.URL.Path {
+		case "/rest/api/3/issue/RHOAIENG-1/editmeta":
+			w.Write([]byte(`{"fields":{"priority":{"allowedValues":[{"name":"Blocker"},{"name":"Major"}]}}}`))
+		case "/rest/api/3/issue/OTHER-1/editmeta":
+			w.Write([]byte(`{"fields":{}}`))
+		case "/rest/api/3/priority":
+			w.Write([]byte(`[{"name":"High"},{"name":"Low"}]`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	rk := &priorityRanker{client: &Client{BaseURL: srv.URL, Email: "e", Token: "t"}, logger: testLogger()}
+
+	a := rk.ranksFor("RHOAIENG-1")
+	b := rk.ranksFor("RHOAIENG-2")
+	o := rk.ranksFor("OTHER-1")
+	o2 := rk.ranksFor("OTHER-2")
+
+	if a["Major"] != 1 || b["Major"] != 1 {
+		t.Errorf("RHOAIENG ranks wrong: %v %v", a, b)
+	}
+	if o["Low"] != 1 || o2["Low"] != 1 {
+		t.Errorf("OTHER should fall back to global: %v %v", o, o2)
+	}
+	for path, want := range map[string]int{
+		"/rest/api/3/issue/RHOAIENG-1/editmeta": 1,
+		"/rest/api/3/issue/OTHER-1/editmeta":    1,
+		"/rest/api/3/priority":                  1,
+	} {
+		if calls[path] != want {
+			t.Errorf("%s called %d times, want %d", path, calls[path], want)
+		}
+	}
+	if len(calls) != 3 {
+		t.Errorf("unexpected calls: %v", calls)
+	}
+}
+
+func TestPollerRankerFetchErrorOmitsRank(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	rk := &priorityRanker{client: &Client{BaseURL: srv.URL, Email: "e", Token: "t"}, logger: testLogger()}
+	if got := rk.ranksFor("RHOAIENG-1"); got != nil {
+		t.Errorf("got %v, want nil", got)
+	}
+}
+
+func TestBuildJiraStateJSONPriorityRank(t *testing.T) {
+	issue := &IssueData{Priority: "Major"}
+	ranks := map[string]int{"Blocker": 0, "Critical": 1, "Major": 2}
+
+	var state map[string]interface{}
+	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue, ranks)), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state["priority_rank"] != float64(2) {
+		t.Errorf("priority_rank = %v, want 2", state["priority_rank"])
+	}
+
+	state = nil
+	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue, nil)), &state); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := state["priority_rank"]; ok {
+		t.Errorf("priority_rank present with nil ranks")
 	}
 }

@@ -213,6 +213,62 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 	return issue, nil
 }
 
+// FetchPriorityOrder returns the priority ranking (0 = highest) in the order
+// of the issue's own project scheme, from the issue's editmeta. ok is false
+// when editmeta carries no priority field (typically the user cannot edit the
+// issue), in which case callers fall back to FetchGlobalPriorities.
+func (c *Client) FetchPriorityOrder(issueKey string) (map[string]int, bool, error) {
+	body, err := c.get(fmt.Sprintf("%s/rest/api/3/issue/%s/editmeta", c.BaseURL, url.PathEscape(issueKey)))
+	if err != nil {
+		return nil, false, err
+	}
+	var raw struct {
+		Fields struct {
+			Priority *struct {
+				AllowedValues []struct {
+					Name string `json:"name"`
+				} `json:"allowedValues"`
+			} `json:"priority"`
+		} `json:"fields"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, false, fmt.Errorf("failed to parse editmeta: %w", err)
+	}
+	if raw.Fields.Priority == nil || len(raw.Fields.Priority.AllowedValues) == 0 {
+		return nil, false, nil
+	}
+	ranks := make(map[string]int, len(raw.Fields.Priority.AllowedValues))
+	for i, v := range raw.Fields.Priority.AllowedValues {
+		if _, dup := ranks[v.Name]; !dup {
+			ranks[v.Name] = i
+		}
+	}
+	return ranks, true, nil
+}
+
+// FetchGlobalPriorities returns the instance-wide priority list ranked by
+// array index. It mixes every priority scheme, so ranks are only comparable
+// within one scheme; use it as a fallback for FetchPriorityOrder.
+func (c *Client) FetchGlobalPriorities() (map[string]int, error) {
+	body, err := c.get(c.BaseURL + "/rest/api/3/priority")
+	if err != nil {
+		return nil, err
+	}
+	var raw []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse priorities: %w", err)
+	}
+	ranks := make(map[string]int, len(raw))
+	for i, v := range raw {
+		if _, dup := ranks[v.Name]; !dup {
+			ranks[v.Name] = i
+		}
+	}
+	return ranks, nil
+}
+
 // get performs an authenticated GET and returns the response body, or an
 // error if the request fails or returns a non-200 status.
 func (c *Client) get(reqURL string) ([]byte, error) {

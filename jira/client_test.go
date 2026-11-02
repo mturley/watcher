@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -88,7 +89,7 @@ func TestPriorityIconCaptured(t *testing.T) {
 		t.Errorf("PriorityIconURL = %q, want %q", issue.PriorityIconURL, want)
 	}
 	var state map[string]interface{}
-	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue)), &state); err != nil {
+	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue, nil)), &state); err != nil {
 		t.Fatalf("unmarshal state: %v", err)
 	}
 	if state["priority_icon_url"] != want {
@@ -134,10 +135,61 @@ func TestStatusCategoryCaptured(t *testing.T) {
 		t.Errorf("StatusCategory = %q, want indeterminate", issue.StatusCategory)
 	}
 	var state map[string]interface{}
-	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue)), &state); err != nil {
+	if err := json.Unmarshal([]byte(buildJiraStateJSON(issue, nil)), &state); err != nil {
 		t.Fatalf("unmarshal state: %v", err)
 	}
 	if state["status_category"] != "indeterminate" {
 		t.Errorf("state[\"status_category\"] = %v, want indeterminate", state["status_category"])
+	}
+}
+
+func priorityServer(t *testing.T, handler http.HandlerFunc) *Client {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return &Client{BaseURL: srv.URL, Email: "user@example.com", Token: "token"}
+}
+
+func TestFetchPriorityOrderEditmeta(t *testing.T) {
+	c := priorityServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/api/3/issue/RHOAIENG-1/editmeta" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.Write([]byte(`{"fields":{"priority":{"allowedValues":[{"name":"Blocker"},{"name":"Critical"},{"name":"Major"},{"name":"Normal"},{"name":"Minor"},{"name":"Undefined"}]}}}`))
+	})
+	got, ok, err := c.FetchPriorityOrder("RHOAIENG-1")
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	want := map[string]int{"Blocker": 0, "Critical": 1, "Major": 2, "Normal": 3, "Minor": 4, "Undefined": 5}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestFetchPriorityOrderNoPermission(t *testing.T) {
+	c := priorityServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"fields":{}}`))
+	})
+	got, ok, err := c.FetchPriorityOrder("RHOAIENG-1")
+	if got != nil || ok || err != nil {
+		t.Errorf("got %v, %v, %v; want nil, false, nil", got, ok, err)
+	}
+}
+
+func TestFetchGlobalPriorities(t *testing.T) {
+	c := priorityServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/api/3/priority" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.Write([]byte(`[{"name":"Highest (migrated)"},{"name":"Blocker"}]`))
+	})
+	got, err := c.FetchGlobalPriorities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"Highest (migrated)": 0, "Blocker": 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }

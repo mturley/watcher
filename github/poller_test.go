@@ -1238,3 +1238,26 @@ func TestParsePRNode_ReviewDecision(t *testing.T) {
 		t.Errorf("null reviewDecision = %q, want empty", got.ReviewDecision)
 	}
 }
+
+func TestBuildPRStateJSONRequestedReviewers(t *testing.T) {
+	got := buildPRStateJSON(PRData{RequestedReviewerIDs: []string{"123", "456"}})
+	if !strings.Contains(got, `"requested_reviewer_ids":["123","456"]`) {
+		t.Errorf("missing requested ids: %s", got)
+	}
+	got = buildPRStateJSON(PRData{})
+	if !strings.Contains(got, `"requested_reviewer_ids":[]`) {
+		t.Errorf("nil should marshal as []: %s", got)
+	}
+}
+
+func TestParsePRNodeRequestedReviewers(t *testing.T) {
+	var node prNode
+	raw := `{"number":1,"reviewRequests":{"nodes":[{"requestedReviewer":{"databaseId":123}},{"requestedReviewer":{}},{"requestedReviewer":null}]}}`
+	if err := json.Unmarshal([]byte(raw), &node); err != nil {
+		t.Fatal(err)
+	}
+	got := parsePRNode(&node, "o", "r").RequestedReviewerIDs
+	if len(got) != 1 || got[0] != "123" {
+		t.Errorf("got %v, want [123] (team/unknown reviewers skipped)", got)
+	}
+}
