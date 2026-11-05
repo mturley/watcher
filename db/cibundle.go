@@ -47,7 +47,8 @@ func inClause(types []watcher.EventType) (string, []any) {
 // UpsertCIBundle finds or creates a CI bundle event for a specific commit
 // on a resource. Identity is source='github', one of identityTypes, the given
 // resource, and tags = "commit:<commitSHA>". If a matching bundle exists it
-// updates the event's type, title, body, and timestamps in place; otherwise it
+// updates the event's type, title, body, and external_ts in place, and moves
+// ts to now only when the type changed; otherwise it
 // inserts a new event with its associated resource row. identityTypes selects
 // which bundle family this call owns (CICheckBundleTypes vs
 // CIWorkflowBundleTypes) so the CheckRun and StatusContext bundles for the same
@@ -117,10 +118,16 @@ func UpsertCIBundle(conn *sql.DB, commitSHA string, t watcher.EventType, title, 
 	}
 
 	if existingID != "" {
+		// Only a change of result (the event type) moves ts. A same-type
+		// refresh, such as a bot re-running a check on an already-passing
+		// commit, updates the content but keeps ts, so consumers that treat
+		// ts as "when this last changed" (unread, timeline order) don't see
+		// a fresh event for a result they've already seen.
 		if _, err := c.ExecContext(ctx, `
-			UPDATE watcher_events SET type = ?, title = ?, body = ?, ts = ?, external_ts = ?
+			UPDATE watcher_events SET type = ?, title = ?, body = ?, external_ts = ?,
+				ts = CASE WHEN type = ? THEN ts ELSE ? END
 			WHERE id = ?
-		`, string(t), title, body, now, externalTS, existingID); err != nil {
+		`, string(t), title, body, externalTS, string(t), now, existingID); err != nil {
 			return rollback(fmt.Errorf("failed to update CI bundle: %w", err))
 		}
 		if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {

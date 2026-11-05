@@ -643,11 +643,10 @@ func TestProcessPR_PendingCIBundleRefreshesOnSetChange(t *testing.T) {
 	if !strings.Contains(newBody, "lint") {
 		t.Errorf("expected the refreshed body to mention the new pending check %q, got %q", "lint", newBody)
 	}
-	// Note: we don't assert that ts advanced here — UpsertCIBundle stamps
-	// ts with second-resolution RFC3339, so two polls in the same test run
-	// can legitimately land in the same second. The title content change
-	// above (overwriting the sentinel) is sufficient proof that
-	// UpsertCIBundle ran its UPDATE path again.
+	// Note: we don't assert on ts here — a pending→pending refresh keeps the
+	// bundle's type, so UpsertCIBundle deliberately leaves ts alone. The
+	// title content change above (overwriting the sentinel) is sufficient
+	// proof that UpsertCIBundle ran its UPDATE path again.
 }
 
 // sentinelizeCIBundle directly overwrites the title of the CI bundle event

@@ -184,3 +184,47 @@ func TestMarkCIBundlesOutOfDate(t *testing.T) {
 		t.Errorf("after second mark, title = %q, want no double prefix", title)
 	}
 }
+
+// TestUpsertCIBundle_SameTypeKeepsTS verifies that re-upserting a bundle whose
+// type is unchanged (e.g. a bot re-running a check on an already-passing
+// commit) refreshes its content but does not move ts, so the event is not
+// bumped to "now" and made unread again. A type change still moves ts.
+func TestUpsertCIBundle_SameTypeKeepsTS(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	res := watcher.Resource{Type: "pr", ID: "owner/repo#1"}
+
+	if err := UpsertCIBundle(c, "abc", watcher.EventTypeCIPassed, "CI checks passed (2/2)", "", "2026-01-15T12:00:00Z", res, CICheckBundleTypes); err != nil {
+		t.Fatal(err)
+	}
+	const oldTS = "2000-01-01T00:00:00Z"
+	if _, err := c.Exec(`UPDATE watcher_events SET ts = ?`, oldTS); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := UpsertCIBundle(c, "abc", watcher.EventTypeCIPassed, "CI checks passed (3/3)", "b", "2026-01-15T13:00:00Z", res, CICheckBundleTypes); err != nil {
+		t.Fatal(err)
+	}
+	var ts, title, extTS string
+	if err := c.QueryRow(`SELECT ts, title, external_ts FROM watcher_events`).Scan(&ts, &title, &extTS); err != nil {
+		t.Fatal(err)
+	}
+	if ts != oldTS {
+		t.Errorf("same-type upsert moved ts to %q, want it kept at %q", ts, oldTS)
+	}
+	if title != "CI checks passed (3/3)" || extTS != "2026-01-15T13:00:00Z" {
+		t.Errorf("same-type upsert did not refresh content: title=%q external_ts=%q", title, extTS)
+	}
+
+	if err := UpsertCIBundle(c, "abc", watcher.EventTypeCIFailed, "CI failed", "", "2026-01-15T14:00:00Z", res, CICheckBundleTypes); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.QueryRow(`SELECT ts FROM watcher_events`).Scan(&ts); err != nil {
+		t.Fatal(err)
+	}
+	if ts == oldTS {
+		t.Errorf("type change did not move ts")
+	}
+}
