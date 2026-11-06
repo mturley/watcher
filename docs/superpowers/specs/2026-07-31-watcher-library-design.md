@@ -106,6 +106,18 @@ Change events detected by pollers.
 
 Indexes: `ts`, `(source, type)`.
 
+### `watcher_event_text_change`
+
+Before/after text of an event, for description edits (schema v7). Stored exactly as received; read with `db.EventTextChange(conn, eventID)`, written when `watcher.Event.TextChange` (`*watcher.TextChange{Old, New}`) is set on insert. Events without text have no row.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| event_id | TEXT FK | References watcher_events.id |
+| old_text | TEXT | Text before the edit |
+| new_text | TEXT | Text after the edit |
+
+Pollers skip edits whose before and after differ only in line endings (`\r\n` vs `\n`), using `watcher.SameText`; such edits emit nothing.
+
 ### `watcher_event_resources`
 
 Links events to the resources they describe.
@@ -233,6 +245,7 @@ Named `watcher_poller_status` rather than `watcher_status` deliberately: agent-h
 | `pr_reopened` | PR reopened |
 | `pr_new_commits` | New commits pushed (detected via SHA comparison in resource state) |
 | `pr_needs_rebase` | Open PR has merge conflicts with its base (GitHub `mergeable` is CONFLICTING); once per head commit, tagged `commit:<sha>`, titled `Needs rebase: PR #N @ <sha7>`, prefixed `[out of date] ` when the head moves or the conflict clears. Cached PR state keys: `mergeable`, `mergeable_sha` |
+| `pr_description_changed` | PR description edited; titled `<owner>/<repo>#N description changed`, no body. Carries before/after text (see `watcher_event_text_change`). Cached PR state key: `description_edited_at` (see Description edit detection) |
 | `ci_passed` | All CI checks passed (upserted per commit SHA) |
 | `ci_failed` | One or more CI checks failed (upserted per commit SHA) |
 | `ci_pending` | CI checks still running (upserted per commit SHA) |
@@ -245,7 +258,7 @@ Named `watcher_poller_status` rather than `watcher_status` deliberately: agent-h
 | `jira_comment` | New comment on an issue |
 | `jira_status_change` | Status transition |
 | `jira_assigned` | Assignee changed |
-| `jira_description_changed` | Description updated |
+| `jira_description_changed` | Description updated; titled `<KEY> description changed`, no body. Carries before/after text (see `watcher_event_text_change`) |
 | `jira_labels_changed` | Labels added or removed |
 
 ### Internal
@@ -254,6 +267,14 @@ Named `watcher_poller_status` rather than `watcher_status` deliberately: agent-h
 |------|---------|
 | `watch_started` | First poll for a newly subscribed resource |
 | `watcher_error` | Poller encountered an error |
+
+### Description edit detection and options
+
+**GitHub.** Description edits are fetched only when the PR's `lastEditedAt` moves past the cached state key `description_edited_at`. The lower bound for new edits is the saved `description_edited_at`, or the event cursor when none is saved yet. If the edit fetch fails, `description_edited_at` is seeded with that bound (not `lastEditedAt`), so the next poll retries without losing edits and without the cursor moving past them. The original body is never an edit: the oldest version produces no event. `github.PollWithOptions(conn, token, resources, logger, github.PollOptions{DropBotDescriptionEdits: true})` skips `pr_description_changed` events whose editor is a bot; `Poll` uses the zero value.
+
+**Jira.** `JiraAuth.DropBotDescriptionEdits` does the same for `jira_description_changed`, matching configured `BotUsernames`. Both options are off by default.
+
+**Jira skip-unchanged.** Jira bumps `fields.updated` on every changelog entry and comment, so the history (changelog and comments) is fetched only when `fields.updated` differs from the saved `resource_updated_at`, or when there is no saved state or the event cursor is empty. Epic linking and cached state still update on a skip.
 
 ## Polling Flow
 
