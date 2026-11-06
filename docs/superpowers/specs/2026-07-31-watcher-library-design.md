@@ -232,6 +232,7 @@ Named `watcher_poller_status` rather than `watcher_status` deliberately: agent-h
 | `pr_merged` | PR merged |
 | `pr_reopened` | PR reopened |
 | `pr_new_commits` | New commits pushed (detected via SHA comparison in resource state) |
+| `pr_needs_rebase` | Open PR has merge conflicts with its base (GitHub `mergeable` is CONFLICTING); once per head commit, tagged `commit:<sha>`, titled `Needs rebase: PR #N @ <sha7>`, prefixed `[out of date] ` when the head moves or the conflict clears. Cached PR state keys: `mergeable`, `mergeable_sha` |
 | `ci_passed` | All CI checks passed (upserted per commit SHA) |
 | `ci_failed` | One or more CI checks failed (upserted per commit SHA) |
 | `ci_pending` | CI checks still running (upserted per commit SHA) |
