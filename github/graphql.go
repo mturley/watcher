@@ -38,7 +38,10 @@ type PRData struct {
 	// ReviewDecision is GitHub's own review decision (APPROVED,
 	// CHANGES_REQUESTED or REVIEW_REQUIRED), set by the repo's review
 	// requirements; "" when the repo has none.
-	ReviewDecision      string
+	ReviewDecision string
+	// Mergeable is GitHub's MERGEABLE, CONFLICTING or UNKNOWN (UNKNOWN while
+	// it is still computing).
+	Mergeable           string
 	Reviews             []Review
 	Comments            []Comment
 	ReviewComments      []ReviewComment
@@ -260,6 +263,7 @@ func buildBatchedPRQuery(prs []PRRef) string {
         createdAt
         updatedAt
         reviewDecision
+        mergeable
         author {
           __typename
           login
@@ -457,6 +461,7 @@ type prNode struct {
 	CreatedAt      string                  `json:"createdAt"`
 	UpdatedAt      string                  `json:"updatedAt"`
 	ReviewDecision *string                 `json:"reviewDecision"`
+	Mergeable      string                  `json:"mergeable"`
 	Reviews        reviewsConnection       `json:"reviews"`
 	Comments       commentsConnection      `json:"comments"`
 	ReviewThreads  reviewThreadsConnection `json:"reviewThreads"`
@@ -605,6 +610,8 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 		CreatedAt:  node.CreatedAt,
 		UpdatedAt:  node.UpdatedAt,
 	}
+
+	data.Mergeable = node.Mergeable
 
 	if node.ReviewDecision != nil {
 		data.ReviewDecision = *node.ReviewDecision

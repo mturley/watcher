@@ -643,7 +643,7 @@ skipCIBundle:
 	}
 
 	// Write resource state
-	stateJSON := buildPRStateJSON(prData)
+	stateJSON := buildPRStateJSON(prData, resolveMergeable(prevStateMap, prData))
 	now := time.Now().UTC().Format(time.RFC3339)
 	if err := db.UpsertResourceState(conn, "pr", resource.ID, stateJSON, prData.UpdatedAt, now); err != nil {
 		logger.Printf("WARNING: failed to upsert resource state for %s: %v", resource.ID, err)
@@ -763,7 +763,22 @@ func formatNewCommitsBody(prData PRData, prevSHA string) string {
 	return strings.Join(lines, "\n")
 }
 
-func buildPRStateJSON(prData PRData) string {
+// resolveMergeable returns the mergeable value to cache. GitHub reports
+// UNKNOWN (or nothing) while it computes mergeability, so a known value
+// carries forward only while the head SHA is unchanged; otherwise "".
+func resolveMergeable(prev map[string]interface{}, prData PRData) string {
+	if prData.Mergeable == "CONFLICTING" || prData.Mergeable == "MERGEABLE" {
+		return prData.Mergeable
+	}
+	prevVal, _ := prev["mergeable"].(string)
+	prevSHA, _ := prev["mergeable_sha"].(string)
+	if prevVal != "" && prevSHA != "" && prevSHA == prData.Commits.LatestSHA {
+		return prevVal
+	}
+	return ""
+}
+
+func buildPRStateJSON(prData PRData, mergeable string) string {
 	requested := prData.RequestedReviewerIDs
 	if requested == nil {
 		requested = []string{}
@@ -781,6 +796,8 @@ func buildPRStateJSON(prData PRData) string {
 		"ci_pending_fingerprint":       pendingCIFingerprint(prData),
 		"ci_workflow_fingerprint":      workflowFingerprint(prData),
 		"requested_reviewer_ids":       requested,
+		"mergeable":                    mergeable,
+		"mergeable_sha":                prData.Commits.LatestSHA,
 	}
 	data, _ := json.Marshal(state)
 	return string(data)

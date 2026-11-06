@@ -194,3 +194,9 @@ func TestParseGraphQLResponse_ReviewCommentFullDatabaseID(t *testing.T) {
 		t.Fatalf("ids = %+v", rc)
 	}
 }
+
+func TestParsePRNode_Mergeable(t *testing.T) {
+	if got := parsePRNode(&prNode{Mergeable: "CONFLICTING"}, "o", "r"); got.Mergeable != "CONFLICTING" {
+		t.Errorf("Mergeable = %q, want CONFLICTING", got.Mergeable)
+	}
+}

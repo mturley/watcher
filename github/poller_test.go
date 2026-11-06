@@ -1009,7 +1009,7 @@ func TestBuildPRStateJSON_Author(t *testing.T) {
 		UpdatedAt:  "2024-01-01T00:00:00Z",
 	}
 
-	stateJSON := buildPRStateJSON(prData)
+	stateJSON := buildPRStateJSON(prData, "")
 
 	var state map[string]interface{}
 	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
@@ -1239,11 +1239,11 @@ func TestParsePRNode_ReviewDecision(t *testing.T) {
 }
 
 func TestBuildPRStateJSONRequestedReviewers(t *testing.T) {
-	got := buildPRStateJSON(PRData{RequestedReviewerIDs: []string{"123", "456"}})
+	got := buildPRStateJSON(PRData{RequestedReviewerIDs: []string{"123", "456"}}, "")
 	if !strings.Contains(got, `"requested_reviewer_ids":["123","456"]`) {
 		t.Errorf("missing requested ids: %s", got)
 	}
-	got = buildPRStateJSON(PRData{})
+	got = buildPRStateJSON(PRData{}, "")
 	if !strings.Contains(got, `"requested_reviewer_ids":[]`) {
 		t.Errorf("nil should marshal as []: %s", got)
 	}
@@ -1258,5 +1258,41 @@ func TestParsePRNodeRequestedReviewers(t *testing.T) {
 	got := parsePRNode(&node, "o", "r").RequestedReviewerIDs
 	if len(got) != 1 || got[0] != "123" {
 		t.Errorf("got %v, want [123] (team/unknown reviewers skipped)", got)
+	}
+}
+
+func TestResolveMergeable(t *testing.T) {
+	tests := []struct {
+		name string
+		prev map[string]interface{}
+		in   string
+		want string
+	}{
+		{"fresh conflicting", nil, "CONFLICTING", "CONFLICTING"},
+		{"fresh mergeable", nil, "MERGEABLE", "MERGEABLE"},
+		{"unknown, no prev", nil, "UNKNOWN", ""},
+		{"unknown, same head", map[string]interface{}{"mergeable": "CONFLICTING", "mergeable_sha": "sha2"}, "UNKNOWN", "CONFLICTING"},
+		{"unknown, head moved", map[string]interface{}{"mergeable": "CONFLICTING", "mergeable_sha": "sha1"}, "UNKNOWN", ""},
+		{"empty treated as unknown", map[string]interface{}{"mergeable": "MERGEABLE", "mergeable_sha": "sha2"}, "", "MERGEABLE"},
+		{"legacy state", map[string]interface{}{"latest_commit_sha": "sha2"}, "UNKNOWN", ""},
+		{"wrong types", map[string]interface{}{"mergeable": 1, "mergeable_sha": 2}, "UNKNOWN", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pd := PRData{Mergeable: tt.in, Commits: CommitInfo{LatestSHA: "sha2"}}
+			if got := resolveMergeable(tt.prev, pd); got != tt.want {
+				t.Errorf("resolveMergeable() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildPRStateJSON_Mergeable(t *testing.T) {
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(buildPRStateJSON(PRData{Commits: CommitInfo{LatestSHA: "sha2"}}, "CONFLICTING")), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["mergeable"] != "CONFLICTING" || m["mergeable_sha"] != "sha2" {
+		t.Errorf("got mergeable=%v mergeable_sha=%v", m["mergeable"], m["mergeable_sha"])
 	}
 }
