@@ -318,8 +318,8 @@ func TestMigrateV4AddsEventAuthorID(t *testing.T) {
 	if !hasColumn(t, c, "watcher_events", "author_id") {
 		t.Fatal("watcher_events missing author_id after migrating from v4")
 	}
-	if v, _ := SchemaVersion(c); v != 6 {
-		t.Fatalf("version = %d, want 6", v)
+	if v, _ := SchemaVersion(c); v != 7 {
+		t.Fatalf("version = %d, want 7", v)
 	}
 }
 
@@ -360,8 +360,8 @@ func TestMigrateV6AddsPollLogTables(t *testing.T) {
 		t.Fatal("poll log indexes missing")
 	}
 	v, err := SchemaVersion(c)
-	if err != nil || v != 6 {
-		t.Fatalf("version = %d (err=%v), want 6", v, err)
+	if err != nil || v != 7 {
+		t.Fatalf("version = %d (err=%v), want 7", v, err)
 	}
 }
 
@@ -384,5 +384,28 @@ func TestMigrateV5DatabaseUpgradesToV6(t *testing.T) {
 	}
 	if ok, _ := tableExists(c, "watcher_poll_log"); !ok {
 		t.Fatal("watcher_poll_log not created on upgrade")
+	}
+}
+
+func TestMigrate_V6ToV7AddsTextChangeTable(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec("DROP TABLE watcher_event_text_change"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec("UPDATE watcher_schema_version SET version = 6"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(c); err != nil {
+		t.Fatalf("Migrate v6->v7: %v", err)
+	}
+	if ok, _ := tableExists(c, "watcher_event_text_change"); !ok {
+		t.Fatal("watcher_event_text_change not created on upgrade")
+	}
+	v, err := SchemaVersion(c)
+	if err != nil || v != 7 {
+		t.Fatalf("version = %d (err=%v), want 7", v, err)
 	}
 }

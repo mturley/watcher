@@ -4,6 +4,8 @@
 // it does not own read-state, a CLI, or a binary.
 package watcher
 
+import "strings"
+
 // Resource identifies an external resource. ID is the canonical key
 // (see the spec's Resource ID formats); URL is the human-facing link.
 type Resource struct {
@@ -28,4 +30,19 @@ type Event struct {
 	// (GitHub databaseId, Jira accountId, Slack user ID); nil when unknown.
 	// Compare it only together with Source.
 	AuthorID *string
+	// TextChange holds the before/after text of an edit (a description
+	// change); nil when the event carries no text. Stored exactly as
+	// received, in watcher_event_text_change.
+	TextChange *TextChange
+}
+
+// TextChange is the text before and after an edit.
+type TextChange struct {
+	Old, New string
+}
+
+// SameText reports whether a and b are equal once "\r\n" is normalized
+// to "\n". Pollers use it to skip edits that only change line endings.
+func SameText(a, b string) bool {
+	return strings.ReplaceAll(a, "\r\n", "\n") == strings.ReplaceAll(b, "\r\n", "\n")
 }

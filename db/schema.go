@@ -43,7 +43,10 @@ package db
 // Bumped to 6 to add watcher_resource_poll_status, watcher_poll_log and
 // watcher_poll_log_resources (the watcher log). Purely additive tables; the
 // bump is required for the same short-circuit reason as v3.
-const CurrentSchemaVersion = 6
+// Bumped to 7 to add watcher_event_text_change (before/after text of an
+// event). Purely additive table; the bump is required for the same
+// short-circuit reason as v3.
+const CurrentSchemaVersion = 7
 
 // managedTables is the exact set of tables Migrate owns.
 var managedTables = []string{
@@ -51,7 +54,7 @@ var managedTables = []string{
 	"watcher_resource_state", "watcher_subscriptions",
 	"watcher_resource_relationships", "watcher_poller_status",
 	"watcher_resource_meta", "watcher_resource_poll_status", "watcher_poll_log",
-	"watcher_poll_log_resources",
+	"watcher_poll_log_resources", "watcher_event_text_change",
 }
 
 // managedColumns maps each managed table to its expected set of column
@@ -94,6 +97,7 @@ var managedColumns = map[string][]string{
 		"endpoint", "http_status", "duration_ms", "bytes", "error_body",
 	},
 	"watcher_poll_log_resources": {"log_id", "resource_type", "resource_id"},
+	"watcher_event_text_change":  {"event_id", "old_text", "new_text"},
 }
 
 // schemaDDL creates all watcher_* tables and indexes if they don't
@@ -123,6 +127,12 @@ CREATE TABLE IF NOT EXISTS watcher_event_resources (
 	resource_type TEXT NOT NULL,
 	resource_id TEXT NOT NULL,
 	resource_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS watcher_event_text_change (
+	event_id TEXT PRIMARY KEY,
+	old_text TEXT NOT NULL,
+	new_text TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS watcher_resource_state (

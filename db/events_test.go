@@ -125,3 +125,43 @@ func TestInsertEventRoundTripsAuthorID(t *testing.T) {
 		t.Fatalf("e2 AuthorID = %q, want nil", *got["e2"])
 	}
 }
+
+func TestInsertEvent_WritesTextChange(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	ts := "2026-01-15T12:00:00Z"
+	ev := watcher.Event{ID: "e1", TS: ts, ExternalTS: &ts, Source: "jira", Type: watcher.EventTypeJiraDescChanged, Title: "Description changed",
+		TextChange: &watcher.TextChange{Old: "a\nb", New: "a\nc"}}
+	if err := InsertEvent(c, ev, watcher.Resource{Type: "jira", ID: "TEST-1"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := EventTextChange(c, "e1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Old != "a\nb" || got.New != "a\nc" {
+		t.Fatalf("got %+v, want old=%q new=%q", got, "a\nb", "a\nc")
+	}
+}
+
+func TestInsertEvent_NoTextChange(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	ts := "2026-01-15T12:00:00Z"
+	ev := watcher.Event{ID: "e1", TS: ts, ExternalTS: &ts, Source: "github", Type: watcher.EventTypePRComment, Title: "Comment"}
+	if err := InsertEvent(c, ev, watcher.Resource{Type: "pr", ID: "owner/repo#1"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := EventTextChange(c, "e1")
+	if err != nil || got != nil {
+		t.Fatalf("got %+v, err %v; want nil, nil", got, err)
+	}
+	var n int
+	if err := c.QueryRow(`SELECT COUNT(*) FROM watcher_event_text_change`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("rows = %d, err %v; want 0", n, err)
+	}
+}

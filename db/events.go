@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/mturley/watcher"
@@ -31,11 +32,37 @@ func InsertEvent(conn *sql.DB, e watcher.Event, r watcher.Resource) error {
 		return fmt.Errorf("failed to insert event resource: %w", err)
 	}
 
+	if e.TextChange != nil {
+		if _, err := tx.Exec(`
+			INSERT INTO watcher_event_text_change (event_id, old_text, new_text)
+			VALUES (?, ?, ?)
+		`, e.ID, e.TextChange.Old, e.TextChange.New); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to insert event text change: %w", err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
+}
+
+// EventTextChange returns the before/after text stored with an event, or
+// (nil, nil) when the event has none.
+func EventTextChange(conn *sql.DB, eventID string) (*watcher.TextChange, error) {
+	var tc watcher.TextChange
+	err := conn.QueryRow(`
+		SELECT old_text, new_text FROM watcher_event_text_change WHERE event_id = ?
+	`, eventID).Scan(&tc.Old, &tc.New)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query event text change: %w", err)
+	}
+	return &tc, nil
 }
 
 // EventCursor returns the maximum external_ts from events for the given
