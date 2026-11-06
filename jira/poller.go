@@ -22,6 +22,9 @@ type JiraAuth struct {
 	Token        string
 	CustomFields map[string]string
 	BotUsernames []string
+	// DropBotDescriptionEdits skips description-changed events authored by a
+	// configured bot. The zero value keeps them.
+	DropBotDescriptionEdits bool
 }
 
 // Poll polls Jira for issue updates and emits events. Each resource's
@@ -128,7 +131,7 @@ func Poll(conn *sql.DB, cfg JiraAuth, resources []watcher.Resource, logger *log.
 
 // emitEvent inserts a watcher event for the given resource, setting the
 // ID and recording timestamp that db.InsertEvent does not set.
-func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType, authorID *string, r watcher.Resource) error {
+func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType, authorID *string, r watcher.Resource, tc *watcher.TextChange) error {
 	extTS := externalTS
 	return db.InsertEvent(conn, watcher.Event{
 		ID:         uuid.New().String(),
@@ -141,6 +144,7 @@ func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, ex
 		Author:     author,
 		AuthorType: authorType,
 		AuthorID:   authorID,
+		TextChange: tc,
 	}, r)
 }
 
@@ -193,7 +197,7 @@ func processIssue(conn *sql.DB, cfg JiraAuth, issue IssueData, resource watcher.
 		body := fmt.Sprintf("%s\nStatus: %s", issue.Key, issue.Status)
 		// Use the most recent timestamp from the issue (latest changelog or comment)
 		latestTS := latestTimestamp(issue)
-		if err := emitEvent(conn, watcher.EventTypeWatchStarted, title, &body, latestTS, nil, nil, nil, resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypeWatchStarted, title, &body, latestTS, nil, nil, nil, resource, nil); err != nil {
 			return eventCount, fmt.Errorf("failed to emit watch_started event: %w", err)
 		}
 		eventCount++
@@ -224,7 +228,7 @@ func processIssue(conn *sql.DB, cfg JiraAuth, issue IssueData, resource watcher.
 		title := fmt.Sprintf("Comment by %s on %s", comment.Author, issue.Key)
 		authorType := authorTypeFromUsername(cfg.BotUsernames, comment.Author)
 		body := comment.Body
-		if err := emitEvent(conn, watcher.EventTypeJiraComment, title, &body, comment.CreatedAt, &comment.Author, &authorType, optional(comment.AuthorID), resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypeJiraComment, title, &body, comment.CreatedAt, &comment.Author, &authorType, optional(comment.AuthorID), resource, nil); err != nil {
 			return eventCount, fmt.Errorf("failed to emit jira_comment event: %w", err)
 		}
 		eventCount++
@@ -252,7 +256,7 @@ func processIssue(conn *sql.DB, cfg JiraAuth, issue IssueData, resource watcher.
 			title := fmt.Sprintf("%s: %s → %s", issue.Key, entry.From, entry.To)
 			authorType := authorTypeFromUsername(cfg.BotUsernames, entry.Author)
 			author := entry.Author
-			if err := emitEvent(conn, watcher.EventTypeJiraStatusChange, title, nil, entry.CreatedAt, &author, &authorType, optional(entry.AuthorID), resource); err != nil {
+			if err := emitEvent(conn, watcher.EventTypeJiraStatusChange, title, nil, entry.CreatedAt, &author, &authorType, optional(entry.AuthorID), resource, nil); err != nil {
 				return eventCount, fmt.Errorf("failed to emit jira_status_change event: %w", err)
 			}
 			eventCount++
@@ -272,13 +276,19 @@ func processIssue(conn *sql.DB, cfg JiraAuth, issue IssueData, resource watcher.
 			title := fmt.Sprintf("%s assigned to %s", issue.Key, entry.To)
 			authorType := authorTypeFromUsername(cfg.BotUsernames, entry.Author)
 			author := entry.Author
-			if err := emitEvent(conn, watcher.EventTypeJiraAssigned, title, nil, entry.CreatedAt, &author, &authorType, optional(entry.AuthorID), resource); err != nil {
+			if err := emitEvent(conn, watcher.EventTypeJiraAssigned, title, nil, entry.CreatedAt, &author, &authorType, optional(entry.AuthorID), resource, nil); err != nil {
 				return eventCount, fmt.Errorf("failed to emit jira_assigned event: %w", err)
 			}
 			eventCount++
 			logger.Printf("Emitted jira_assigned for %s: %s", resource.ID, entry.To)
 
 		case "description":
+			if watcher.SameText(entry.From, entry.To) {
+				continue
+			}
+			if cfg.DropBotDescriptionEdits && authorTypeFromUsername(cfg.BotUsernames, entry.Author) == "bot" {
+				continue
+			}
 			dup, err := db.IsDuplicate(conn, db.DedupCheck{
 				Source: "jira", ResourceType: resource.Type, ResourceID: resource.ID,
 				Type: watcher.EventTypeJiraDescChanged, ExternalTS: &entry.CreatedAt,
@@ -292,7 +302,7 @@ func processIssue(conn *sql.DB, cfg JiraAuth, issue IssueData, resource watcher.
 			title := fmt.Sprintf("%s description changed", issue.Key)
 			authorType := authorTypeFromUsername(cfg.BotUsernames, entry.Author)
 			author := entry.Author
-			if err := emitEvent(conn, watcher.EventTypeJiraDescChanged, title, nil, entry.CreatedAt, &author, &authorType, optional(entry.AuthorID), resource); err != nil {
+			if err := emitEvent(conn, watcher.EventTypeJiraDescChanged, title, nil, entry.CreatedAt, &author, &authorType, optional(entry.AuthorID), resource, &watcher.TextChange{Old: entry.From, New: entry.To}); err != nil {
 				return eventCount, fmt.Errorf("failed to emit jira_description_changed event: %w", err)
 			}
 			eventCount++
@@ -312,7 +322,7 @@ func processIssue(conn *sql.DB, cfg JiraAuth, issue IssueData, resource watcher.
 			title := labelChangeTitle(issue.Key, entry.From, entry.To)
 			authorType := authorTypeFromUsername(cfg.BotUsernames, entry.Author)
 			author := entry.Author
-			if err := emitEvent(conn, watcher.EventTypeJiraLabelsChanged, title, nil, entry.CreatedAt, &author, &authorType, optional(entry.AuthorID), resource); err != nil {
+			if err := emitEvent(conn, watcher.EventTypeJiraLabelsChanged, title, nil, entry.CreatedAt, &author, &authorType, optional(entry.AuthorID), resource, nil); err != nil {
 				return eventCount, fmt.Errorf("failed to emit jira_labels_changed event: %w", err)
 			}
 			eventCount++

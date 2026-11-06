@@ -1,6 +1,7 @@
 package jira
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -753,5 +754,85 @@ func TestBuildJiraStateJSONPriorityRank(t *testing.T) {
 	}
 	if _, ok := state["priority_rank"]; ok {
 		t.Errorf("priority_rank present with nil ranks")
+	}
+}
+
+// descEvents processes a backfill of the given changelog and returns the
+// description-changed events.
+func descEvents(t *testing.T, cfg JiraAuth, entries []ChangelogEntry) (*sql.DB, []watcher.Event) {
+	t.Helper()
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	issue := IssueData{Key: "RHOAIENG-123", Summary: "S", Status: "To Do", Changelog: entries}
+	if _, err := processIssue(conn, cfg, issue, jiraResource, true, testLogger()); err != nil {
+		t.Fatalf("processIssue: %v", err)
+	}
+	all, err := db.EventsForResource(conn, "jira", jiraResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	var out []watcher.Event
+	for _, e := range all {
+		if e.Type == watcher.EventTypeJiraDescChanged {
+			out = append(out, e)
+		}
+	}
+	return conn, out
+}
+
+func descEntry(from, to string) ChangelogEntry {
+	return ChangelogEntry{Author: "John Doe", CreatedAt: "2026-06-17T11:00:00.000+0000", Field: "description", From: from, To: to}
+}
+
+func TestProcessIssue_DescriptionStoresText(t *testing.T) {
+	conn, evs := descEvents(t, JiraAuth{}, []ChangelogEntry{descEntry("old", "new")})
+	if len(evs) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(evs))
+	}
+	tc, err := db.EventTextChange(conn, evs[0].ID)
+	if err != nil || tc == nil || tc.Old != "old" || tc.New != "new" {
+		t.Errorf("text change = %+v, err %v", tc, err)
+	}
+}
+
+func TestProcessIssue_DescriptionAdded(t *testing.T) {
+	conn, evs := descEvents(t, JiraAuth{}, []ChangelogEntry{descEntry("", "x")})
+	if len(evs) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(evs))
+	}
+	tc, err := db.EventTextChange(conn, evs[0].ID)
+	if err != nil || tc == nil || tc.Old != "" || tc.New != "x" {
+		t.Errorf("text change = %+v, err %v", tc, err)
+	}
+}
+
+func TestProcessIssue_DescriptionLineEndingsOnly(t *testing.T) {
+	_, evs := descEvents(t, JiraAuth{}, []ChangelogEntry{descEntry("a\r\nb", "a\nb")})
+	if len(evs) != 0 {
+		t.Errorf("expected no event, got %d", len(evs))
+	}
+}
+
+func TestProcessIssue_DropBotDescriptionEdits(t *testing.T) {
+	bot := []ChangelogEntry{
+		descEntry("old", "new"),
+		{Author: "John Doe", CreatedAt: "2026-06-17T12:00:00.000+0000", Field: "status", From: "A", To: "B"},
+	}
+	cfg := JiraAuth{BotUsernames: []string{"John Doe"}, DropBotDescriptionEdits: true}
+	conn, evs := descEvents(t, cfg, bot)
+	if len(evs) != 0 {
+		t.Errorf("expected no description event with drop on, got %d", len(evs))
+	}
+	all, _ := db.EventsForResource(conn, "jira", jiraResource.ID)
+	if typeCounts(all)[watcher.EventTypeJiraStatusChange] != 1 {
+		t.Errorf("status change by bot should still be emitted")
+	}
+
+	cfg.DropBotDescriptionEdits = false
+	_, evs = descEvents(t, cfg, bot)
+	if len(evs) != 1 || evs[0].AuthorType == nil || *evs[0].AuthorType != "bot" {
+		t.Errorf("expected 1 bot-authored event with drop off, got %+v", evs)
 	}
 }
