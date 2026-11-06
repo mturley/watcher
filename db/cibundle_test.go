@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"testing"
 
 	"github.com/mturley/watcher"
@@ -226,5 +227,77 @@ func TestUpsertCIBundle_SameTypeKeepsTS(t *testing.T) {
 	}
 	if ts == oldTS {
 		t.Errorf("type change did not move ts")
+	}
+}
+
+func outOfDateFixture(t *testing.T) (*sql.DB, watcher.Resource) {
+	t.Helper()
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	res := watcher.Resource{Type: "pr", ID: "owner/repo#1"}
+	rebase := []watcher.EventType{watcher.EventTypePRNeedsRebase}
+	if err := UpsertCIBundle(c, "old", watcher.EventTypePRNeedsRebase, "Needs rebase: PR #1 @ old", "", "2026-01-15T12:00:00Z", res, rebase); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertCIBundle(c, "old", watcher.EventTypeCIFailed, "CI failed", "", "2026-01-15T12:00:00Z", res, CICheckBundleTypes); err != nil {
+		t.Fatal(err)
+	}
+	return c, res
+}
+
+func TestMarkOutOfDate_OnlyListedTypes(t *testing.T) {
+	c, res := outOfDateFixture(t)
+	type row struct{ title, ts, ext string }
+	read := func() map[string]row {
+		m := map[string]row{}
+		rows, err := c.Query(`SELECT type, title, ts, COALESCE(external_ts,'') FROM watcher_events`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var typ string
+			var r row
+			if err := rows.Scan(&typ, &r.title, &r.ts, &r.ext); err != nil {
+				t.Fatal(err)
+			}
+			m[typ] = r
+		}
+		return m
+	}
+	before := read()
+	if err := MarkOutOfDate(c, "old", res, []watcher.EventType{watcher.EventTypePRNeedsRebase}); err != nil {
+		t.Fatal(err)
+	}
+	after := read()
+	if got := after["pr_needs_rebase"].title; got != "[out of date] Needs rebase: PR #1 @ old" {
+		t.Errorf("needs-rebase title = %q, want prefixed", got)
+	}
+	if got := after["ci_failed"].title; got != "CI failed" {
+		t.Errorf("ci_failed title = %q, want unchanged", got)
+	}
+	for typ, b := range before {
+		if after[typ].ts != b.ts || after[typ].ext != b.ext {
+			t.Errorf("%s ts/external_ts changed: %+v -> %+v", typ, b, after[typ])
+		}
+	}
+}
+
+func TestMarkOutOfDate_Idempotent(t *testing.T) {
+	c, res := outOfDateFixture(t)
+	types := []watcher.EventType{watcher.EventTypePRNeedsRebase}
+	for i := 0; i < 2; i++ {
+		if err := MarkOutOfDate(c, "old", res, types); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var title string
+	if err := c.QueryRow(`SELECT title FROM watcher_events WHERE type='pr_needs_rebase'`).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "[out of date] Needs rebase: PR #1 @ old" {
+		t.Errorf("title = %q, want single prefix", title)
 	}
 }

@@ -12,6 +12,7 @@ const (
 	EventTypePRMerged          EventType = "pr_merged"
 	EventTypePRReopened        EventType = "pr_reopened"
 	EventTypePRNewCommits      EventType = "pr_new_commits"
+	EventTypePRNeedsRebase     EventType = "pr_needs_rebase"
 	EventTypeCICheckPassed     EventType = "ci_check_passed"
 	EventTypeCICheckFailed     EventType = "ci_check_failed"
 	EventTypeCIPassed          EventType = "ci_passed"
@@ -49,6 +50,7 @@ var eventTypeDisplayNames = map[EventType]string{
 	EventTypePRMerged:          "PR merged",
 	EventTypePRReopened:        "PR reopened",
 	EventTypePRNewCommits:      "new commits",
+	EventTypePRNeedsRebase:     "needs rebase",
 	EventTypeCICheckPassed:     "CI passed",
 	EventTypeCICheckFailed:     "CI failed",
 	EventTypeCIPassed:          "CI checks passed",

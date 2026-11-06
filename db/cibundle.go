@@ -164,8 +164,8 @@ func UpsertCIBundle(conn *sql.DB, commitSHA string, t watcher.EventType, title, 
 // doesn't mistake it for the current CI state.
 const outOfDatePrefix = "[out of date] "
 
-// MarkCIBundlesOutOfDate prepends outOfDatePrefix to the title of every CI/
-// workflow bundle event (both families) for the given commit on a resource.
+// MarkOutOfDate prepends outOfDatePrefix to the title of every event of the
+// given types tagged for the given commit on a resource.
 //
 // It touches ONLY the title: ts and external_ts are deliberately left unchanged
 // so the update does not re-surface a stale event in a consumer's inbox — the
@@ -175,10 +175,9 @@ const outOfDatePrefix = "[out of date] "
 // Zero matched rows is not an error (the previous commit may have had no
 // bundles). A single UPDATE with no check-then-act means no BEGIN IMMEDIATE is
 // needed.
-func MarkCIBundlesOutOfDate(conn *sql.DB, commitSHA string, r watcher.Resource) error {
+func MarkOutOfDate(conn *sql.DB, commitSHA string, r watcher.Resource, types []watcher.EventType) error {
 	tag := "commit:" + commitSHA
-	allTypes := append(append([]watcher.EventType{}, CICheckBundleTypes...), CIWorkflowBundleTypes...)
-	typeIn, typeArgs := inClause(allTypes)
+	typeIn, typeArgs := inClause(types)
 
 	args := append([]any{outOfDatePrefix}, typeArgs...)
 	args = append(args, r.Type, r.ID, tag, outOfDatePrefix+"%")
@@ -197,7 +196,14 @@ func MarkCIBundlesOutOfDate(conn *sql.DB, commitSHA string, r watcher.Resource) 
 		)
 	`, args...)
 	if err != nil {
-		return fmt.Errorf("failed to mark CI bundles out of date: %w", err)
+		return fmt.Errorf("failed to mark events out of date: %w", err)
 	}
 	return nil
+}
+
+// MarkCIBundlesOutOfDate marks the CI/workflow bundle events (both families)
+// for the given commit out of date. See MarkOutOfDate.
+func MarkCIBundlesOutOfDate(conn *sql.DB, commitSHA string, r watcher.Resource) error {
+	allTypes := append(append([]watcher.EventType{}, CICheckBundleTypes...), CIWorkflowBundleTypes...)
+	return MarkOutOfDate(conn, commitSHA, r, allTypes)
 }
