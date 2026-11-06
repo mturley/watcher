@@ -383,14 +383,26 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 	}
 
 	// Description edits: only when lastEditedAt moved past the last value
-	// processed, so unedited PRs cost no extra query.
+	// processed, so unedited PRs cost no extra query. Edits newer than that
+	// value are new; the event cursor is no bound here, because a failed
+	// fetch can be followed by a later event in the same poll that moves the
+	// cursor past an edit not yet emitted. With no value saved yet (first
+	// fetch for this PR), the cursor is the bound.
 	descriptionEditedAt, _ := prevStateMap["description_edited_at"].(string)
 	if prData.LastEditedAt > descriptionEditedAt {
-		n, err := processDescriptionEdits(conn, h, prData, resource, token, cursor, opts, logger)
+		since := descriptionEditedAt
+		if since == "" {
+			since = cursor
+		}
+		n, err := processDescriptionEdits(conn, h, prData, resource, token, since, opts, logger)
 		eventCount += n
 		if err != nil {
-			// Keep the previous value so the next poll retries.
+			// Don't advance, so the next poll retries from the same bound.
+			// With no value saved yet, save the bound used (the cursor as of
+			// this poll): a later event in this same poll would otherwise
+			// move the cursor past the edits still to be emitted.
 			logger.Printf("WARNING: failed to process description edits for %s: %v", resource.ID, err)
+			descriptionEditedAt = since
 		} else {
 			descriptionEditedAt = prData.LastEditedAt
 		}
@@ -727,14 +739,12 @@ skipCIBundle:
 	return eventCount, nil
 }
 
-// reviewEventType maps a PR review state to an event type. APPROVED gets
-// its own type; CHANGES_REQUESTED, COMMENTED, and any other submitted
-// state map to the generic review-comment type.
 // processDescriptionEdits emits a pr_description_changed event for each
-// description edit newer than cursor, with the text before and after.
+// description edit newer than since, with the text before and after.
 // The oldest version is the original description and never gets an event.
-func processDescriptionEdits(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resource, token, cursor string, opts PollOptions, logger *log.Logger) (int, error) {
-	edits, err := fetchDescriptionEdits(h, token, prData.Owner, prData.Repo, prData.Number, cursor)
+// IsDuplicate guards edits already emitted.
+func processDescriptionEdits(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resource, token, since string, opts PollOptions, logger *log.Logger) (int, error) {
+	edits, err := fetchDescriptionEdits(h, token, prData.Owner, prData.Repo, prData.Number, since)
 	if err != nil {
 		return 0, err
 	}
@@ -742,7 +752,7 @@ func processDescriptionEdits(conn *sql.DB, h ghHTTP, prData PRData, resource wat
 	count := 0
 	for i := 0; i+1 < len(edits); i++ {
 		cur, prev := edits[i], edits[i+1]
-		if cur.EditedAt <= cursor {
+		if cur.EditedAt <= since {
 			continue
 		}
 		if cur.Body != nil && prev.Body != nil && watcher.SameText(*prev.Body, *cur.Body) {
@@ -779,6 +789,9 @@ func processDescriptionEdits(conn *sql.DB, h ghHTTP, prData PRData, resource wat
 	return count, nil
 }
 
+// reviewEventType maps a PR review state to an event type. APPROVED gets
+// its own type; CHANGES_REQUESTED, COMMENTED, and any other submitted
+// state map to the generic review-comment type.
 func reviewEventType(state string) watcher.EventType {
 	if state == "APPROVED" {
 		return watcher.EventTypePRApproved

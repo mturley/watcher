@@ -1802,8 +1802,10 @@ func TestDescriptionEdits_FailureDoesNotAdvance(t *testing.T) {
 	if n := len(descEvents(t, conn)); n != 0 {
 		t.Errorf("got %d events after failure, want 0", n)
 	}
-	if got := descEditedAtState(t, conn); got != "" {
-		t.Errorf("description_edited_at = %q after failure, want unchanged \"\"", got)
+	// Not advanced to lastEditedAt: it holds the bound the retry starts from
+	// (the cursor, as nothing was saved before).
+	if got := descEditedAtState(t, conn); got != "2026-06-17T08:30:00Z" {
+		t.Errorf("description_edited_at = %q after failure, want the cursor 2026-06-17T08:30:00Z", got)
 	}
 
 	ok := newDescServer(t, vs, 50, http.StatusOK)
@@ -1817,6 +1819,61 @@ func TestDescriptionEdits_FailureDoesNotAdvance(t *testing.T) {
 	if got := descEditedAtState(t, conn); got != vs[1].editedAt {
 		t.Errorf("description_edited_at = %q, want %q", got, vs[1].editedAt)
 	}
+}
+
+// descPollWithComment polls with a comment at commentAt, an event that
+// moves the cursor past the description edits in the same poll.
+func descPollWithComment(t *testing.T, conn *sql.DB, url, lastEditedAt, commentAt string) {
+	t.Helper()
+	prData := PRData{
+		Number: 1, Owner: "o", Repo: "r", State: "OPEN", Title: "T",
+		CreatedAt: "2026-06-17T08:00:00Z", UpdatedAt: "2026-06-17T23:00:00Z", LastEditedAt: lastEditedAt,
+		Comments: []Comment{{Author: "carol", AuthorType: "user", CreatedAt: commentAt, Body: "a comment"}},
+	}
+	if _, err := processPRWith(conn, defaultGHHTTP(url), prData, descResource, "tok", false, testLogger(), PollOptions{}); err != nil {
+		t.Fatalf("processPRWith: %v", err)
+	}
+}
+
+// A failed edits fetch in a poll that also emits a later event (moving the
+// cursor past the edit) must not lose the edit on the retry.
+func TestDescriptionEdits_RetryAfterCursorMoves(t *testing.T) {
+	vs := descVersions(3)
+	commentAt := "2026-06-17T11:00:00Z" // after V2's edit
+
+	check := func(t *testing.T, conn *sql.DB, wantNew int) {
+		t.Helper()
+		evs := descEvents(t, conn)
+		if len(evs) == 0 || *evs[len(evs)-1].ExternalTS != vs[2].editedAt {
+			t.Fatalf("edit V2 not emitted; events: %d", len(evs))
+		}
+		tc := descTextChange(t, conn, evs[len(evs)-1])
+		want := watcher.TextChange{Old: *vs[1].body, New: *vs[2].body}
+		if tc == nil || *tc != want {
+			t.Errorf("text change = %+v, want %+v", tc, want)
+		}
+		if len(evs) != wantNew {
+			t.Errorf("got %d description events, want %d", len(evs), wantNew)
+		}
+		if got := descEditedAtState(t, conn); got != vs[2].editedAt {
+			t.Errorf("description_edited_at = %q, want %q", got, vs[2].editedAt)
+		}
+	}
+
+	t.Run("after an earlier successful fetch", func(t *testing.T) {
+		conn := descSeed(t, "2026-06-17T08:30:00Z")
+		descPoll(t, conn, newDescServer(t, vs[:2], 50, http.StatusOK).srv.URL, vs[1].editedAt)
+		descPollWithComment(t, conn, newDescServer(t, vs, 50, http.StatusInternalServerError).srv.URL, vs[2].editedAt, commentAt)
+		descPoll(t, conn, newDescServer(t, vs, 50, http.StatusOK).srv.URL, vs[2].editedAt)
+		check(t, conn, 2)
+	})
+
+	t.Run("on the first fetch", func(t *testing.T) {
+		conn := descSeed(t, "2026-06-17T09:30:00Z") // between V1 and V2
+		descPollWithComment(t, conn, newDescServer(t, vs, 50, http.StatusInternalServerError).srv.URL, vs[2].editedAt, commentAt)
+		descPoll(t, conn, newDescServer(t, vs, 50, http.StatusOK).srv.URL, vs[2].editedAt)
+		check(t, conn, 1)
+	})
 }
 
 func TestDescriptionEdits_LineEndingsOnly(t *testing.T) {

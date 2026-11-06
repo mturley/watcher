@@ -35,7 +35,7 @@ type PRData struct {
 	MergedByID   string
 	CreatedAt    string
 	UpdatedAt    string
-	// LastEditedAt is when the PR's title or description was last edited
+	// LastEditedAt is when the PR's description (body) was last edited
 	// (RFC3339); "" if it never was.
 	LastEditedAt string
 	// ReviewDecision is GitHub's own review decision (APPROVED,
