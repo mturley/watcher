@@ -25,7 +25,7 @@ func TestPoll_BatchFailureRecordsEveryPR(t *testing.T) {
 	defer ts.Close()
 	prs := []watcher.Resource{{Type: "pr", ID: "o/r#1"}, {Type: "pr", ID: "o/r#2"}}
 
-	if err := pollWith(conn, "tok", prs, quietLog, ts.URL); err == nil {
+	if err := pollWith(conn, "tok", prs, quietLog, ts.URL, PollOptions{}); err == nil {
 		t.Fatal("expected error from 504")
 	}
 	st, _ := db.GetResourcePollStatuses(conn, prs)
@@ -65,7 +65,7 @@ func TestPoll_MissingPRRecordedAsError(t *testing.T) {
 	}))
 	defer ts.Close()
 	pr := watcher.Resource{Type: "pr", ID: "o/gone#1"}
-	if err := pollWith(conn, "tok", []watcher.Resource{pr}, quietLog, ts.URL); err != nil {
+	if err := pollWith(conn, "tok", []watcher.Resource{pr}, quietLog, ts.URL, PollOptions{}); err != nil {
 		t.Fatalf("partial batch should not fail the poll: %v", err)
 	}
 	st, _ := db.GetResourcePollStatuses(conn, []watcher.Resource{pr})
@@ -87,7 +87,7 @@ func TestPoll_PartialBatchMissingPR(t *testing.T) {
 	gone := watcher.Resource{Type: "pr", ID: "o/gone#1"}
 	good := watcher.Resource{Type: "pr", ID: "o/r#9097"}
 	rs := []watcher.Resource{gone, good}
-	if err := pollWith(conn, "tok", rs, quietLog, ts.URL); err != nil {
+	if err := pollWith(conn, "tok", rs, quietLog, ts.URL, PollOptions{}); err != nil {
 		t.Fatalf("partial batch should not fail the poll: %v", err)
 	}
 	st, _ := db.GetResourcePollStatuses(conn, rs)
@@ -108,7 +108,7 @@ func TestPoll_PartialBatchMissingPR(t *testing.T) {
 func TestPoll_InvalidResourceIDRecorded(t *testing.T) {
 	conn := testutil.NewTestDB(t)
 	bad := watcher.Resource{Type: "pr", ID: "not-a-pr"}
-	_ = pollWith(conn, "tok", []watcher.Resource{bad}, quietLog, "http://127.0.0.1:1")
+	_ = pollWith(conn, "tok", []watcher.Resource{bad}, quietLog, "http://127.0.0.1:1", PollOptions{})
 	st, _ := db.GetResourcePollStatuses(conn, []watcher.Resource{bad})
 	if !st[db.ResourceKey{Type: "pr", ID: "not-a-pr"}].Failing() {
 		t.Fatal("invalid resource id not recorded as error")

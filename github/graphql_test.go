@@ -200,3 +200,44 @@ func TestParsePRNode_Mergeable(t *testing.T) {
 		t.Errorf("Mergeable = %q, want CONFLICTING", got.Mergeable)
 	}
 }
+
+func TestLastEditedAt_QueriedAndParsed(t *testing.T) {
+	q := buildBatchedPRQuery([]PRRef{{Owner: "o", Repo: "r", Number: 1}})
+	if !strings.Contains(q, "lastEditedAt") {
+		t.Error("batched PR query does not request lastEditedAt")
+	}
+	var node prNode
+	if err := json.Unmarshal([]byte(`{"lastEditedAt":"2026-06-17T10:00:00Z"}`), &node); err != nil {
+		t.Fatal(err)
+	}
+	if got := parsePRNode(&node, "o", "r").LastEditedAt; got != "2026-06-17T10:00:00Z" {
+		t.Errorf("LastEditedAt = %q", got)
+	}
+	if got := parsePRNode(&prNode{}, "o", "r").LastEditedAt; got != "" {
+		t.Errorf("never-edited LastEditedAt = %q, want \"\"", got)
+	}
+}
+
+func TestFetchDescriptionEdits_StopsAtCursor(t *testing.T) {
+	vs := descVersions(5)
+	ds := newDescServer(t, vs, 2, http.StatusOK)
+	edits, err := fetchDescriptionEdits(defaultGHHTTP(ds.srv.URL), "tok", "o", "r", 1, vs[3].editedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Page 1 [V4 V3] already reaches the stop point.
+	if len(edits) != 2 || ds.requests.Load() != 1 {
+		t.Fatalf("got %d edits in %d requests, want 2 in 1", len(edits), ds.requests.Load())
+	}
+	if edits[0].EditedAt != vs[4].editedAt || *edits[0].Body != "body v4" || edits[0].Editor.Login != "alice" {
+		t.Errorf("edits[0] = %+v", edits[0])
+	}
+
+	all, err := fetchDescriptionEdits(defaultGHHTTP(ds.srv.URL), "tok", "o", "r", 1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 5 {
+		t.Errorf("stopAt \"\" fetched %d edits, want all 5", len(all))
+	}
+}

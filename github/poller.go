@@ -16,13 +16,25 @@ import (
 	"github.com/mturley/watcher/polllog"
 )
 
+// PollOptions tunes what a GitHub poll emits.
+type PollOptions struct {
+	// DropBotDescriptionEdits skips pr_description_changed events whose
+	// editor is a bot (the edit is still marked processed).
+	DropBotDescriptionEdits bool
+}
+
 // Poll polls GitHub for PR updates and emits events. Each resource's
 // backfill flag is resolved from its live subscriptions.
 func Poll(conn *sql.DB, token string, resources []watcher.Resource, logger *log.Logger) error {
-	return pollWith(conn, token, resources, logger, graphqlEndpoint)
+	return PollWithOptions(conn, token, resources, logger, PollOptions{})
 }
 
-func pollWith(conn *sql.DB, token string, resources []watcher.Resource, logger *log.Logger, endpoint string) error {
+// PollWithOptions is Poll with options.
+func PollWithOptions(conn *sql.DB, token string, resources []watcher.Resource, logger *log.Logger, opts PollOptions) error {
+	return pollWith(conn, token, resources, logger, graphqlEndpoint, opts)
+}
+
+func pollWith(conn *sql.DB, token string, resources []watcher.Resource, logger *log.Logger, endpoint string, opts PollOptions) error {
 	if token == "" {
 		return fmt.Errorf("GitHub token not configured")
 	}
@@ -135,7 +147,7 @@ func pollWith(conn *sql.DB, token string, resources []watcher.Resource, logger *
 			logger.Printf("WARNING: failed to resolve backfill for %s: %v", resourceID, err)
 		}
 
-		count, err := processPRWith(conn, h, prData, resource, token, backfill, logger)
+		count, err := processPRWith(conn, h, prData, resource, token, backfill, logger, opts)
 		if err != nil {
 			logger.Printf("ERROR: failed to process PR %s: %v", resourceID, err)
 			// Emit error event
@@ -165,7 +177,7 @@ func pollWith(conn *sql.DB, token string, resources []watcher.Resource, logger *
 
 // emitEvent inserts a watcher event for the given resource, setting the
 // ID and recording timestamp that db.InsertEvent does not set.
-func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType, authorID, tags *string, r watcher.Resource) error {
+func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType, authorID, tags *string, r watcher.Resource, tc *watcher.TextChange) error {
 	extTS := externalTS
 	return db.InsertEvent(conn, watcher.Event{
 		ID:         uuid.New().String(),
@@ -179,6 +191,7 @@ func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, ex
 		AuthorType: authorType,
 		AuthorID:   authorID,
 		Tags:       tags,
+		TextChange: tc,
 	}, r)
 }
 
@@ -213,10 +226,10 @@ func emitError(conn *sql.DB, title string, body *string, r watcher.Resource) err
 // is true, all history is emitted; when backfill is false, only a
 // watch_started event is emitted on the first poll.
 func processPR(conn *sql.DB, prData PRData, resource watcher.Resource, token string, backfill bool, logger *log.Logger) (int, error) {
-	return processPRWith(conn, defaultGHHTTP(""), prData, resource, token, backfill, logger)
+	return processPRWith(conn, defaultGHHTTP(""), prData, resource, token, backfill, logger, PollOptions{})
 }
 
-func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resource, token string, backfill bool, logger *log.Logger) (int, error) {
+func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resource, token string, backfill bool, logger *log.Logger, opts PollOptions) (int, error) {
 	// Tag follow-up calls (check-context pages) with this one PR.
 	h.ctx = polllog.WithResources(h.ctx, resource)
 	eventCount := 0
@@ -234,7 +247,7 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 	if cursor == "" && !backfill {
 		title := fmt.Sprintf("Started watching PR: %s", prData.Title)
 		body := fmt.Sprintf("PR #%d in %s/%s\nState: %s", prData.Number, prData.Owner, prData.Repo, prData.State)
-		if err := emitEvent(conn, watcher.EventTypeWatchStarted, title, &body, prData.UpdatedAt, nil, nil, nil, nil, resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypeWatchStarted, title, &body, prData.UpdatedAt, nil, nil, nil, nil, resource, nil); err != nil {
 			return eventCount, fmt.Errorf("failed to emit watch_started event: %w", err)
 		}
 		eventCount++
@@ -285,7 +298,7 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 			title = fmt.Sprintf("PR review by %s", review.Author)
 		}
 
-		if err := emitEvent(conn, eventType, title, &review.Body, review.SubmittedAt, &review.Author, &review.AuthorType, optional(review.AuthorID), nil, resource); err != nil {
+		if err := emitEvent(conn, eventType, title, &review.Body, review.SubmittedAt, &review.Author, &review.AuthorType, optional(review.AuthorID), nil, resource, nil); err != nil {
 			return eventCount, fmt.Errorf("failed to emit %s event: %w", eventType, err)
 		}
 		eventCount++
@@ -313,7 +326,7 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 		}
 
 		title := fmt.Sprintf("Comment by %s", comment.Author)
-		if err := emitEvent(conn, watcher.EventTypePRComment, title, &comment.Body, comment.CreatedAt, &comment.Author, &comment.AuthorType, optional(comment.AuthorID), nil, resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypePRComment, title, &comment.Body, comment.CreatedAt, &comment.Author, &comment.AuthorType, optional(comment.AuthorID), nil, resource, nil); err != nil {
 			return eventCount, fmt.Errorf("failed to emit pr_comment event: %w", err)
 		}
 		eventCount++
@@ -349,15 +362,15 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 			continue
 		}
 
-		if err := emitEvent(conn, watcher.EventTypePRReviewComment, title, &reviewComment.Body, reviewComment.CreatedAt, &reviewComment.Author, &reviewComment.AuthorType, optional(reviewComment.AuthorID), commentTag(reviewComment.DatabaseID), resource); err != nil {
+		if err := emitEvent(conn, watcher.EventTypePRReviewComment, title, &reviewComment.Body, reviewComment.CreatedAt, &reviewComment.Author, &reviewComment.AuthorType, optional(reviewComment.AuthorID), commentTag(reviewComment.DatabaseID), resource, nil); err != nil {
 			return eventCount, fmt.Errorf("failed to emit pr_review_comment event: %w", err)
 		}
 		eventCount++
 		logger.Printf("Emitted pr_review_comment for %s by %s on %s", resource.ID, reviewComment.Author, reviewComment.Path)
 	}
 
-	// Read previous resource state once, used both by the CI-pending-refresh
-	// check below and by the new-commits detection further down.
+	// Read previous resource state once, used by the description-edit,
+	// CI-pending-refresh, new-commits and needs-rebase checks below.
 	prevState, _ := db.GetResourceState(conn, "pr", resource.ID)
 	var prevStateMap map[string]interface{}
 	if prevState != nil {
@@ -366,6 +379,20 @@ func processPRWith(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resou
 			// risking a partially-populated map (matches the old inline
 			// check's behavior of skipping cleanly on unmarshal error).
 			prevStateMap = nil
+		}
+	}
+
+	// Description edits: only when lastEditedAt moved past the last value
+	// processed, so unedited PRs cost no extra query.
+	descriptionEditedAt, _ := prevStateMap["description_edited_at"].(string)
+	if prData.LastEditedAt > descriptionEditedAt {
+		n, err := processDescriptionEdits(conn, h, prData, resource, token, cursor, opts, logger)
+		eventCount += n
+		if err != nil {
+			// Keep the previous value so the next poll retries.
+			logger.Printf("WARNING: failed to process description edits for %s: %v", resource.ID, err)
+		} else {
+			descriptionEditedAt = prData.LastEditedAt
 		}
 	}
 
@@ -584,7 +611,7 @@ skipCIBundle:
 			if eventType == watcher.EventTypePRMerged && prData.MergedBy != "" {
 				author, authorType, authorID = &prData.MergedBy, &prData.MergedByType, optional(prData.MergedByID)
 			}
-			if err := emitEvent(conn, eventType, title, &body, prData.UpdatedAt, author, authorType, authorID, nil, resource); err != nil {
+			if err := emitEvent(conn, eventType, title, &body, prData.UpdatedAt, author, authorType, authorID, nil, resource, nil); err != nil {
 				return eventCount, fmt.Errorf("failed to emit %s event: %w", eventType, err)
 			}
 			eventCount++
@@ -635,7 +662,7 @@ skipCIBundle:
 					user := "user"
 					author, authorType, authorID = &login, &user, &id
 				}
-				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, author, authorType, authorID, nil, resource); err != nil {
+				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, author, authorType, authorID, nil, resource, nil); err != nil {
 					logger.Printf("WARNING: failed to emit new commits event: %v", err)
 				} else {
 					eventCount++
@@ -681,7 +708,7 @@ skipCIBundle:
 			tag := "commit:" + headSHA
 			// external_ts is the head commit's date, never poll time, so this
 			// event cannot advance the cursor past real activity.
-			if err := emitEvent(conn, watcher.EventTypePRNeedsRebase, title, &body, prData.Commits.LatestDate, nil, nil, nil, &tag, resource); err != nil {
+			if err := emitEvent(conn, watcher.EventTypePRNeedsRebase, title, &body, prData.Commits.LatestDate, nil, nil, nil, &tag, resource, nil); err != nil {
 				logger.Printf("WARNING: failed to emit needs-rebase event: %v", err)
 			} else {
 				eventCount++
@@ -691,7 +718,7 @@ skipCIBundle:
 	}
 
 	// Write resource state
-	stateJSON := buildPRStateJSON(prData, mergeable)
+	stateJSON := buildPRStateJSON(prData, mergeable, descriptionEditedAt)
 	now := time.Now().UTC().Format(time.RFC3339)
 	if err := db.UpsertResourceState(conn, "pr", resource.ID, stateJSON, prData.UpdatedAt, now); err != nil {
 		logger.Printf("WARNING: failed to upsert resource state for %s: %v", resource.ID, err)
@@ -703,6 +730,55 @@ skipCIBundle:
 // reviewEventType maps a PR review state to an event type. APPROVED gets
 // its own type; CHANGES_REQUESTED, COMMENTED, and any other submitted
 // state map to the generic review-comment type.
+// processDescriptionEdits emits a pr_description_changed event for each
+// description edit newer than cursor, with the text before and after.
+// The oldest version is the original description and never gets an event.
+func processDescriptionEdits(conn *sql.DB, h ghHTTP, prData PRData, resource watcher.Resource, token, cursor string, opts PollOptions, logger *log.Logger) (int, error) {
+	edits, err := fetchDescriptionEdits(h, token, prData.Owner, prData.Repo, prData.Number, cursor)
+	if err != nil {
+		return 0, err
+	}
+	title := fmt.Sprintf("%s/%s#%d description changed", prData.Owner, prData.Repo, prData.Number)
+	count := 0
+	for i := 0; i+1 < len(edits); i++ {
+		cur, prev := edits[i], edits[i+1]
+		if cur.EditedAt <= cursor {
+			continue
+		}
+		if cur.Body != nil && prev.Body != nil && watcher.SameText(*prev.Body, *cur.Body) {
+			continue
+		}
+		editorType := authorType(cur.Editor.Typename)
+		if opts.DropBotDescriptionEdits && editorType == "bot" {
+			continue
+		}
+		dup, err := db.IsDuplicate(conn, db.DedupCheck{
+			Source:       "github",
+			ResourceType: resource.Type,
+			ResourceID:   resource.ID,
+			Type:         watcher.EventTypePRDescChanged,
+			ExternalTS:   &cur.EditedAt,
+		})
+		if err != nil {
+			return count, fmt.Errorf("failed to check description edit duplicate: %w", err)
+		}
+		if dup {
+			continue
+		}
+		var tc *watcher.TextChange
+		if cur.Body != nil && prev.Body != nil {
+			tc = &watcher.TextChange{Old: *prev.Body, New: *cur.Body}
+		}
+		editor := cur.Editor.Login
+		if err := emitEvent(conn, watcher.EventTypePRDescChanged, title, nil, cur.EditedAt, &editor, &editorType, optional(cur.Editor.id()), nil, resource, tc); err != nil {
+			return count, fmt.Errorf("failed to emit pr_description_changed event: %w", err)
+		}
+		count++
+		logger.Printf("Emitted pr_description_changed for %s by %s", resource.ID, editor)
+	}
+	return count, nil
+}
+
 func reviewEventType(state string) watcher.EventType {
 	if state == "APPROVED" {
 		return watcher.EventTypePRApproved
@@ -826,7 +902,7 @@ func resolveMergeable(prev map[string]interface{}, prData PRData) string {
 	return ""
 }
 
-func buildPRStateJSON(prData PRData, mergeable string) string {
+func buildPRStateJSON(prData PRData, mergeable, descriptionEditedAt string) string {
 	requested := prData.RequestedReviewerIDs
 	if requested == nil {
 		requested = []string{}
@@ -846,6 +922,7 @@ func buildPRStateJSON(prData PRData, mergeable string) string {
 		"requested_reviewer_ids":       requested,
 		"mergeable":                    mergeable,
 		"mergeable_sha":                prData.Commits.LatestSHA,
+		"description_edited_at":        descriptionEditedAt,
 	}
 	data, _ := json.Marshal(state)
 	return string(data)

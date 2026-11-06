@@ -35,6 +35,9 @@ type PRData struct {
 	MergedByID   string
 	CreatedAt    string
 	UpdatedAt    string
+	// LastEditedAt is when the PR's title or description was last edited
+	// (RFC3339); "" if it never was.
+	LastEditedAt string
 	// ReviewDecision is GitHub's own review decision (APPROVED,
 	// CHANGES_REQUESTED or REVIEW_REQUIRED), set by the repo's review
 	// requirements; "" when the repo has none.
@@ -262,6 +265,7 @@ func buildBatchedPRQuery(prs []PRRef) string {
         title
         createdAt
         updatedAt
+        lastEditedAt
         reviewDecision
         mergeable
         author {
@@ -460,6 +464,7 @@ type prNode struct {
 	Author         authorNode              `json:"author"`
 	CreatedAt      string                  `json:"createdAt"`
 	UpdatedAt      string                  `json:"updatedAt"`
+	LastEditedAt   *string                 `json:"lastEditedAt"`
 	ReviewDecision *string                 `json:"reviewDecision"`
 	Mergeable      string                  `json:"mergeable"`
 	Reviews        reviewsConnection       `json:"reviews"`
@@ -612,6 +617,10 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 	}
 
 	data.Mergeable = node.Mergeable
+
+	if node.LastEditedAt != nil {
+		data.LastEditedAt = *node.LastEditedAt
+	}
 
 	if node.ReviewDecision != nil {
 		data.ReviewDecision = *node.ReviewDecision
@@ -806,6 +815,109 @@ func fetchRemainingCheckContexts(h ghHTTP, token, owner, repo string, prNumber i
 	}
 
 	return allRuns, allContexts, nil
+}
+
+// DescriptionEdit is one version of a PR's description from
+// pullRequest.userContentEdits. Despite GitHub's field name ("diff"), Body is
+// the complete description as of that version; nil when GitHub returns no
+// text for it (the history entry was deleted). The oldest version is the
+// original description, not an edit.
+type DescriptionEdit struct {
+	EditedAt string
+	Body     *string
+	Editor   authorNode // zero value when the editor's account is gone
+}
+
+const descriptionEditsQuery = `query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){userContentEdits(first:50,after:$after){pageInfo{hasNextPage endCursor}nodes{editedAt diff editor{__typename login ... on User{databaseId} ... on Bot{databaseId}}}}}}}`
+
+// maxDescriptionEditPages bounds one fetch (50 versions per page).
+const maxDescriptionEditPages = 20
+
+// fetchDescriptionEdits returns a PR's description versions, newest first. It
+// stops after the page holding a version edited at or before stopAt (that
+// version is the "before" text of the oldest newer edit), or at the last page.
+func fetchDescriptionEdits(h ghHTTP, token, owner, repo string, number int, stopAt string) ([]DescriptionEdit, error) {
+	var edits []DescriptionEdit
+	var after *string
+	for page := 1; page <= maxDescriptionEditPages; page++ {
+		reqBody, err := json.Marshal(map[string]interface{}{
+			"query": descriptionEditsQuery,
+			"variables": map[string]interface{}{
+				"owner": owner, "name": repo, "number": number, "after": after,
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal description edits query: %w", err)
+		}
+		req, err := http.NewRequestWithContext(h.ctx, "POST", h.endpoint, bytes.NewReader(reqBody))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request for description edits page %d: %w", page, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := h.hc.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch description edits page %d: %w", page, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read description edits page %d: %w", page, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("GitHub API returned status %d for description edits: %s", resp.StatusCode, string(body))
+		}
+
+		var result struct {
+			Data struct {
+				Repository *struct {
+					PullRequest *struct {
+						UserContentEdits struct {
+							PageInfo struct {
+								HasNextPage bool   `json:"hasNextPage"`
+								EndCursor   string `json:"endCursor"`
+							} `json:"pageInfo"`
+							Nodes []struct {
+								EditedAt string      `json:"editedAt"`
+								Diff     *string     `json:"diff"`
+								Editor   *authorNode `json:"editor"`
+							} `json:"nodes"`
+						} `json:"userContentEdits"`
+					} `json:"pullRequest"`
+				} `json:"repository"`
+			} `json:"data"`
+			Errors []graphQLError `json:"errors"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("failed to parse description edits page %d: %w", page, err)
+		}
+		if len(result.Errors) > 0 {
+			return nil, fmt.Errorf("GraphQL error fetching description edits: %s", result.Errors[0].Message)
+		}
+		if result.Data.Repository == nil || result.Data.Repository.PullRequest == nil {
+			return nil, fmt.Errorf("description edits: pull request %s/%s#%d not found", owner, repo, number)
+		}
+
+		conn := result.Data.Repository.PullRequest.UserContentEdits
+		reached := false
+		for _, n := range conn.Nodes {
+			e := DescriptionEdit{EditedAt: n.EditedAt, Body: n.Diff}
+			if n.Editor != nil {
+				e.Editor = *n.Editor
+			}
+			edits = append(edits, e)
+			if n.EditedAt <= stopAt {
+				reached = true
+			}
+		}
+		if reached || !conn.PageInfo.HasNextPage {
+			break
+		}
+		cursor := conn.PageInfo.EndCursor
+		after = &cursor
+	}
+	return edits, nil
 }
 
 // authorType converts GitHub's __typename into "user" or "bot".

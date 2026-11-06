@@ -3,9 +3,14 @@ package github
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mturley/watcher"
@@ -1009,7 +1014,7 @@ func TestBuildPRStateJSON_Author(t *testing.T) {
 		UpdatedAt:  "2024-01-01T00:00:00Z",
 	}
 
-	stateJSON := buildPRStateJSON(prData, "")
+	stateJSON := buildPRStateJSON(prData, "", "")
 
 	var state map[string]interface{}
 	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
@@ -1239,11 +1244,11 @@ func TestParsePRNode_ReviewDecision(t *testing.T) {
 }
 
 func TestBuildPRStateJSONRequestedReviewers(t *testing.T) {
-	got := buildPRStateJSON(PRData{RequestedReviewerIDs: []string{"123", "456"}}, "")
+	got := buildPRStateJSON(PRData{RequestedReviewerIDs: []string{"123", "456"}}, "", "")
 	if !strings.Contains(got, `"requested_reviewer_ids":["123","456"]`) {
 		t.Errorf("missing requested ids: %s", got)
 	}
-	got = buildPRStateJSON(PRData{}, "")
+	got = buildPRStateJSON(PRData{}, "", "")
 	if !strings.Contains(got, `"requested_reviewer_ids":[]`) {
 		t.Errorf("nil should marshal as []: %s", got)
 	}
@@ -1289,7 +1294,7 @@ func TestResolveMergeable(t *testing.T) {
 
 func TestBuildPRStateJSON_Mergeable(t *testing.T) {
 	var m map[string]interface{}
-	if err := json.Unmarshal([]byte(buildPRStateJSON(PRData{Commits: CommitInfo{LatestSHA: "sha2"}}, "CONFLICTING")), &m); err != nil {
+	if err := json.Unmarshal([]byte(buildPRStateJSON(PRData{Commits: CommitInfo{LatestSHA: "sha2"}}, "CONFLICTING", "")), &m); err != nil {
 		t.Fatal(err)
 	}
 	if m["mergeable"] != "CONFLICTING" || m["mergeable_sha"] != "sha2" {
@@ -1536,5 +1541,379 @@ func TestNeedsRebaseTitle(t *testing.T) {
 	}
 	if got := needsRebaseTitle(123, nrSHA1); got != nrTitle1 {
 		t.Errorf("long sha: %q", got)
+	}
+}
+
+// --- pr_description_changed ---------------------------------------------
+
+var descResource = watcher.Resource{
+	Type: "pr",
+	ID:   "o/r#1",
+	URL:  "https://github.com/o/r/pull/1",
+}
+
+// descVersion is one synthetic userContentEdits node. A nil body is a
+// version whose history entry was deleted (GitHub returns diff: null).
+type descVersion struct {
+	editedAt string
+	body     *string
+	editor   string // GraphQL editor JSON, or "null"
+}
+
+func strp(s string) *string { return &s }
+
+const (
+	descUser = `{"__typename":"User","login":"alice","databaseId":101}`
+	descBot  = `{"__typename":"Bot","login":"helper-bot","databaseId":202}`
+)
+
+// descVersions returns V0 (original) … V(n-1), oldest first, an hour apart
+// starting at 08:00, each with body "body vN".
+func descVersions(n int) []descVersion {
+	var vs []descVersion
+	for i := 0; i < n; i++ {
+		vs = append(vs, descVersion{
+			editedAt: fmt.Sprintf("2026-06-17T%02d:00:00Z", 8+i),
+			body:     strp(fmt.Sprintf("body v%d", i)),
+			editor:   descUser,
+		})
+	}
+	return vs
+}
+
+// descServer serves pullRequest.userContentEdits newest first, pageSize
+// nodes per page (ignoring the requested page size), from versions given
+// oldest first. status != 200 fails every request. It counts requests.
+type descServer struct {
+	srv      *httptest.Server
+	requests atomic.Int32
+}
+
+func newDescServer(t *testing.T, versions []descVersion, pageSize int, status int) *descServer {
+	t.Helper()
+	ds := &descServer{}
+	newest := make([]descVersion, len(versions))
+	for i, v := range versions {
+		newest[len(versions)-1-i] = v
+	}
+	ds.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ds.requests.Add(1)
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			io.WriteString(w, "boom")
+			return
+		}
+		var req struct {
+			Query     string                 `json:"query"`
+			Variables map[string]interface{} `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if !strings.Contains(req.Query, "userContentEdits") {
+			t.Errorf("unexpected query: %s", req.Query)
+		}
+		start := 0
+		if after, _ := req.Variables["after"].(string); after != "" {
+			fmt.Sscanf(after, "c%d", &start)
+		}
+		end := start + pageSize
+		if end > len(newest) {
+			end = len(newest)
+		}
+		var nodes []string
+		for _, v := range newest[start:end] {
+			diff := "null"
+			if v.body != nil {
+				b, _ := json.Marshal(*v.body)
+				diff = string(b)
+			}
+			nodes = append(nodes, fmt.Sprintf(`{"editedAt":%q,"diff":%s,"editor":%s}`, v.editedAt, diff, v.editor))
+		}
+		fmt.Fprintf(w, `{"data":{"repository":{"pullRequest":{"userContentEdits":{"pageInfo":{"hasNextPage":%t,"endCursor":"c%d"},"nodes":[%s]}}}}}`,
+			end < len(newest), end, strings.Join(nodes, ","))
+	}))
+	t.Cleanup(ds.srv.Close)
+	return ds
+}
+
+// descSeed subscribes descResource and sets the cursor to cursor via a
+// first (watch_started) poll.
+func descSeed(t *testing.T, cursor string) *sql.DB {
+	t.Helper()
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", descResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if cursor != "" {
+		descPollOpts(t, conn, "http://127.0.0.1:1", cursor, "", false, PollOptions{})
+	}
+	return conn
+}
+
+func descPollOpts(t *testing.T, conn *sql.DB, url, updatedAt, lastEditedAt string, backfill bool, opts PollOptions) {
+	t.Helper()
+	prData := PRData{
+		Number: 1, Owner: "o", Repo: "r", State: "OPEN", Title: "T",
+		CreatedAt: "2026-06-17T08:00:00Z", UpdatedAt: updatedAt, LastEditedAt: lastEditedAt,
+	}
+	if _, err := processPRWith(conn, defaultGHHTTP(url), prData, descResource, "tok", backfill, testLogger(), opts); err != nil {
+		t.Fatalf("processPRWith: %v", err)
+	}
+}
+
+func descPoll(t *testing.T, conn *sql.DB, url, lastEditedAt string) {
+	t.Helper()
+	descPollOpts(t, conn, url, "2026-06-17T23:00:00Z", lastEditedAt, false, PollOptions{})
+}
+
+func descEvents(t *testing.T, conn *sql.DB) []watcher.Event {
+	t.Helper()
+	events, err := db.EventsForResource(conn, "pr", descResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	var out []watcher.Event
+	for _, e := range events {
+		if e.Type == watcher.EventTypePRDescChanged {
+			out = append(out, e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return *out[i].ExternalTS < *out[j].ExternalTS })
+	return out
+}
+
+func descEditedAtState(t *testing.T, conn *sql.DB) string {
+	t.Helper()
+	rs, err := db.GetResourceState(conn, "pr", descResource.ID)
+	if err != nil || rs == nil {
+		t.Fatalf("GetResourceState: %v (nil=%v)", err, rs == nil)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(rs.StateJSON), &m); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := m["description_edited_at"].(string)
+	return s
+}
+
+func descTextChange(t *testing.T, conn *sql.DB, e watcher.Event) *watcher.TextChange {
+	t.Helper()
+	tc, err := db.EventTextChange(conn, e.ID)
+	if err != nil {
+		t.Fatalf("EventTextChange: %v", err)
+	}
+	return tc
+}
+
+func TestDescriptionEdits_PagesAndPairing(t *testing.T) {
+	vs := descVersions(5)
+	conn := descSeed(t, "2026-06-17T09:30:00Z") // between V1 and V2
+	ds := newDescServer(t, vs, 2, http.StatusOK)
+
+	descPoll(t, conn, ds.srv.URL, vs[4].editedAt)
+
+	// Pages: [V4 V3] [V2 V1] [V0]. V1 is at or before the cursor, so the
+	// third page is never requested.
+	if got := ds.requests.Load(); got != 2 {
+		t.Errorf("requests = %d, want 2", got)
+	}
+	evs := descEvents(t, conn)
+	if len(evs) != 3 {
+		t.Fatalf("got %d events, want 3", len(evs))
+	}
+	for k, e := range evs {
+		i := k + 2
+		if *e.ExternalTS != vs[i].editedAt {
+			t.Errorf("event %d external_ts = %q, want %q", k, *e.ExternalTS, vs[i].editedAt)
+		}
+		if e.Title != "o/r#1 description changed" {
+			t.Errorf("title = %q", e.Title)
+		}
+		if e.Body != nil {
+			t.Errorf("body = %q, want nil", *e.Body)
+		}
+		if e.Author == nil || *e.Author != "alice" || e.AuthorType == nil || *e.AuthorType != "user" || e.AuthorID == nil || *e.AuthorID != "101" {
+			t.Errorf("author = %v/%v/%v", e.Author, e.AuthorType, e.AuthorID)
+		}
+		tc := descTextChange(t, conn, e)
+		want := watcher.TextChange{Old: *vs[i-1].body, New: *vs[i].body}
+		if tc == nil || *tc != want {
+			t.Errorf("event %d text change = %+v, want %+v", k, tc, want)
+		}
+	}
+	if got := descEditedAtState(t, conn); got != vs[4].editedAt {
+		t.Errorf("description_edited_at = %q, want %q", got, vs[4].editedAt)
+	}
+}
+
+func TestDescriptionEdits_OriginalNeverEmitted(t *testing.T) {
+	vs := descVersions(3)
+	conn := descSeed(t, "")
+	ds := newDescServer(t, vs, 50, http.StatusOK)
+
+	descPollOpts(t, conn, ds.srv.URL, "2026-06-17T23:00:00Z", vs[2].editedAt, true, PollOptions{})
+
+	evs := descEvents(t, conn)
+	if len(evs) != 2 {
+		t.Fatalf("got %d events, want 2", len(evs))
+	}
+	for _, e := range evs {
+		if *e.ExternalTS == vs[0].editedAt {
+			t.Errorf("emitted an event for the original body")
+		}
+	}
+}
+
+func TestDescriptionEdits_OnlyWhenLastEditedAtMoves(t *testing.T) {
+	vs := descVersions(2)
+	conn := descSeed(t, "2026-06-17T08:30:00Z")
+	ds := newDescServer(t, vs, 50, http.StatusOK)
+
+	descPoll(t, conn, ds.srv.URL, vs[1].editedAt)
+	if got := ds.requests.Load(); got != 1 {
+		t.Fatalf("first poll requests = %d, want 1", got)
+	}
+	descPoll(t, conn, ds.srv.URL, vs[1].editedAt)
+	if got := ds.requests.Load(); got != 1 {
+		t.Errorf("unchanged lastEditedAt made %d more requests", got-1)
+	}
+	if n := len(descEvents(t, conn)); n != 1 {
+		t.Errorf("got %d events, want 1", n)
+	}
+}
+
+func TestDescriptionEdits_NeverEditedMakesNoQuery(t *testing.T) {
+	conn := descSeed(t, "2026-06-17T08:30:00Z")
+	ds := newDescServer(t, nil, 50, http.StatusOK)
+
+	descPoll(t, conn, ds.srv.URL, "")
+	if got := ds.requests.Load(); got != 0 {
+		t.Errorf("requests = %d, want 0", got)
+	}
+}
+
+func TestDescriptionEdits_FailureDoesNotAdvance(t *testing.T) {
+	vs := descVersions(2)
+	conn := descSeed(t, "2026-06-17T08:30:00Z")
+	failing := newDescServer(t, vs, 50, http.StatusInternalServerError)
+
+	descPoll(t, conn, failing.srv.URL, vs[1].editedAt)
+	if n := len(descEvents(t, conn)); n != 0 {
+		t.Errorf("got %d events after failure, want 0", n)
+	}
+	if got := descEditedAtState(t, conn); got != "" {
+		t.Errorf("description_edited_at = %q after failure, want unchanged \"\"", got)
+	}
+
+	ok := newDescServer(t, vs, 50, http.StatusOK)
+	descPoll(t, conn, ok.srv.URL, vs[1].editedAt)
+	if got := ok.requests.Load(); got != 1 {
+		t.Errorf("retry requests = %d, want 1", got)
+	}
+	if n := len(descEvents(t, conn)); n != 1 {
+		t.Errorf("got %d events after retry, want 1", n)
+	}
+	if got := descEditedAtState(t, conn); got != vs[1].editedAt {
+		t.Errorf("description_edited_at = %q, want %q", got, vs[1].editedAt)
+	}
+}
+
+func TestDescriptionEdits_LineEndingsOnly(t *testing.T) {
+	vs := descVersions(2)
+	vs[0].body = strp("line one\nline two")
+	vs[1].body = strp("line one\r\nline two")
+	conn := descSeed(t, "2026-06-17T08:30:00Z")
+	ds := newDescServer(t, vs, 50, http.StatusOK)
+
+	descPoll(t, conn, ds.srv.URL, vs[1].editedAt)
+	if n := len(descEvents(t, conn)); n != 0 {
+		t.Errorf("got %d events for a line-ending-only edit, want 0", n)
+	}
+}
+
+func TestDescriptionEdits_NullDiff(t *testing.T) {
+	vs := descVersions(2)
+	vs[0].body = nil
+	conn := descSeed(t, "2026-06-17T08:30:00Z")
+	ds := newDescServer(t, vs, 50, http.StatusOK)
+
+	descPoll(t, conn, ds.srv.URL, vs[1].editedAt)
+	evs := descEvents(t, conn)
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1", len(evs))
+	}
+	if tc := descTextChange(t, conn, evs[0]); tc != nil {
+		t.Errorf("text change = %+v, want nil", tc)
+	}
+}
+
+func TestDescriptionEdits_NullEditor(t *testing.T) {
+	vs := descVersions(2)
+	vs[1].editor = "null"
+	conn := descSeed(t, "2026-06-17T08:30:00Z")
+	ds := newDescServer(t, vs, 50, http.StatusOK)
+
+	descPoll(t, conn, ds.srv.URL, vs[1].editedAt)
+	evs := descEvents(t, conn)
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1", len(evs))
+	}
+	e := evs[0]
+	if (e.Author != nil && *e.Author != "") || e.AuthorType == nil || *e.AuthorType != "user" || e.AuthorID != nil {
+		t.Errorf("author = %v/%v/%v, want empty/user/nil", e.Author, e.AuthorType, e.AuthorID)
+	}
+}
+
+func TestDescriptionEdits_BotAuthor(t *testing.T) {
+	vs := descVersions(2)
+	vs[1].editor = descBot
+
+	t.Run("kept by default", func(t *testing.T) {
+		conn := descSeed(t, "2026-06-17T08:30:00Z")
+		ds := newDescServer(t, vs, 50, http.StatusOK)
+		descPoll(t, conn, ds.srv.URL, vs[1].editedAt)
+		evs := descEvents(t, conn)
+		if len(evs) != 1 {
+			t.Fatalf("got %d events, want 1", len(evs))
+		}
+		e := evs[0]
+		if e.Author == nil || *e.Author != "helper-bot" || e.AuthorType == nil || *e.AuthorType != "bot" || e.AuthorID == nil || *e.AuthorID != "202" {
+			t.Errorf("author = %v/%v/%v", e.Author, e.AuthorType, e.AuthorID)
+		}
+	})
+
+	t.Run("dropped on request", func(t *testing.T) {
+		conn := descSeed(t, "2026-06-17T08:30:00Z")
+		ds := newDescServer(t, vs, 50, http.StatusOK)
+		descPollOpts(t, conn, ds.srv.URL, "2026-06-17T23:00:00Z", vs[1].editedAt, false, PollOptions{DropBotDescriptionEdits: true})
+		if n := len(descEvents(t, conn)); n != 0 {
+			t.Errorf("got %d events, want 0", n)
+		}
+		if got := descEditedAtState(t, conn); got != vs[1].editedAt {
+			t.Errorf("description_edited_at = %q, want %q", got, vs[1].editedAt)
+		}
+	})
+}
+
+func TestDescriptionEdits_Dedup(t *testing.T) {
+	vs := descVersions(3)
+	conn := descSeed(t, "2026-06-17T08:30:00Z")
+	ds := newDescServer(t, vs, 50, http.StatusOK)
+	prData := PRData{Number: 1, Owner: "o", Repo: "r", LastEditedAt: vs[2].editedAt}
+
+	// Run the same edit processing twice against the same (stale) cursor, so
+	// the second run sees the same edits as new and only dedup stops them.
+	for run, want := range []int{2, 0} {
+		n, err := processDescriptionEdits(conn, defaultGHHTTP(ds.srv.URL), prData, descResource, "tok", "2026-06-17T08:30:00Z", PollOptions{}, testLogger())
+		if err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+		if n != want {
+			t.Errorf("run %d emitted %d events, want %d", run, n, want)
+		}
+	}
+	if n := len(descEvents(t, conn)); n != 2 {
+		t.Errorf("got %d events, want 2", n)
 	}
 }
