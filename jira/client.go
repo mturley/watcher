@@ -104,6 +104,19 @@ func normalizeBaseURL(host string) string {
 // expand=changelog silently caps at the 100 most recent entries, dropping the
 // oldest history on active issues.
 func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (*IssueData, error) {
+	issue, err := c.FetchIssueFields(issueKey, customFieldIDs)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.FetchIssueHistory(issueKey, issue); err != nil {
+		return nil, err
+	}
+	return issue, nil
+}
+
+// FetchIssueFields fetches only the issue's fields (one request). Comments
+// and Changelog are left nil; FetchIssueHistory fills them.
+func (c *Client) FetchIssueFields(issueKey string, customFieldIDs map[string]string) (*IssueData, error) {
 	fields := "summary,status,assignee,reporter,labels,priority,issuetype,created,updated"
 	for _, fieldID := range customFieldIDs {
 		fields += "," + fieldID
@@ -196,21 +209,24 @@ func (c *Client) FetchIssue(issueKey string, customFieldIDs map[string]string) (
 		}
 	}
 
-	// Fetch all comments (paginated).
+	return issue, nil
+}
+
+// FetchIssueHistory fills issue.Comments and issue.Changelog from their
+// paginated endpoints.
+func (c *Client) FetchIssueHistory(issueKey string, issue *IssueData) error {
 	comments, err := c.fetchComments(issueKey)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	issue.Comments = comments
 
-	// Fetch the full, paginated changelog.
 	changelog, err := c.fetchChangelog(issueKey)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	issue.Changelog = changelog
-
-	return issue, nil
+	return nil
 }
 
 // FetchPriorityOrder returns the priority ranking (0 = highest) in the order

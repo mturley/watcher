@@ -70,7 +70,16 @@ func Poll(conn *sql.DB, cfg JiraAuth, resources []watcher.Resource, logger *log.
 		client.Ctx = ctx
 
 		logger.Printf("Fetching issue %s...", issueKey)
-		issueData, err := client.FetchIssue(issueKey, customFields)
+		issueData, err := client.FetchIssueFields(issueKey, customFields)
+		if err == nil {
+			// Jira bumps fields.updated on every changelog entry and comment,
+			// so an unchanged value means there is no new history to fetch.
+			if needsHistory(conn, issueData, resource) {
+				err = client.FetchIssueHistory(issueKey, issueData)
+			} else {
+				logger.Printf("Issue %s unchanged since last poll; skipping history", issueKey)
+			}
+		}
 		if err != nil {
 			logger.Printf("ERROR: failed to fetch issue %s: %v", issueKey, err)
 			errBody := polllog.SanitizeMessage(fmt.Sprintf("Failed to fetch issue: %v", err))
@@ -127,6 +136,24 @@ func Poll(conn *sql.DB, cfg JiraAuth, resources []watcher.Resource, logger *log.
 		logger.Printf("ERROR: failed to record poller success: %v", err)
 	}
 	return nil
+}
+
+// needsHistory reports whether the changelog and comments must be fetched.
+// They can be skipped only when a saved state exists, the issue's updated
+// timestamp equals the saved one, and events already exist (non-empty cursor).
+func needsHistory(conn *sql.DB, issue *IssueData, r watcher.Resource) bool {
+	if issue.UpdatedAt == "" {
+		return true
+	}
+	state, err := db.GetResourceState(conn, "jira", r.ID)
+	if err != nil || state == nil || state.ResourceUpdatedAt != issue.UpdatedAt {
+		return true
+	}
+	cursor, err := db.EventCursor(conn, "jira", r.Type, r.ID)
+	if err != nil || cursor == "" {
+		return true
+	}
+	return false
 }
 
 // emitEvent inserts a watcher event for the given resource, setting the

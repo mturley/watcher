@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mturley/watcher"
 	"github.com/mturley/watcher/db"
@@ -834,5 +835,181 @@ func TestProcessIssue_DropBotDescriptionEdits(t *testing.T) {
 	_, evs = descEvents(t, cfg, bot)
 	if len(evs) != 1 || evs[0].AuthorType == nil || *evs[0].AuthorType != "bot" {
 		t.Errorf("expected 1 bot-authored event with drop off, got %+v", evs)
+	}
+}
+
+// pollFixture serves one issue whose updated stamp, comments and changelog
+// the test can change between polls, counting hits per path.
+type pollFixture struct {
+	srv       *httptest.Server
+	updated   string
+	comments  []map[string]interface{}
+	histories []map[string]interface{}
+	epic      string
+	hits      map[string]int
+}
+
+func newPollFixture(t *testing.T) *pollFixture {
+	f := &pollFixture{hits: map[string]int{}, updated: "2026-06-17T08:00:00.000+0000"}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.hits[r.URL.Path]++
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/rest/api/3/issue/RHOAIENG-123":
+			fields := map[string]interface{}{
+				"summary": "Poll Issue", "status": map[string]interface{}{"name": "Open"},
+				"created": "2026-06-01T08:00:00.000+0000", "updated": f.updated,
+			}
+			if f.epic != "" {
+				fields["customfield_epic"] = f.epic
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{"key": "RHOAIENG-123", "fields": fields})
+		case "/rest/api/3/issue/RHOAIENG-123/changelog":
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"startAt": 0, "maxResults": 100, "total": len(f.histories), "isLast": true, "values": f.histories,
+			})
+		case "/rest/api/3/issue/RHOAIENG-123/comment":
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"startAt": 0, "maxResults": 100, "total": len(f.comments), "comments": f.comments,
+			})
+		default:
+			w.Write([]byte(`{"fields":{}}`))
+		}
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *pollFixture) historyHits() int {
+	return f.hits["/rest/api/3/issue/RHOAIENG-123/changelog"] + f.hits["/rest/api/3/issue/RHOAIENG-123/comment"]
+}
+
+func (f *pollFixture) poll(t *testing.T, conn *sql.DB) {
+	t.Helper()
+	cfg := JiraAuth{URL: f.srv.URL, Email: "e@x.com", Token: "t", CustomFields: map[string]string{"epic_key": "customfield_epic"}}
+	if err := Poll(conn, cfg, []watcher.Resource{jiraResource}, testLogger()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+}
+
+func pollEventCount(t *testing.T, conn *sql.DB, typ watcher.EventType) int {
+	t.Helper()
+	var n int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM watcher_events WHERE source='jira' AND type=?`, string(typ)).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func pollFixtureDB(t *testing.T) *sql.DB {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	return conn
+}
+
+func TestPoll_SkipsHistoryOnlyWhenUpdatedUnchanged(t *testing.T) {
+	const later = "2026-06-18T08:00:00.000+0000"
+	cases := []struct {
+		name         string
+		mutate       func(f *pollFixture)
+		wantHistory  bool
+		wantComments int
+		wantDesc     int
+	}{
+		{"unchanged", func(f *pollFixture) {}, false, 0, 0},
+		{"new comment", func(f *pollFixture) {
+			f.updated = later
+			f.comments = []map[string]interface{}{{
+				"author": map[string]interface{}{"displayName": "Jane"}, "created": later, "updated": later,
+				"body": "hello",
+			}}
+		}, true, 1, 0},
+		{"description change", func(f *pollFixture) {
+			f.updated = later
+			f.histories = []map[string]interface{}{{
+				"id": "1", "created": later, "author": map[string]interface{}{"displayName": "Jane"},
+				"items": []map[string]interface{}{{"field": "description", "fromString": "a", "toString": "b"}},
+			}}
+		}, true, 0, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := pollFixtureDB(t)
+			f := newPollFixture(t)
+			f.poll(t, conn) // first poll: full fetch, watch_started
+			if f.historyHits() == 0 {
+				t.Fatal("first poll should fetch history")
+			}
+			before, err := db.GetResourceState(conn, "jira", "RHOAIENG-123")
+			if err != nil || before == nil {
+				t.Fatalf("state after first poll: %v %v", before, err)
+			}
+			f.hits = map[string]int{}
+			time.Sleep(1100 * time.Millisecond) // RFC3339 stamps have 1s resolution
+			tc.mutate(f)
+			f.poll(t, conn)
+
+			if got := f.historyHits() > 0; got != tc.wantHistory {
+				t.Errorf("history fetched = %v, want %v (hits %v)", got, tc.wantHistory, f.hits)
+			}
+			if n := pollEventCount(t, conn, watcher.EventTypeJiraComment); n != tc.wantComments {
+				t.Errorf("jira_comment events = %d, want %d", n, tc.wantComments)
+			}
+			if n := pollEventCount(t, conn, watcher.EventTypeJiraDescChanged); n != tc.wantDesc {
+				t.Errorf("description events = %d, want %d", n, tc.wantDesc)
+			}
+			after, _ := db.GetResourceState(conn, "jira", "RHOAIENG-123")
+			if after.WatcherUpdatedAt <= before.WatcherUpdatedAt {
+				t.Errorf("resource state not rewritten: %s -> %s", before.WatcherUpdatedAt, after.WatcherUpdatedAt)
+			}
+		})
+	}
+}
+
+func TestPoll_FullFetchWithoutSavedState(t *testing.T) {
+	conn := pollFixtureDB(t)
+	f := newPollFixture(t)
+	f.poll(t, conn)
+	if err := db.DeleteResourceState(conn, "jira", "RHOAIENG-123"); err != nil {
+		t.Fatal(err)
+	}
+	f.hits = map[string]int{}
+	f.poll(t, conn)
+	if f.historyHits() == 0 {
+		t.Errorf("expected a full fetch without saved state, hits %v", f.hits)
+	}
+}
+
+func TestPoll_FullFetchOnFirstPoll(t *testing.T) {
+	conn := pollFixtureDB(t)
+	f := newPollFixture(t)
+	f.poll(t, conn)
+	if f.historyHits() == 0 {
+		t.Errorf("expected history fetch on first poll, hits %v", f.hits)
+	}
+	if n := pollEventCount(t, conn, watcher.EventTypeWatchStarted); n != 1 {
+		t.Errorf("watch_started events = %d, want 1", n)
+	}
+}
+
+func TestPoll_SkippedIssueStillLinksEpic(t *testing.T) {
+	conn := pollFixtureDB(t)
+	f := newPollFixture(t)
+	f.poll(t, conn)
+	if _, err := conn.Exec(`DELETE FROM watcher_resource_relationships`); err != nil {
+		t.Fatal(err)
+	}
+	f.epic = "RHOAIENG-100"
+	f.hits = map[string]int{}
+	f.poll(t, conn)
+	if f.historyHits() != 0 {
+		t.Fatalf("history should be skipped, hits %v", f.hits)
+	}
+	var n int
+	conn.QueryRow(`SELECT COUNT(*) FROM watcher_resource_relationships WHERE child_id='RHOAIENG-123' AND parent_id='RHOAIENG-100'`).Scan(&n)
+	if n != 1 {
+		t.Errorf("epic relationship rows = %d, want 1", n)
 	}
 }
