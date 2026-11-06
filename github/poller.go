@@ -609,8 +609,11 @@ skipCIBundle:
 			// harmless. Only the immediately-previous SHA is known here (same
 			// limitation as new-commit detection), so commits skipped between
 			// polls are not marked.
-			if err := db.MarkCIBundlesOutOfDate(conn, prevSHA, resource); err != nil {
-				logger.Printf("WARNING: failed to mark CI bundles out of date for %s @ %s: %v", resource.ID, prevSHA, err)
+			// A needs-rebase event for that commit is superseded the same way.
+			staleTypes := append(append([]watcher.EventType{}, db.CICheckBundleTypes...), db.CIWorkflowBundleTypes...)
+			staleTypes = append(staleTypes, watcher.EventTypePRNeedsRebase)
+			if err := db.MarkOutOfDate(conn, prevSHA, resource, staleTypes); err != nil {
+				logger.Printf("WARNING: failed to mark CI bundles and needs-rebase out of date for %s @ %s: %v", resource.ID, prevSHA, err)
 			}
 
 			dup, err := db.IsDuplicate(conn, db.DedupCheck{
@@ -642,8 +645,53 @@ skipCIBundle:
 		}
 	}
 
+	// Needs rebase. mergeable is this poll's answer for the current head
+	// ("" while GitHub is still computing it for a new head).
+	mergeable := resolveMergeable(prevStateMap, prData)
+	headSHA := prData.Commits.LatestSHA
+	prevMergeable, _ := prevStateMap["mergeable"].(string)
+	prevMergeableSHA, _ := prevStateMap["mergeable_sha"].(string)
+
+	// Conflicts gone without a push (e.g. the conflicting change was reverted
+	// on the base branch): flag the head's
+	// needs-rebase event out of date. A push is handled above, by marking the
+	// previous commit's event.
+	if headSHA != "" && prevMergeable == "CONFLICTING" && prevMergeableSHA == headSHA && mergeable == "MERGEABLE" {
+		if err := db.MarkOutOfDate(conn, headSHA, resource, []watcher.EventType{watcher.EventTypePRNeedsRebase}); err != nil {
+			logger.Printf("WARNING: failed to mark needs-rebase out of date for %s @ %s: %v", resource.ID, headSHA, err)
+		}
+	}
+
+	// One event per conflicting spell at a head. Dedup on the title only: once
+	// the event is marked out of date its title no longer matches, so the head
+	// conflicting again emits a fresh event.
+	if strings.EqualFold(prData.State, "OPEN") && headSHA != "" && mergeable == "CONFLICTING" {
+		title := needsRebaseTitle(prData.Number, headSHA)
+		dup, err := db.IsDuplicate(conn, db.DedupCheck{
+			Source:       "github",
+			ResourceType: resource.Type,
+			ResourceID:   resource.ID,
+			Type:         watcher.EventTypePRNeedsRebase,
+			Title:        &title,
+		})
+		if err != nil {
+			logger.Printf("WARNING: failed to check needs-rebase duplicate: %v", err)
+		} else if !dup {
+			body := fmt.Sprintf("PR #%d: %s", prData.Number, prData.Title)
+			tag := "commit:" + headSHA
+			// external_ts is the head commit's date, never poll time, so this
+			// event cannot advance the cursor past real activity.
+			if err := emitEvent(conn, watcher.EventTypePRNeedsRebase, title, &body, prData.Commits.LatestDate, nil, nil, nil, &tag, resource); err != nil {
+				logger.Printf("WARNING: failed to emit needs-rebase event: %v", err)
+			} else {
+				eventCount++
+				logger.Printf("Emitted pr_needs_rebase for %s @ %s", resource.ID, headSHA)
+			}
+		}
+	}
+
 	// Write resource state
-	stateJSON := buildPRStateJSON(prData, resolveMergeable(prevStateMap, prData))
+	stateJSON := buildPRStateJSON(prData, mergeable)
 	now := time.Now().UTC().Format(time.RFC3339)
 	if err := db.UpsertResourceState(conn, "pr", resource.ID, stateJSON, prData.UpdatedAt, now); err != nil {
 		logger.Printf("WARNING: failed to upsert resource state for %s: %v", resource.ID, err)
@@ -901,4 +949,13 @@ func commonCommitAuthor(cs []CommitEntry) (login, id string, ok bool) {
 		}
 	}
 	return cs[0].AuthorLogin, cs[0].AuthorID, true
+}
+
+// needsRebaseTitle is the pr_needs_rebase event title for a PR's head commit:
+// the SHA shortened to 7 characters, as GitHub displays it.
+func needsRebaseTitle(number int, sha string) string {
+	if len(sha) > 7 {
+		sha = sha[:7]
+	}
+	return fmt.Sprintf("Needs rebase: PR #%d @ %s", number, sha)
 }

@@ -1296,3 +1296,245 @@ func TestBuildPRStateJSON_Mergeable(t *testing.T) {
 		t.Errorf("got mergeable=%v mergeable_sha=%v", m["mergeable"], m["mergeable_sha"])
 	}
 }
+
+// needsRebaseSeed subscribes prResource and seeds the event cursor with a
+// first (watch_started) poll, so later polls process normally.
+func needsRebaseSeed(t *testing.T) *sql.DB {
+	t.Helper()
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", prResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if _, err := processPR(conn, PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: "OPEN", Title: "Test PR",
+		UpdatedAt: "2026-06-17T07:00:00Z",
+	}, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("seed processPR: %v", err)
+	}
+	return conn
+}
+
+const (
+	nrSHA1  = "85a4638deadbeef"
+	nrSHA2  = "99b7777cafef00d"
+	nrDate1 = "2026-06-17T08:00:00Z"
+	nrDate2 = "2026-06-17T12:00:00Z"
+)
+
+// needsRebasePoll runs one poll of an OPEN PR at the given head and mergeable.
+func needsRebasePoll(t *testing.T, conn *sql.DB, state, sha, date, mergeable, updatedAt string) {
+	t.Helper()
+	if _, err := processPR(conn, PRData{
+		Number: 123, Owner: "owner", Repo: "repo", State: state, Title: "Test PR",
+		UpdatedAt: updatedAt,
+		Mergeable: mergeable,
+		Commits:   CommitInfo{LatestSHA: sha, LatestDate: date},
+	}, prResource, "test-token", false, testLogger()); err != nil {
+		t.Fatalf("processPR: %v", err)
+	}
+}
+
+func needsRebaseEvents(t *testing.T, conn *sql.DB) []watcher.Event {
+	t.Helper()
+	events, err := db.EventsForResource(conn, "pr", prResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	var out []watcher.Event
+	for _, e := range events {
+		if e.Type == watcher.EventTypePRNeedsRebase {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func cachedMergeable(t *testing.T, conn *sql.DB) string {
+	t.Helper()
+	rs, err := db.GetResourceState(conn, "pr", prResource.ID)
+	if err != nil || rs == nil {
+		t.Fatalf("GetResourceState: %v (nil=%v)", err, rs == nil)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(rs.StateJSON), &m); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := m["mergeable"].(string)
+	return s
+}
+
+const (
+	nrTitle1 = "Needs rebase: PR #123 @ 85a4638"
+	nrTitle2 = "Needs rebase: PR #123 @ 99b7777"
+	nrStale  = "[out of date] "
+)
+
+func TestProcessPR_NeedsRebase_Emits(t *testing.T) {
+	conn := needsRebaseSeed(t)
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+
+	evs := needsRebaseEvents(t, conn)
+	if len(evs) != 1 {
+		t.Fatalf("expected 1 pr_needs_rebase, got %d", len(evs))
+	}
+	e := evs[0]
+	if e.Title != nrTitle1 {
+		t.Errorf("title = %q, want %q", e.Title, nrTitle1)
+	}
+	if e.Tags == nil || *e.Tags != "commit:"+nrSHA1 {
+		t.Errorf("tags = %v, want commit:%s", e.Tags, nrSHA1)
+	}
+	if e.ExternalTS == nil || *e.ExternalTS != nrDate1 {
+		t.Errorf("external_ts = %v, want %s", e.ExternalTS, nrDate1)
+	}
+	if e.Author != nil {
+		t.Errorf("author = %q, want nil", *e.Author)
+	}
+	if e.Body == nil || *e.Body != "PR #123: Test PR" {
+		t.Errorf("body = %v", e.Body)
+	}
+}
+
+func TestProcessPR_NeedsRebase_NoRepeatSameHead(t *testing.T) {
+	conn := needsRebaseSeed(t)
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T10:00:00Z")
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T11:00:00Z")
+	if got := len(needsRebaseEvents(t, conn)); got != 1 {
+		t.Errorf("expected 1 pr_needs_rebase, got %d", got)
+	}
+}
+
+func TestProcessPR_NeedsRebase_UnknownIsNoChange(t *testing.T) {
+	conn := needsRebaseSeed(t)
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "UNKNOWN", "2026-06-17T10:00:00Z")
+	evs := needsRebaseEvents(t, conn)
+	if len(evs) != 1 {
+		t.Fatalf("expected 1 pr_needs_rebase, got %d", len(evs))
+	}
+	if evs[0].Title != nrTitle1 {
+		t.Errorf("title = %q, want un-prefixed %q", evs[0].Title, nrTitle1)
+	}
+	if got := cachedMergeable(t, conn); got != "CONFLICTING" {
+		t.Errorf("cached mergeable = %q, want CONFLICTING", got)
+	}
+}
+
+func TestProcessPR_NeedsRebase_ClearedMarksOutOfDate(t *testing.T) {
+	conn := needsRebaseSeed(t)
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+	before := needsRebaseEvents(t, conn)
+	if len(before) != 1 {
+		t.Fatalf("expected 1 pr_needs_rebase, got %d", len(before))
+	}
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "MERGEABLE", "2026-06-17T10:00:00Z")
+	evs := needsRebaseEvents(t, conn)
+	if len(evs) != 1 {
+		t.Fatalf("expected 1 pr_needs_rebase, got %d", len(evs))
+	}
+	if want := nrStale + nrTitle1; evs[0].Title != want {
+		t.Errorf("title = %q, want %q", evs[0].Title, want)
+	}
+	if evs[0].TS != before[0].TS {
+		t.Errorf("ts changed: %q -> %q", before[0].TS, evs[0].TS)
+	}
+}
+
+func TestProcessPR_NeedsRebase_PushThenUnknown(t *testing.T) {
+	conn := needsRebaseSeed(t)
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+	needsRebasePoll(t, conn, "OPEN", nrSHA2, nrDate2, "UNKNOWN", "2026-06-17T13:00:00Z")
+	evs := needsRebaseEvents(t, conn)
+	if len(evs) != 1 {
+		t.Fatalf("expected only the sha1 pr_needs_rebase, got %d", len(evs))
+	}
+	if want := nrStale + nrTitle1; evs[0].Title != want {
+		t.Errorf("title = %q, want %q", evs[0].Title, want)
+	}
+	if got := cachedMergeable(t, conn); got != "" {
+		t.Errorf("cached mergeable = %q, want empty", got)
+	}
+}
+
+func TestProcessPR_NeedsRebase_PushStillConflicting(t *testing.T) {
+	conn := needsRebaseSeed(t)
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+	needsRebasePoll(t, conn, "OPEN", nrSHA2, nrDate2, "CONFLICTING", "2026-06-17T13:00:00Z")
+	evs := needsRebaseEvents(t, conn)
+	if len(evs) != 2 {
+		t.Fatalf("expected 2 pr_needs_rebase, got %d", len(evs))
+	}
+	titles := map[string]bool{}
+	for _, e := range evs {
+		titles[e.Title] = true
+	}
+	if !titles[nrStale+nrTitle1] || !titles[nrTitle2] {
+		t.Errorf("titles = %v, want %q and %q", titles, nrStale+nrTitle1, nrTitle2)
+	}
+}
+
+func TestProcessPR_NeedsRebase_ReconflictSameHead(t *testing.T) {
+	conn := needsRebaseSeed(t)
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "MERGEABLE", "2026-06-17T10:00:00Z")
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T11:00:00Z")
+	evs := needsRebaseEvents(t, conn)
+	if len(evs) != 2 {
+		t.Fatalf("expected 2 pr_needs_rebase, got %d", len(evs))
+	}
+	var stale, fresh int
+	for _, e := range evs {
+		switch e.Title {
+		case nrStale + nrTitle1:
+			stale++
+		case nrTitle1:
+			fresh++
+		default:
+			t.Errorf("unexpected title %q", e.Title)
+		}
+	}
+	if stale != 1 || fresh != 1 {
+		t.Errorf("stale=%d fresh=%d, want 1 and 1", stale, fresh)
+	}
+}
+
+func TestProcessPR_NeedsRebase_NotOpen(t *testing.T) {
+	conn := needsRebaseSeed(t)
+	needsRebasePoll(t, conn, "MERGED", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+	if got := len(needsRebaseEvents(t, conn)); got != 0 {
+		t.Errorf("expected no pr_needs_rebase, got %d", got)
+	}
+}
+
+func TestProcessPR_NeedsRebase_NoSHA(t *testing.T) {
+	conn := needsRebaseSeed(t)
+	needsRebasePoll(t, conn, "OPEN", "", nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+	if got := len(needsRebaseEvents(t, conn)); got != 0 {
+		t.Errorf("expected no pr_needs_rebase, got %d", got)
+	}
+}
+
+func TestProcessPR_NeedsRebase_DoesNotAdvanceCursor(t *testing.T) {
+	conn := needsRebaseSeed(t) // seed external_ts 07:00, before nrDate1
+	needsRebasePoll(t, conn, "OPEN", nrSHA1, nrDate1, "CONFLICTING", "2026-06-17T09:00:00Z")
+	if got := len(needsRebaseEvents(t, conn)); got != 1 {
+		t.Fatalf("expected 1 pr_needs_rebase, got %d", got)
+	}
+	cursor, err := db.EventCursor(conn, "github", prResource.Type, prResource.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor != nrDate1 {
+		t.Errorf("cursor = %q, want %q (the head commit date, not poll time)", cursor, nrDate1)
+	}
+}
+
+func TestNeedsRebaseTitle(t *testing.T) {
+	if got := needsRebaseTitle(7, "abc"); got != "Needs rebase: PR #7 @ abc" {
+		t.Errorf("short sha: %q", got)
+	}
+	if got := needsRebaseTitle(123, nrSHA1); got != nrTitle1 {
+		t.Errorf("long sha: %q", got)
+	}
+}
