@@ -82,13 +82,31 @@ type SlackCreds struct {
 // behavior config file ("config.yaml"), as distinct from the
 // credentials-holding auth.yaml handled by Config/Load/Save above.
 type ConfigFile struct {
-	Jira *JiraBehavior `yaml:"jira,omitempty"`
+	GitHub *GitHubBehavior `yaml:"github,omitempty"`
+	Jira   *JiraBehavior   `yaml:"jira,omitempty"`
+}
+
+// GitHubBehavior holds non-auth GitHub behavior settings.
+type GitHubBehavior struct {
+	// BotUsernames are glob patterns (see botmatch) for logins to classify
+	// as bots although GitHub reports them as users, e.g. "*ci-bot*".
+	BotUsernames []string `yaml:"bot_usernames,omitempty"`
+}
+
+// GitHubBotUsernames returns the configured GitHub bot patterns, or nil if
+// no GitHub behavior block is configured.
+func (c *ConfigFile) GitHubBotUsernames() []string {
+	if c.GitHub == nil {
+		return nil
+	}
+	return c.GitHub.BotUsernames
 }
 
 // JiraBehavior holds non-auth Jira behavior settings.
 type JiraBehavior struct {
 	// BotUsernames lists Jira usernames to classify as bots when
-	// attributing comment/changelog authors.
+	// attributing comment/changelog authors: glob patterns (see botmatch),
+	// so a name without wildcards is an exact, case-insensitive match.
 	BotUsernames []string `yaml:"bot_usernames,omitempty"`
 	// CustomFields maps friendly names (e.g. "epic_key", "story_points") to
 	// Jira custom field IDs (e.g. "customfield_10014"), letting the poller

@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mturley/watcher"
+	"github.com/mturley/watcher/botmatch"
 	"github.com/mturley/watcher/db"
 	"github.com/mturley/watcher/polllog"
 )
@@ -21,6 +22,9 @@ type PollOptions struct {
 	// DropBotDescriptionEdits skips pr_description_changed events whose
 	// editor is a bot (the edit is still marked processed).
 	DropBotDescriptionEdits bool
+	// BotUsernames are glob patterns (see botmatch) for logins to treat as
+	// bots although GitHub reports them as users, such as a CI account.
+	BotUsernames []string
 }
 
 // Poll polls GitHub for PR updates and emits events. Each resource's
@@ -84,6 +88,9 @@ func pollWith(conn *sql.DB, token string, resources []watcher.Resource, logger *
 	// Fetch PR data
 	logger.Printf("Fetching data for %d PRs...", len(prRefs))
 	prDataList, rateLimit, err := fetchPRs(h, token, prRefs)
+	for i := range prDataList {
+		markBotLogins(&prDataList[i], opts.BotUsernames)
+	}
 	// Capture now: per-PR follow-up calls share these stats and overwrite them.
 	batchStatus, batchMS := stats.Get()
 	if err != nil {
@@ -672,6 +679,9 @@ skipCIBundle:
 				var author, authorType, authorID *string
 				if login, id, ok := commonCommitAuthor(newCommitsSince(prData, prevSHA)); ok {
 					user := "user"
+					if botmatch.Match(opts.BotUsernames, login) {
+						user = "bot"
+					}
 					author, authorType, authorID = &login, &user, &id
 				}
 				if err := emitEvent(conn, watcher.EventTypePRNewCommits, title, &body, prData.Commits.LatestDate, author, authorType, authorID, nil, resource, nil); err != nil {
@@ -759,6 +769,9 @@ func processDescriptionEdits(conn *sql.DB, h ghHTTP, prData PRData, resource wat
 			continue
 		}
 		editorType := authorType(cur.Editor.Typename)
+		if botmatch.Match(opts.BotUsernames, cur.Editor.Login) {
+			editorType = "bot"
+		}
 		if opts.DropBotDescriptionEdits && editorType == "bot" {
 			continue
 		}
@@ -1048,4 +1061,30 @@ func needsRebaseTitle(number int, sha string) string {
 		sha = sha[:7]
 	}
 	return fmt.Sprintf("Needs rebase: PR #%d @ %s", number, sha)
+}
+
+// markBotLogins marks every account in a PR's data whose login matches one of
+// the configured bot patterns as a bot, wherever GitHub called it a user: the
+// author, merger, reviewers and commenters. Events take their author type
+// from these fields, so this is the one place the patterns reach them.
+func markBotLogins(d *PRData, patterns []string) {
+	if len(patterns) == 0 {
+		return
+	}
+	mark := func(login string, t *string) {
+		if botmatch.Match(patterns, login) {
+			*t = "bot"
+		}
+	}
+	mark(d.Author, &d.AuthorType)
+	mark(d.MergedBy, &d.MergedByType)
+	for i := range d.Reviews {
+		mark(d.Reviews[i].Author, &d.Reviews[i].AuthorType)
+	}
+	for i := range d.Comments {
+		mark(d.Comments[i].Author, &d.Comments[i].AuthorType)
+	}
+	for i := range d.ReviewComments {
+		mark(d.ReviewComments[i].Author, &d.ReviewComments[i].AuthorType)
+	}
 }

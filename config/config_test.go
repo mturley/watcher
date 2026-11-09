@@ -289,3 +289,21 @@ func TestUnregisterConsumer(t *testing.T) {
 		t.Errorf("got %v, want only handler", got)
 	}
 }
+
+func TestConfigFileGitHubBotUsernamesRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if got := (&ConfigFile{}).GitHubBotUsernames(); got != nil {
+		t.Fatalf("no github block: got %v, want nil", got)
+	}
+	in := &ConfigFile{GitHub: &GitHubBehavior{BotUsernames: []string{"*ci-bot*"}}}
+	if err := SaveConfig(path, in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out.GitHubBotUsernames(); len(got) != 1 || got[0] != "*ci-bot*" {
+		t.Fatalf("round trip: got %v", got)
+	}
+}

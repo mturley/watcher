@@ -292,6 +292,9 @@ credentials, so it isn't subject to the same permission checks, and a
 missing file simply loads as empty defaults (not an error).
 
 ```yaml
+github:
+  bot_usernames:
+    - "*ci-bot*"
 jira:
   bot_usernames:
     - dependabot
@@ -301,8 +304,17 @@ jira:
     story_points: customfield_10028
 ```
 
-`bot_usernames` lists Jira usernames to classify as bots when
-attributing comment/changelog authors. `custom_fields` maps friendly
+`github.bot_usernames` and `jira.bot_usernames` list accounts to
+classify as bots when attributing events, beyond those the service itself
+reports as bots (GitHub's `Bot` type) — a CI account that GitHub sees as an
+ordinary user, for example. Each entry is a glob over the whole name,
+compared case-insensitively: `*` matches any run of characters and `?` one,
+so `*ci-bot*` matches `rhods-ci-bot`, and a name without wildcards is an
+exact match (`botmatch.Match`). Pass GitHub's to the poller as
+`github.PollOptions.BotUsernames` and Jira's as `jira.JiraAuth.BotUsernames`.
+The pollers classify new events; `db.MarkBotAuthors(conn, source, patterns)`
+re-marks events already stored, for when the list changes (it only marks:
+removing a pattern does not un-mark what it matched). `custom_fields` maps friendly
 names to Jira custom field IDs so the poller can fetch and cache extra
 issue data (epic link, story points, blocked status, etc.). Both are
 configuration rather than credentials, which is why they live here in
@@ -310,6 +322,7 @@ configuration rather than credentials, which is why they live here in
 
 ```go
 cfg, err := config.LoadConfig(config.ConfigDefaultPath())
+ghBots := cfg.GitHubBotUsernames() // []string, or nil if unset
 bots := cfg.JiraBotUsernames()   // []string, or nil if unset
 fields := cfg.JiraCustomFields() // map[string]string, or nil if unset
 ```

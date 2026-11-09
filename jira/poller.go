@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mturley/watcher"
+	"github.com/mturley/watcher/botmatch"
 	"github.com/mturley/watcher/db"
 	"github.com/mturley/watcher/polllog"
 )
@@ -382,12 +383,11 @@ func epicKeyFromCustomFields(customFields map[string]interface{}) string {
 	return ""
 }
 
-// authorTypeFromUsername determines if a username is a bot.
+// authorTypeFromUsername determines if a username is a bot: whether it
+// matches one of the configured patterns (botmatch: globs, case-insensitive).
 func authorTypeFromUsername(botUsernames []string, username string) string {
-	for _, bot := range botUsernames {
-		if username == bot {
-			return "bot"
-		}
+	if botmatch.Match(botUsernames, username) {
+		return "bot"
 	}
 	return "human"
 }
