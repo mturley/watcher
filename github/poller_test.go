@@ -1974,3 +1974,16 @@ func TestDescriptionEdits_Dedup(t *testing.T) {
 		t.Errorf("got %d events, want 2", n)
 	}
 }
+
+func TestBuildPRStateJSONHeadBase(t *testing.T) {
+	got := buildPRStateJSON(PRData{HeadRefName: "feat", BaseRefName: "main", HeadRepoOwner: "o", HeadRepoName: "r"}, "", "")
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(got), &m); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]string{"head_ref_name": "feat", "base_ref_name": "main", "head_repo_owner": "o", "head_repo_name": "r"} {
+		if m[k] != want {
+			t.Errorf("%s = %v, want %q", k, m[k], want)
+		}
+	}
+}

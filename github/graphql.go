@@ -44,7 +44,14 @@ type PRData struct {
 	ReviewDecision string
 	// Mergeable is GitHub's MERGEABLE, CONFLICTING or UNKNOWN (UNKNOWN while
 	// it is still computing).
-	Mergeable           string
+	Mergeable string
+	// HeadRefName and BaseRefName are the PR's head and base branch names.
+	// HeadRepoOwner and HeadRepoName identify the head repository; both are
+	// empty when GitHub reports headRepository: null (a deleted fork).
+	HeadRefName         string
+	BaseRefName         string
+	HeadRepoOwner       string
+	HeadRepoName        string
 	Reviews             []Review
 	Comments            []Comment
 	ReviewComments      []ReviewComment
@@ -268,6 +275,9 @@ func buildBatchedPRQuery(prs []PRRef) string {
         lastEditedAt
         reviewDecision
         mergeable
+        headRefName
+        baseRefName
+        headRepository { name owner { login } }
         author {
           __typename
           login
@@ -458,15 +468,23 @@ func parseGraphQLResponse(data json.RawMessage, prs []PRRef) ([]PRData, *RateLim
 
 // prNode represents a PR node in the GraphQL response.
 type prNode struct {
-	Number         int                     `json:"number"`
-	State          string                  `json:"state"`
-	Title          string                  `json:"title"`
-	Author         authorNode              `json:"author"`
-	CreatedAt      string                  `json:"createdAt"`
-	UpdatedAt      string                  `json:"updatedAt"`
-	LastEditedAt   *string                 `json:"lastEditedAt"`
-	ReviewDecision *string                 `json:"reviewDecision"`
-	Mergeable      string                  `json:"mergeable"`
+	Number         int        `json:"number"`
+	State          string     `json:"state"`
+	Title          string     `json:"title"`
+	Author         authorNode `json:"author"`
+	CreatedAt      string     `json:"createdAt"`
+	UpdatedAt      string     `json:"updatedAt"`
+	LastEditedAt   *string    `json:"lastEditedAt"`
+	ReviewDecision *string    `json:"reviewDecision"`
+	Mergeable      string     `json:"mergeable"`
+	HeadRefName    string     `json:"headRefName"`
+	BaseRefName    string     `json:"baseRefName"`
+	HeadRepository *struct {
+		Name  string `json:"name"`
+		Owner struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"headRepository"`
 	Reviews        reviewsConnection       `json:"reviews"`
 	Comments       commentsConnection      `json:"comments"`
 	ReviewThreads  reviewThreadsConnection `json:"reviewThreads"`
@@ -617,6 +635,12 @@ func parsePRNode(node *prNode, owner, repo string) PRData {
 	}
 
 	data.Mergeable = node.Mergeable
+	data.HeadRefName = node.HeadRefName
+	data.BaseRefName = node.BaseRefName
+	if node.HeadRepository != nil {
+		data.HeadRepoOwner = node.HeadRepository.Owner.Login
+		data.HeadRepoName = node.HeadRepository.Name
+	}
 
 	if node.LastEditedAt != nil {
 		data.LastEditedAt = *node.LastEditedAt

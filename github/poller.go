@@ -948,6 +948,10 @@ func buildPRStateJSON(prData PRData, mergeable, descriptionEditedAt string) stri
 		"requested_reviewer_ids":       requested,
 		"mergeable":                    mergeable,
 		"mergeable_sha":                prData.Commits.LatestSHA,
+		"head_ref_name":                prData.HeadRefName,
+		"base_ref_name":                prData.BaseRefName,
+		"head_repo_owner":              prData.HeadRepoOwner,
+		"head_repo_name":               prData.HeadRepoName,
 		"description_edited_at":        descriptionEditedAt,
 	}
 	data, _ := json.Marshal(state)

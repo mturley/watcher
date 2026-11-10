@@ -241,3 +241,38 @@ func TestFetchDescriptionEdits_StopsAtCursor(t *testing.T) {
 		t.Errorf("stopAt \"\" fetched %d edits, want all 5", len(all))
 	}
 }
+
+func TestParsePRNodeHeadBase(t *testing.T) {
+	var node prNode
+	raw := `{"number":1,"headRefName":"feat","baseRefName":"main","headRepository":{"name":"odh-dashboard","owner":{"login":"sridarna"}}}`
+	if err := json.Unmarshal([]byte(raw), &node); err != nil {
+		t.Fatal(err)
+	}
+	got := parsePRNode(&node, "o", "r")
+	if got.HeadRefName != "feat" || got.BaseRefName != "main" || got.HeadRepoOwner != "sridarna" || got.HeadRepoName != "odh-dashboard" {
+		t.Errorf("head/base = %q %q %q %q", got.HeadRefName, got.BaseRefName, got.HeadRepoOwner, got.HeadRepoName)
+	}
+
+	// A deleted fork: GitHub returns headRepository: null.
+	var gone prNode
+	raw = `{"number":1,"headRefName":"feat","baseRefName":"main","headRepository":null}`
+	if err := json.Unmarshal([]byte(raw), &gone); err != nil {
+		t.Fatal(err)
+	}
+	got = parsePRNode(&gone, "o", "r")
+	if got.HeadRepoOwner != "" || got.HeadRepoName != "" {
+		t.Errorf("null headRepository = %q/%q, want empty", got.HeadRepoOwner, got.HeadRepoName)
+	}
+	if got.HeadRefName != "feat" || got.BaseRefName != "main" {
+		t.Errorf("refs = %q %q", got.HeadRefName, got.BaseRefName)
+	}
+}
+
+func TestBuildBatchedPRQueryHeadBase(t *testing.T) {
+	q := buildBatchedPRQuery([]PRRef{{Owner: "o", Repo: "r", Number: 1}})
+	for _, want := range []string{"headRefName", "baseRefName", "headRepository { name owner { login } }"} {
+		if !strings.Contains(q, want) {
+			t.Errorf("query missing %q", want)
+		}
+	}
+}
