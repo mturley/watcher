@@ -318,8 +318,8 @@ func TestMigrateV4AddsEventAuthorID(t *testing.T) {
 	if !hasColumn(t, c, "watcher_events", "author_id") {
 		t.Fatal("watcher_events missing author_id after migrating from v4")
 	}
-	if v, _ := SchemaVersion(c); v != 7 {
-		t.Fatalf("version = %d, want 7", v)
+	if v, _ := SchemaVersion(c); v != CurrentSchemaVersion {
+		t.Fatalf("version = %d, want %d", v, CurrentSchemaVersion)
 	}
 }
 
@@ -360,8 +360,8 @@ func TestMigrateV6AddsPollLogTables(t *testing.T) {
 		t.Fatal("poll log indexes missing")
 	}
 	v, err := SchemaVersion(c)
-	if err != nil || v != 7 {
-		t.Fatalf("version = %d (err=%v), want 7", v, err)
+	if err != nil || v != CurrentSchemaVersion {
+		t.Fatalf("version = %d (err=%v), want %d", v, err, CurrentSchemaVersion)
 	}
 }
 
@@ -405,7 +405,38 @@ func TestMigrate_V6ToV7AddsTextChangeTable(t *testing.T) {
 		t.Fatal("watcher_event_text_change not created on upgrade")
 	}
 	v, err := SchemaVersion(c)
-	if err != nil || v != 7 {
-		t.Fatalf("version = %d (err=%v), want 7", v, err)
+	if err != nil || v != CurrentSchemaVersion {
+		t.Fatalf("version = %d (err=%v), want %d", v, err, CurrentSchemaVersion)
+	}
+}
+
+// A database already at v7 (no out_of_date) must gain the column on Migrate,
+// with existing rows reading as not out of date.
+func TestMigrateV7AddsEventOutOfDate(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec(`ALTER TABLE watcher_events DROP COLUMN out_of_date`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec(`INSERT INTO watcher_events (id, ts, source, type, title) VALUES ('e1', '2026-01-01T00:00:00Z', 'github', 'ci_passed', 'CI passed')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec(`UPDATE watcher_schema_version SET version = 7`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(c); err != nil {
+		t.Fatalf("Migrate on a v7 DB: %v", err)
+	}
+	var ood int
+	if err := c.QueryRow(`SELECT out_of_date FROM watcher_events WHERE id = 'e1'`).Scan(&ood); err != nil {
+		t.Fatal(err)
+	}
+	if ood != 0 {
+		t.Errorf("out_of_date = %d for a pre-v8 row, want 0", ood)
+	}
+	if v, _ := SchemaVersion(c); v != CurrentSchemaVersion {
+		t.Fatalf("version = %d, want %d", v, CurrentSchemaVersion)
 	}
 }

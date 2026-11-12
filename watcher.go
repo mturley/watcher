@@ -30,6 +30,10 @@ type Event struct {
 	// (GitHub databaseId, Jira accountId, Slack user ID); nil when unknown.
 	// Compare it only together with Source.
 	AuthorID *string
+	// OutOfDate is true once the commit the event covers is no longer the
+	// PR's latest (a CI bundle or needs-rebase event; see db.MarkOutOfDate).
+	// The title also carries an "[out of date] " prefix, for display.
+	OutOfDate bool
 	// TextChange holds the before/after text of an edit (a description
 	// change); nil when the event carries no text. Stored exactly as
 	// received, in watcher_event_text_change.

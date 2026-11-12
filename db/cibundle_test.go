@@ -164,6 +164,35 @@ func TestMarkCIBundlesOutOfDate(t *testing.T) {
 		t.Errorf("different-commit bundle title = %q, want untouched", got)
 	}
 
+	// The flag is set on exactly the marked rows, and reads back on Event.
+	flags := map[string]bool{}
+	frows, err := c.Query(`SELECT id, type FROM watcher_events`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids = map[string]string{}
+	for frows.Next() {
+		var id, typ string
+		if err := frows.Scan(&id, &typ); err != nil {
+			t.Fatal(err)
+		}
+		ids[typ] = id
+	}
+	frows.Close()
+	for typ, id := range ids {
+		e, err := GetEvent(c, id)
+		if err != nil || e == nil {
+			t.Fatalf("GetEvent(%s): %v", typ, err)
+		}
+		flags[typ] = e.OutOfDate
+	}
+	if !flags["ci_passed"] || !flags["ci_workflows_pending"] {
+		t.Errorf("old-commit bundles OutOfDate = %v, want true", flags)
+	}
+	if flags["ci_pending"] {
+		t.Error("different-commit bundle OutOfDate = true, want false")
+	}
+
 	// ts/external_ts must be unchanged (no re-notify).
 	var tsAfter, extAfter string
 	if err := c.QueryRow(`SELECT ts, COALESCE(external_ts,'') FROM watcher_events WHERE type='ci_passed'`).Scan(&tsAfter, &extAfter); err != nil {

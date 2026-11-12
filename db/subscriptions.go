@@ -272,7 +272,7 @@ func EventsForResource(conn *sql.DB, resourceType, resourceID string) ([]watcher
 	exclClause, exclArgs := bookkeepingExclusionClause()
 	args := append([]any{resourceType, resourceID}, exclArgs...)
 	rows, err := conn.Query(`
-		SELECT e.id, e.ts, e.external_ts, e.source, e.type, e.title, e.body, e.author, e.author_type, e.tags, e.author_id
+		SELECT e.id, e.ts, e.external_ts, e.source, e.type, e.title, e.body, e.author, e.author_type, e.tags, e.author_id, e.out_of_date
 		FROM watcher_events e
 		JOIN watcher_event_resources er ON er.event_id = e.id
 		WHERE er.resource_type = ? AND er.resource_id = ?
@@ -295,7 +295,7 @@ func EventsForSubscriberSince(conn *sql.DB, subscriber, since string) ([]watcher
 	exclClause, exclArgs := bookkeepingExclusionClause()
 	args := append([]any{subscriber, now, since}, exclArgs...)
 	rows, err := conn.Query(`
-		SELECT DISTINCT e.id, e.ts, e.external_ts, e.source, e.type, e.title, e.body, e.author, e.author_type, e.tags, e.author_id
+		SELECT DISTINCT e.id, e.ts, e.external_ts, e.source, e.type, e.title, e.body, e.author, e.author_type, e.tags, e.author_id, e.out_of_date
 		FROM watcher_events e
 		JOIN watcher_event_resources er ON er.event_id = e.id
 		JOIN watcher_subscriptions s ON s.resource_type = er.resource_type AND s.resource_id = er.resource_id
@@ -314,7 +314,7 @@ func EventsForSubscriberSince(conn *sql.DB, subscriber, since string) ([]watcher
 
 // eventColumns is the column list scanEvents expects, qualified by the
 // watcher_events alias e.
-const eventColumns = `e.id, e.ts, e.external_ts, e.source, e.type, e.title, e.body, e.author, e.author_type, e.tags, e.author_id`
+const eventColumns = `e.id, e.ts, e.external_ts, e.source, e.type, e.title, e.body, e.author, e.author_type, e.tags, e.author_id, e.out_of_date`
 
 // RecentEventsForResource returns up to limit non-bookkeeping events
 // recorded for the given resource, newest first (ts descending, ties
@@ -544,14 +544,14 @@ func SubscribersOf(conn *sql.DB, resourceType, resourceID string) ([]Subscriptio
 }
 
 // scanEvents scans rows in the id, ts, external_ts, source, type, title,
-// body, author, author_type, tags column order into watcher.Event values.
+// body, author, author_type, tags, author_id, out_of_date column order into watcher.Event values.
 func scanEvents(rows *sql.Rows) ([]watcher.Event, error) {
 	var out []watcher.Event
 	for rows.Next() {
 		var e watcher.Event
 		var externalTS, body, author, authorType, tags, authorID sql.NullString
 		var typ string
-		if err := rows.Scan(&e.ID, &e.TS, &externalTS, &e.Source, &typ, &e.Title, &body, &author, &authorType, &tags, &authorID); err != nil {
+		if err := rows.Scan(&e.ID, &e.TS, &externalTS, &e.Source, &typ, &e.Title, &body, &author, &authorType, &tags, &authorID, &e.OutOfDate); err != nil {
 			return nil, fmt.Errorf("failed to scan event: %w", err)
 		}
 		e.Type = watcher.EventType(typ)

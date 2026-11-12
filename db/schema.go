@@ -46,7 +46,8 @@ package db
 // Bumped to 7 to add watcher_event_text_change (before/after text of an
 // event). Purely additive table; the bump is required for the same
 // short-circuit reason as v3.
-const CurrentSchemaVersion = 7
+// Bumped to 8 to add watcher_events.out_of_date (see additiveColumns).
+const CurrentSchemaVersion = 8
 
 // managedTables is the exact set of tables Migrate owns.
 var managedTables = []string{
@@ -64,7 +65,7 @@ var managedColumns = map[string][]string{
 	"watcher_schema_version": {"version", "migrated_at"},
 	"watcher_events": {
 		"id", "ts", "external_ts", "source", "type", "title", "body",
-		"author", "author_type", "tags", "author_id",
+		"author", "author_type", "tags", "author_id", "out_of_date",
 	},
 	"watcher_event_resources": {
 		"event_id", "resource_type", "resource_id", "resource_url",
@@ -119,7 +120,8 @@ CREATE TABLE IF NOT EXISTS watcher_events (
 	author TEXT,
 	author_type TEXT,
 	tags TEXT,
-	author_id TEXT
+	author_id TEXT,
+	out_of_date INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS watcher_event_resources (

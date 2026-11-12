@@ -159,18 +159,19 @@ func UpsertCIBundle(conn *sql.DB, commitSHA string, t watcher.EventType, title, 
 	return nil
 }
 
-// outOfDatePrefix is prepended to a bundle's title when the commit it covers is
-// no longer the PR's latest, so a consumer that still has the event in its inbox
-// doesn't mistake it for the current CI state.
+// outOfDatePrefix is prepended to a bundle's (or a needs-rebase event's) title
+// when the commit it covers is no longer the PR's latest, so a consumer that
+// still has the event in its inbox doesn't mistake it for the current CI state.
+// It is for display only: logic reads watcher_events.out_of_date.
 const outOfDatePrefix = "[out of date] "
 
-// MarkOutOfDate prepends outOfDatePrefix to the title of every event of the
-// given types tagged for the given commit on a resource.
+// MarkOutOfDate sets out_of_date on every event of the given types tagged for
+// the given commit on a resource, and prepends outOfDatePrefix to its title.
 //
-// It touches ONLY the title: ts and external_ts are deliberately left unchanged
+// It touches ONLY out_of_date and the title: ts and external_ts are deliberately left unchanged
 // so the update does not re-surface a stale event in a consumer's inbox — the
 // point is to flag an already-delivered event as superseded, not to re-notify.
-// The NOT LIKE guard makes it idempotent: re-running never double-prefixes, so
+// The out_of_date guard makes it idempotent: re-running never double-prefixes, so
 // the poller can call it on every poll where the commit remains superseded.
 // Zero matched rows is not an error (the previous commit may have had no
 // bundles). A single UPDATE with no check-then-act means no BEGIN IMMEDIATE is
@@ -180,11 +181,11 @@ func MarkOutOfDate(conn *sql.DB, commitSHA string, r watcher.Resource, types []w
 	typeIn, typeArgs := inClause(types)
 
 	args := append([]any{outOfDatePrefix}, typeArgs...)
-	args = append(args, r.Type, r.ID, tag, outOfDatePrefix+"%")
+	args = append(args, r.Type, r.ID, tag)
 
 	_, err := conn.Exec(`
 		UPDATE watcher_events
-		SET title = ? || title
+		SET title = ? || title, out_of_date = 1
 		WHERE id IN (
 			SELECT e.id FROM watcher_events e
 			JOIN watcher_event_resources er ON e.id = er.event_id
@@ -192,7 +193,7 @@ func MarkOutOfDate(conn *sql.DB, commitSHA string, r watcher.Resource, types []w
 			  AND e.type IN `+typeIn+`
 			  AND er.resource_type = ? AND er.resource_id = ?
 			  AND e.tags = ?
-			  AND e.title NOT LIKE ?
+			  AND e.out_of_date = 0
 		)
 	`, args...)
 	if err != nil {

@@ -132,6 +132,10 @@ var additiveColumns = map[string]map[string]string{
 	// backfilled: events recorded before v5 simply have no ID.
 	"watcher_events": {
 		"author_id": "TEXT",
+		// out_of_date (schema v8): set by MarkOutOfDate when the commit an
+		// event covers is superseded. Not backfilled from the title prefix:
+		// events marked before v8 keep only the prefix.
+		"out_of_date": "INTEGER NOT NULL DEFAULT 0",
 	},
 }
 
