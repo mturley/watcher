@@ -1,10 +1,8 @@
-// Package config reads and writes the watcher library's shared
-// configuration file: service credentials, Jira custom field IDs, and a
-// registry of consumer databases. See the design spec's "Shared
-// Configuration" section for the YAML shape. The package also owns a
-// separate behavior config file (config.yaml) holding non-secret
-// behavior settings, such as Jira bot usernames, that need not be
-// protected by the same permission checks as credentials.
+// Package config defines the format of the credentials file (service
+// tokens for GitHub, Jira and Slack) and the behavior types (bot
+// usernames, Jira custom fields) that consumers embed in their own
+// config files. The library never chooses a file location: every
+// consumer passes the path it owns to Load and Save.
 package config
 
 import (
@@ -15,11 +13,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the top-level shape of the watcher config file.
+// Config is the top-level shape of the credentials file.
 type Config struct {
-	Services         Services            `yaml:"services"`
-	JiraCustomFields map[string]string   `yaml:"jira_custom_fields,omitempty"`
-	ConsumerRegistry map[string]Consumer `yaml:"consumers,omitempty"`
+	Services Services `yaml:"services"`
 }
 
 // Services holds per-service credential blocks. Each is a pointer so an
@@ -53,11 +49,6 @@ type SlackConfig struct {
 	WorkspaceDomain string `yaml:"workspace_domain,omitempty"`
 }
 
-// Consumer is an entry in the consumer DB registry.
-type Consumer struct {
-	DB string `yaml:"db"`
-}
-
 // GitHubCreds are the typed credentials returned by (*Config).GitHub.
 type GitHubCreds struct {
 	Token string
@@ -65,10 +56,9 @@ type GitHubCreds struct {
 
 // JiraCreds are the typed credentials returned by (*Config).Jira.
 type JiraCreds struct {
-	Host         string
-	Email        string
-	Token        string
-	CustomFields map[string]string
+	Host  string
+	Email string
+	Token string
 }
 
 // SlackCreds are the typed credentials returned by (*Config).Slack.
@@ -78,28 +68,11 @@ type SlackCreds struct {
 	WorkspaceDomain string
 }
 
-// ConfigFile is the top-level shape of the watcher library's separate
-// behavior config file ("config.yaml"), as distinct from the
-// credentials-holding auth.yaml handled by Config/Load/Save above.
-type ConfigFile struct {
-	GitHub *GitHubBehavior `yaml:"github,omitempty"`
-	Jira   *JiraBehavior   `yaml:"jira,omitempty"`
-}
-
 // GitHubBehavior holds non-auth GitHub behavior settings.
 type GitHubBehavior struct {
 	// BotUsernames are glob patterns (see botmatch) for logins to classify
 	// as bots although GitHub reports them as users, e.g. "*ci-bot*".
 	BotUsernames []string `yaml:"bot_usernames,omitempty"`
-}
-
-// GitHubBotUsernames returns the configured GitHub bot patterns, or nil if
-// no GitHub behavior block is configured.
-func (c *ConfigFile) GitHubBotUsernames() []string {
-	if c.GitHub == nil {
-		return nil
-	}
-	return c.GitHub.BotUsernames
 }
 
 // JiraBehavior holds non-auth Jira behavior settings.
@@ -111,94 +84,8 @@ type JiraBehavior struct {
 	// CustomFields maps friendly names (e.g. "epic_key", "story_points") to
 	// Jira custom field IDs (e.g. "customfield_10014"), letting the poller
 	// fetch and cache extra issue data. These are configuration, not
-	// credentials, so they live here in config.yaml rather than auth.yaml.
+	// credentials.
 	CustomFields map[string]string `yaml:"custom_fields,omitempty"`
-}
-
-// JiraBotUsernames returns the configured bot usernames, or nil if no
-// Jira behavior block is configured.
-func (c *ConfigFile) JiraBotUsernames() []string {
-	if c.Jira == nil {
-		return nil
-	}
-	return c.Jira.BotUsernames
-}
-
-// JiraCustomFields returns the configured Jira custom-field map, or nil if no
-// Jira behavior block (or no custom_fields entry) is configured.
-func (c *ConfigFile) JiraCustomFields() map[string]string {
-	if c.Jira == nil {
-		return nil
-	}
-	return c.Jira.CustomFields
-}
-
-// ConfigDefaultPath returns the default behavior config file path,
-// "~/.config/watcher/config.yaml". Honors WATCHER_HOME (used by tests)
-// to override the base directory, exactly like DefaultPath does for
-// auth.yaml.
-func ConfigDefaultPath() string {
-	if dir := os.Getenv("WATCHER_HOME"); dir != "" {
-		return filepath.Join(dir, "config.yaml")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".config", "watcher", "config.yaml")
-}
-
-// LoadConfig reads and parses the behavior config file at path. If the
-// file does not exist, LoadConfig returns an empty, zero-value
-// *ConfigFile (not an error), mirroring Load's missing-file behavior
-// for auth.yaml. Unlike Load, LoadConfig does not enforce file
-// permissions since config.yaml holds no credentials.
-func LoadConfig(path string) (*ConfigFile, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &ConfigFile{}, nil
-		}
-		return nil, fmt.Errorf("failed to read config %s: %w", path, err)
-	}
-
-	var cfg ConfigFile
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config %s: %w", path, err)
-	}
-
-	return &cfg, nil
-}
-
-// SaveConfig writes c to path as YAML, creating the parent directory (0700)
-// if needed. config.yaml holds no credentials, so the file is 0644.
-func SaveConfig(path string, c *ConfigFile) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("failed to create config dir %s: %w", dir, err)
-	}
-	data, err := yaml.Marshal(c)
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("failed to write config %s: %w", path, err)
-	}
-	return nil
-}
-
-// DefaultPath returns the default credentials file path,
-// "~/.config/watcher/auth.yaml". Honors WATCHER_HOME (used by tests)
-// to override the base directory.
-func DefaultPath() string {
-	if dir := os.Getenv("WATCHER_HOME"); dir != "" {
-		return filepath.Join(dir, "auth.yaml")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".config", "watcher", "auth.yaml")
 }
 
 // Load reads and parses the config file at path.
@@ -264,17 +151,16 @@ func (c *Config) GitHub() (GitHubCreds, error) {
 	return GitHubCreds{Token: c.Services.GitHub.Token}, nil
 }
 
-// Jira returns Jira credentials (including custom field IDs), or an
+// Jira returns Jira credentials, or an
 // error if Jira is not configured.
 func (c *Config) Jira() (JiraCreds, error) {
 	if c.Services.Jira == nil || c.Services.Jira.Token == "" {
 		return JiraCreds{}, fmt.Errorf("jira not configured")
 	}
 	return JiraCreds{
-		Host:         c.Services.Jira.Host,
-		Email:        c.Services.Jira.Email,
-		Token:        c.Services.Jira.Token,
-		CustomFields: c.JiraCustomFields,
+		Host:  c.Services.Jira.Host,
+		Email: c.Services.Jira.Email,
+		Token: c.Services.Jira.Token,
 	}, nil
 }
 
@@ -289,28 +175,4 @@ func (c *Config) Slack() (SlackCreds, error) {
 		Cookie:          c.Services.Slack.Cookie,
 		WorkspaceDomain: c.Services.Slack.WorkspaceDomain,
 	}, nil
-}
-
-// RegisterConsumer adds or updates a consumer's DB path in the
-// registry.
-func (c *Config) RegisterConsumer(name, dbPath string) {
-	if c.ConsumerRegistry == nil {
-		c.ConsumerRegistry = make(map[string]Consumer)
-	}
-	c.ConsumerRegistry[name] = Consumer{DB: dbPath}
-}
-
-// UnregisterConsumer removes a consumer from the registry; an absent name is
-// a no-op.
-func (c *Config) UnregisterConsumer(name string) {
-	delete(c.ConsumerRegistry, name)
-}
-
-// Consumers returns a map of consumer name to DB path.
-func (c *Config) Consumers() map[string]string {
-	out := make(map[string]string, len(c.ConsumerRegistry))
-	for name, consumer := range c.ConsumerRegistry {
-		out[name] = consumer.DB
-	}
-	return out
 }

@@ -234,11 +234,13 @@ unless noted. Single-row reads return `nil, nil` when nothing matches.
 
 ## Config
 
-Config is a single shared YAML credentials file, by default at
-`~/.config/watcher/auth.yaml` (`config.DefaultPath()`, overridable via
-the `WATCHER_HOME` env var), loaded with `config.Load` and written with
-`(*Config).Save` (which enforces `0600` permissions since it holds
-credentials — `Load` refuses to read a group/world-readable file).
+The `config` package defines the format of a YAML credentials file and
+the behavior types a consumer embeds in its own config. The library
+never chooses a file location: the consumer always passes the path it
+owns. `config.Load(path)` reads the file (a missing file loads as an
+empty `Config`) and `(*Config).Save(path)` writes it with `0600`
+permissions, since it holds credentials. `Load` refuses to read a
+group/world-readable file.
 
 ```yaml
 services:
@@ -252,44 +254,24 @@ services:
     token: xoxc-xxx           # browser session token
     cookie: xoxd-xxx          # the d= session cookie
     workspace_domain: yourteam.slack.com
-jira_custom_fields:
-  epic_key: customfield_10014
-consumers:
-  mytool:
-    db: /Users/you/.local/share/mytool/mytool.db
 ```
 
 Typed accessors return an error if a service isn't configured, rather
 than zero-value credentials:
 
 ```go
-cfg, err := config.Load(config.DefaultPath())
+cfg, err := config.Load(credsPath) // credsPath is the consumer's own file
 ghCreds, err := cfg.GitHub()   // config.GitHubCreds{Token}
-jiraCreds, err := cfg.Jira()   // config.JiraCreds{Host, Email, Token, CustomFields}
+jiraCreds, err := cfg.Jira()   // config.JiraCreds{Host, Email, Token}
 slackCreds, err := cfg.Slack() // config.SlackCreds{Token, Cookie, WorkspaceDomain}
 ```
 
-`cfg.RegisterConsumer(name, dbPath)` / `cfg.Consumers()` manage the
-`consumers` registry, letting a single config file coordinate multiple
-consumer databases.
+### Behavior types
 
-**Jira epic-link note:** the Jira poller records an `epic` relationship
-(via `db.LinkResources`) from an issue to its parent epic, but it can
-only do so if `jira_custom_fields` maps the display name `epic_key` to
-your Jira instance's actual custom field ID (e.g.
-`customfield_10014` — this varies per Jira instance). Without that
-entry, epic-link relationships are silently skipped. This mapping is a
-deferred, per-instance concern — there's no way to discover it
-generically from the API.
-
-### Behavior config (config.yaml)
-
-Separate from `auth.yaml`, the library also reads an optional behavior
-config file, by default at `~/.config/watcher/config.yaml`
-(`config.ConfigDefaultPath()`, also overridable via `WATCHER_HOME`),
-loaded with `config.LoadConfig`. Unlike `auth.yaml`, it holds no
-credentials, so it isn't subject to the same permission checks, and a
-missing file simply loads as empty defaults (not an error).
+`config.GitHubBehavior` and `config.JiraBehavior` hold non-credential
+settings. A consumer embeds them in its own config file, wherever it
+likes, and reads and writes that file itself; the library does not load
+them. Both carry yaml tags so they embed directly:
 
 ```yaml
 github:
@@ -304,28 +286,29 @@ jira:
     story_points: customfield_10028
 ```
 
-`github.bot_usernames` and `jira.bot_usernames` list accounts to
-classify as bots when attributing events, beyond those the service itself
-reports as bots (GitHub's `Bot` type) — a CI account that GitHub sees as an
-ordinary user, for example. Each entry is a glob over the whole name,
-compared case-insensitively: `*` matches any run of characters and `?` one,
-so `*ci-bot*` matches `rhods-ci-bot`, and a name without wildcards is an
-exact match (`botmatch.Match`). Pass GitHub's to the poller as
+`bot_usernames` lists accounts to classify as bots when attributing
+events, beyond those the service itself reports as bots (GitHub's `Bot`
+type) — a CI account that GitHub sees as an ordinary user, for example.
+Each entry is a glob over the whole name, compared case-insensitively: `*`
+matches any run of characters and `?` one, so `*ci-bot*` matches
+`rhods-ci-bot`, and a name without wildcards is an exact match
+(`botmatch.Match`). Pass GitHub's to the poller as
 `github.PollOptions.BotUsernames` and Jira's as `jira.JiraAuth.BotUsernames`.
 The pollers classify new events; `db.MarkBotAuthors(conn, source, patterns)`
 re-marks events already stored, for when the list changes (it only marks:
-removing a pattern does not un-mark what it matched). `custom_fields` maps friendly
-names to Jira custom field IDs so the poller can fetch and cache extra
-issue data (epic link, story points, blocked status, etc.). Both are
-configuration rather than credentials, which is why they live here in
-`config.yaml` and not in `auth.yaml`. Nil-safe accessors:
+removing a pattern does not un-mark what it matched).
 
-```go
-cfg, err := config.LoadConfig(config.ConfigDefaultPath())
-ghBots := cfg.GitHubBotUsernames() // []string, or nil if unset
-bots := cfg.JiraBotUsernames()   // []string, or nil if unset
-fields := cfg.JiraCustomFields() // map[string]string, or nil if unset
-```
+`custom_fields` maps friendly names to Jira custom field IDs so the
+poller can fetch and cache extra issue data (epic link, story points,
+blocked status, etc.). Pass it as `jira.JiraAuth.CustomFields`.
+
+**Jira epic-link note:** the Jira poller records an `epic` relationship
+(via `db.LinkResources`) from an issue to its parent epic, but it can
+only do so if `custom_fields` maps the display name `epic_key` to your
+Jira instance's actual custom field ID (e.g. `customfield_10014` — this
+varies per Jira instance). Without that entry, epic-link relationships
+are silently skipped. There's no way to discover it generically from the
+API.
 
 ## Credential validation & repair
 
