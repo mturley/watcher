@@ -302,6 +302,9 @@ func processIssue(conn *sql.DB, cfg JiraAuth, issue IssueData, resource watcher.
 				continue
 			}
 			title := fmt.Sprintf("%s assigned to %s", issue.Key, entry.To)
+			if strings.TrimSpace(entry.To) == "" {
+				title = issue.Key + " unassigned"
+			}
 			authorType := authorTypeFromUsername(cfg.BotUsernames, entry.Author)
 			author := entry.Author
 			if err := emitEvent(conn, watcher.EventTypeJiraAssigned, title, nil, entry.CreatedAt, &author, &authorType, optional(entry.AuthorID), resource, nil); err != nil {

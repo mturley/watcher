@@ -1013,3 +1013,51 @@ func TestPoll_SkippedIssueStillLinksEpic(t *testing.T) {
 		t.Errorf("epic relationship rows = %d, want 1", n)
 	}
 }
+
+// TestProcessIssue_AssigneeTitles verifies an assignee change to a person
+// reads "assigned to <name>", and clearing the assignee reads "unassigned"
+// rather than "assigned to " with no name.
+func TestProcessIssue_AssigneeTitles(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", jiraResource, db.SubscribeOpts{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	seed := IssueData{
+		Key: "RHOAIENG-123", Summary: "Test Issue", Status: "To Do",
+		Changelog: []ChangelogEntry{
+			{Author: "John Doe", CreatedAt: "2026-06-17T08:00:00.000+0000", Field: "status", From: "Backlog", To: "To Do"},
+		},
+	}
+	if _, err := processIssue(conn, JiraAuth{}, seed, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("seed processIssue: %v", err)
+	}
+	issue := IssueData{
+		Key: "RHOAIENG-123", Summary: "Test Issue", Status: "To Do",
+		Changelog: []ChangelogEntry{
+			{Author: "John Doe", CreatedAt: "2026-06-17T10:00:00.000+0000", Field: "assignee", From: "", To: "Alice"},
+			{Author: "John Doe", CreatedAt: "2026-06-17T11:00:00.000+0000", Field: "assignee", From: "Alice", To: ""},
+		},
+	}
+	if _, err := processIssue(conn, JiraAuth{}, issue, jiraResource, false, testLogger()); err != nil {
+		t.Fatalf("processIssue: %v", err)
+	}
+	events, err := db.EventsForResource(conn, "jira", jiraResource.ID)
+	if err != nil {
+		t.Fatalf("EventsForResource: %v", err)
+	}
+	var titles []string
+	for _, e := range events {
+		if e.Type == watcher.EventTypeJiraAssigned {
+			titles = append(titles, e.Title)
+		}
+	}
+	want := map[string]bool{"RHOAIENG-123 assigned to Alice": true, "RHOAIENG-123 unassigned": true}
+	if len(titles) != 2 {
+		t.Fatalf("got %d jira_assigned events (%q), want 2", len(titles), titles)
+	}
+	for _, title := range titles {
+		if !want[title] {
+			t.Errorf("unexpected title %q; want one of %v", title, want)
+		}
+	}
+}
