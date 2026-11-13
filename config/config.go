@@ -31,9 +31,8 @@ type GitHubConfig struct {
 	Token string `yaml:"token"`
 }
 
-// JiraConfig contains Jira API configuration. Note the YAML key is
-// "host" (not "url" as in agent-handler's config) per the watcher
-// library's design spec.
+// JiraConfig contains Jira API configuration. Host is the site's base URL
+// (e.g. "https://yourorg.atlassian.net"); see jira.NormalizeHost.
 type JiraConfig struct {
 	Host  string `yaml:"host"`
 	Email string `yaml:"email"`
@@ -151,8 +150,7 @@ func (c *Config) GitHub() (GitHubCreds, error) {
 	return GitHubCreds{Token: c.Services.GitHub.Token}, nil
 }
 
-// Jira returns Jira credentials, or an
-// error if Jira is not configured.
+// Jira returns Jira credentials, or an error if Jira is not configured.
 func (c *Config) Jira() (JiraCreds, error) {
 	if c.Services.Jira == nil || c.Services.Jira.Token == "" {
 		return JiraCreds{}, fmt.Errorf("jira not configured")

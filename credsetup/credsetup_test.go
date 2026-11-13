@@ -1,6 +1,7 @@
 package credsetup
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/mturley/watcher/config"
@@ -401,6 +402,68 @@ func TestTestAndRepair_Jira_UnconfiguredConfirmYesGreenfieldSetup(t *testing.T) 
 	}
 	if cfg.Services.Jira.Token != "new-good-token" {
 		t.Fatalf("expected token set, got %q", cfg.Services.Jira.Token)
+	}
+}
+
+func TestTestAndRepair_Jira_GreenfieldBareHostGetsHTTPS(t *testing.T) {
+	var validatedHost string
+	withJiraSeam(t, func(host, email, token string) error {
+		validatedHost = host
+		return nil
+	})
+
+	cfg := &config.Config{}
+	p := &fakePrompter{
+		confirmResult:   true,
+		jiraHostResult:  "acme.atlassian.net/",
+		jiraEmailResult: "a@acme.com",
+		tokenResults:    []string{"tok"},
+	}
+
+	changed, err := TestAndRepair(cfg, Jira, p)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v, want changed and no error", changed, err)
+	}
+	if validatedHost != "https://acme.atlassian.net" {
+		t.Fatalf("validated host %q, want https://acme.atlassian.net", validatedHost)
+	}
+	if got := cfg.Services.Jira.Host; got != "https://acme.atlassian.net" {
+		t.Fatalf("saved host %q, want https://acme.atlassian.net", got)
+	}
+}
+
+func TestTestAndRepair_Jira_GreenfieldInvalidHostSkips(t *testing.T) {
+	withJiraSeam(t, func(host, email, token string) error {
+		t.Fatalf("validate should not be called for an invalid host")
+		return nil
+	})
+
+	cfg := &config.Config{}
+	p := &fakePrompter{
+		confirmResult:   true,
+		jiraHostResult:  "ftp://acme.atlassian.net",
+		jiraEmailResult: "a@acme.com",
+		tokenResults:    []string{"tok"},
+	}
+
+	changed, err := TestAndRepair(cfg, Jira, p)
+	if err != nil || changed {
+		t.Fatalf("changed=%v err=%v, want unchanged and no error", changed, err)
+	}
+	if len(p.promptCalls) != 0 {
+		t.Fatalf("expected no token prompt for an invalid host")
+	}
+	if cfg.Services.Jira != nil {
+		t.Fatalf("expected Jira to stay unconfigured")
+	}
+	found := false
+	for _, m := range p.infoCalls {
+		if strings.Contains(m, "site URL") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an Info message about the site URL, got %v", p.infoCalls)
 	}
 }
 

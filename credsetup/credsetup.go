@@ -168,11 +168,16 @@ func repairJira(cfg *config.Config, p Prompter) (bool, error) {
 			return false, nil
 		}
 		host, email = p.PromptJira("Enter your Jira site URL (e.g. https://yourorg.atlassian.net) and the account email")
-		host = strings.TrimRight(host, "/")
-		if host == "" || email == "" {
+		if strings.TrimSpace(host) == "" || email == "" {
 			p.Info("Jira: skipped")
 			return false, nil
 		}
+		normalized, err := wjira.NormalizeHost(host)
+		if err != nil {
+			p.Info("Jira: invalid site URL (" + err.Error() + "); skipped")
+			return false, nil
+		}
+		host = normalized
 	} else {
 		p.Info("Testing Jira credentials...")
 		err := validateJira(host, email, creds.Token)

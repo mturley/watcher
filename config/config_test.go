@@ -67,7 +67,16 @@ func TestLoadRefusesGroupWorldReadable(t *testing.T) {
 	}
 }
 
-// JiraCustomFields is nil-safe when there is no Jira behavior block at all.
+func TestLoadMissingFileIsEmpty(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg == nil || cfg.Services.GitHub != nil || cfg.Services.Jira != nil || cfg.Services.Slack != nil {
+		t.Fatalf("expected an empty Config, got %+v", cfg)
+	}
+}
+
 func TestSlackReturnsTokenCookieAndDomain(t *testing.T) {
 	c := &Config{Services: Services{Slack: &SlackConfig{
 		Token: "xoxc-1", Cookie: "xoxd-2", WorkspaceDomain: "acme.slack.com",
