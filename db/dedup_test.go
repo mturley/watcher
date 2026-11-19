@@ -120,3 +120,41 @@ func TestIsDuplicateMatchTypeOnlyDifferentResourceOrType(t *testing.T) {
 		t.Error("expected no duplicate for a different event type")
 	}
 }
+
+func TestUpdateEventBody(t *testing.T) {
+	c := mem(t)
+	if err := Migrate(c); err != nil {
+		t.Fatal(err)
+	}
+	ts := "1.5"
+	old := "Bob: short…"
+	res := watcher.Resource{Type: "slack", ID: "C1:1.0"}
+	if err := InsertEvent(c, watcher.Event{
+		ID: "e1", TS: "2026-01-15T12:00:00Z", ExternalTS: &ts, Source: "slack",
+		Type: watcher.EventTypeSlackReply, Title: "New reply", Body: &old,
+	}, res); err != nil {
+		t.Fatal(err)
+	}
+	check := DedupCheck{Source: "slack", ResourceType: "slack", ResourceID: "C1:1.0",
+		Type: watcher.EventTypeSlackReply, ExternalTS: &ts}
+
+	changed, err := UpdateEventBody(c, check, "Bob: the whole message")
+	if err != nil || !changed {
+		t.Fatalf("UpdateEventBody = %v, %v; want true, nil", changed, err)
+	}
+	var body string
+	if err := c.QueryRow(`SELECT body FROM watcher_events WHERE id = 'e1'`).Scan(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body != "Bob: the whole message" {
+		t.Errorf("body = %q", body)
+	}
+	if changed, err := UpdateEventBody(c, check, "Bob: the whole message"); err != nil || changed {
+		t.Errorf("unchanged body: UpdateEventBody = %v, %v; want false, nil", changed, err)
+	}
+	other := "9.9"
+	check.ExternalTS = &other
+	if changed, err := UpdateEventBody(c, check, "x"); err != nil || changed {
+		t.Errorf("no match: UpdateEventBody = %v, %v; want false, nil", changed, err)
+	}
+}

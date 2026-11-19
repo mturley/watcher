@@ -235,7 +235,7 @@ func processThread(conn *sql.DB, client Client, thread Thread, names map[string]
 		resolvedRoot := mentions.resolve(rootText(thread))
 		title := fallbackTitle(resolvedRoot)
 		wsTitle := fmt.Sprintf("Started watching thread: %s", title)
-		body := title
+		body := resolvedRoot
 		if err := emitEvent(conn, watcher.EventTypeWatchStarted, wsTitle, &body, latestThreadTS(thread), "", nil, nil, nil, resource); err != nil {
 			return 0, resolvedRoot, fmt.Errorf("emit watch_started: %w", err)
 		}
@@ -281,29 +281,41 @@ func BackfillThread(conn *sql.DB, client Client, resource watcher.Resource, logg
 }
 
 // emitReplies records a slack_reply for each message not already recorded
-// (deduped on its ts). atSendTime stamps each event with the message's send
-// time instead of the wall clock; see processThread for when each applies.
+// (deduped on its ts). atSendTime marks a backfill: each new event is
+// stamped with the message's send time instead of the wall clock (see
+// processThread for when each applies), and an already-recorded reply whose
+// body differs is rewritten. Returns the count of events emitted or
+// rewritten.
 func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions mentionResolver, title string, atSendTime bool, resource watcher.Resource, logger *log.Logger) (int, error) {
 	count := 0
 	for _, m := range msgs {
-		dup, err := db.IsDuplicate(conn, db.DedupCheck{
+		check := db.DedupCheck{
 			Source: "slack", ResourceType: resource.Type, ResourceID: resource.ID,
 			Type: watcher.EventTypeSlackReply, ExternalTS: &m.TS,
-		})
+		}
+		dup, err := db.IsDuplicate(conn, check)
 		if err != nil {
 			return count, fmt.Errorf("dedup: %w", err)
 		}
+		author := names[m.UserID]
+		body := replyBody(author, mentions.resolve(m.Text))
 		if dup {
+			// Only a backfill revisits recorded replies: it brings their
+			// text up to date (bodies recorded before they held the whole
+			// message, and edits since). A live poll never sees them again.
+			if atSendTime {
+				changed, err := db.UpdateEventBody(conn, check, body)
+				if err != nil {
+					return count, fmt.Errorf("update slack_reply body: %w", err)
+				}
+				if changed {
+					count++
+				}
+			}
 			continue
 		}
 
-		author := names[m.UserID]
 		evTitle := fmt.Sprintf("New reply in %s", title)
-		snippet := fallbackTitle(mentions.resolve(m.Text))
-		body := snippet
-		if author != "" {
-			body = author + ": " + snippet
-		}
 		var authorPtr *string
 		if author != "" {
 			authorPtr = &author
@@ -319,6 +331,16 @@ func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions
 		logger.Printf("Emitted slack_reply for %s", resource.ID)
 	}
 	return count, nil
+}
+
+// replyBody is a reply event's body: the author's name and the WHOLE message
+// text, mentions resolved, line breaks kept, so search can match any of it.
+// Titles stay short; a body is where the full text lives.
+func replyBody(author, text string) string {
+	if author == "" {
+		return text
+	}
+	return author + ": " + text
 }
 
 // threadReplies returns the thread's messages after the root.

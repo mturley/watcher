@@ -52,24 +52,7 @@ func IsDuplicate(conn *sql.DB, c DedupCheck) (bool, error) {
 		return false, errors.New("at least one of ExternalTS or Title must be set")
 	}
 
-	conds := []string{
-		"e.source = ?",
-		"er.resource_type = ?",
-		"er.resource_id = ?",
-		"e.type = ?",
-	}
-	argsList := []interface{}{c.Source, c.ResourceType, c.ResourceID, string(c.Type)}
-
-	if !c.MatchTypeOnly {
-		if c.ExternalTS != nil {
-			conds = append(conds, "e.external_ts = ?")
-			argsList = append(argsList, *c.ExternalTS)
-		}
-		if c.Title != nil {
-			conds = append(conds, "e.title = ?")
-			argsList = append(argsList, *c.Title)
-		}
-	}
+	conds, argsList := dedupConds(c)
 
 	query := `
 		SELECT 1
@@ -89,4 +72,55 @@ func IsDuplicate(conn *sql.DB, c DedupCheck) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// dedupConds is the WHERE clause (over watcher_events e joined to
+// watcher_event_resources er) and its arguments for the events c matches.
+func dedupConds(c DedupCheck) ([]string, []interface{}) {
+	conds := []string{
+		"e.source = ?",
+		"er.resource_type = ?",
+		"er.resource_id = ?",
+		"e.type = ?",
+	}
+	argsList := []interface{}{c.Source, c.ResourceType, c.ResourceID, string(c.Type)}
+	if !c.MatchTypeOnly {
+		if c.ExternalTS != nil {
+			conds = append(conds, "e.external_ts = ?")
+			argsList = append(argsList, *c.ExternalTS)
+		}
+		if c.Title != nil {
+			conds = append(conds, "e.title = ?")
+			argsList = append(argsList, *c.Title)
+		}
+	}
+	return conds, argsList
+}
+
+// UpdateEventBody sets body on every event c matches (the same match as
+// IsDuplicate) whose body differs, and reports whether any row changed. It
+// lets a poller bring an already-recorded event's text up to date without
+// inserting a second one.
+func UpdateEventBody(conn *sql.DB, c DedupCheck, body string) (bool, error) {
+	if !c.MatchTypeOnly && c.ExternalTS == nil && c.Title == nil {
+		return false, errors.New("at least one of ExternalTS or Title must be set")
+	}
+	conds, args := dedupConds(c)
+	res, err := conn.Exec(`
+		UPDATE watcher_events SET body = ?
+		 WHERE body IS NOT ?
+		   AND id IN (
+			SELECT e.id
+			FROM watcher_events e
+			JOIN watcher_event_resources er ON er.event_id = e.id
+			WHERE `+strings.Join(conds, " AND ")+`)`,
+		append([]interface{}{body, body}, args...)...)
+	if err != nil {
+		return false, fmt.Errorf("failed to update event body: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to update event body: %w", err)
+	}
+	return n > 0, nil
 }

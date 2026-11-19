@@ -856,3 +856,85 @@ func TestBackfillThread_FillsOnlyMissing(t *testing.T) {
 		}
 	}
 }
+
+// eventBody returns the body of the resource's only event of type typ.
+func eventBody(t *testing.T, conn *sql.DB, typ watcher.EventType, extTS string) string {
+	t.Helper()
+	var body sql.NullString
+	if err := conn.QueryRow(`
+		SELECT e.body FROM watcher_events e
+		  JOIN watcher_event_resources er ON er.event_id = e.id
+		 WHERE er.resource_type = 'slack' AND er.resource_id = ? AND e.type = ? AND e.external_ts = ?`,
+		slackResource.ID, string(typ), extTS).Scan(&body); err != nil {
+		t.Fatalf("event body %s %s: %v", typ, extTS, err)
+	}
+	return body.String
+}
+
+// longText is a multi-line message well past the 60-rune title cut.
+var longText = "first line of a long message about the rollout plan for next week\n\n" +
+	strings.Repeat("details ", 20) + "\nlast line with the word zanzibar"
+
+func TestPoll_ReplyBodyIsFullText(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	thread := backfillThread()
+	thread.Messages = thread.Messages[:1]
+	client := &fakeClient{thread: thread, users: map[string]User{"U2": {ID: "U2", DisplayName: "Bob"}}}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	client.thread.Messages = append(client.thread.Messages, Message{TS: "1699000400.000500", UserID: "U2", Text: longText})
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got := eventBody(t, conn, watcher.EventTypeSlackReply, "1699000400.000500"); got != "Bob: "+longText {
+		t.Errorf("body = %q, want the whole message", got)
+	}
+}
+
+func TestPoll_WatchStartedBodyIsFullRoot(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeClient{thread: Thread{Channel: "C1", ThreadTS: "1699000000.000100",
+		Messages: []Message{{TS: "1699000000.000100", UserID: "U1", Text: longText}}}}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got := eventBody(t, conn, watcher.EventTypeWatchStarted, "1699000000.000100"); got != longText {
+		t.Errorf("watch_started body = %q, want the whole root", got)
+	}
+}
+
+func TestBackfillThread_RewritesTruncatedBody(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	thread := backfillThread()
+	thread.Messages = append(thread.Messages[:1], Message{TS: "1699000100.000200", UserID: "U2", Text: longText})
+	client := &fakeClient{thread: thread, users: map[string]User{"U2": {ID: "U2", DisplayName: "Bob"}}}
+
+	// A reply recorded before bodies held the whole text.
+	ts := "1699000100.000200"
+	short := "Bob: " + fallbackTitle(longText)
+	if err := db.InsertEvent(conn, watcher.Event{ID: "old", TS: "2023-11-03T08:28:20Z", ExternalTS: &ts,
+		Source: "slack", Type: watcher.EventTypeSlackReply, Title: "New reply in root", Body: &short}, slackResource); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := BackfillThread(conn, client, slackResource, testLogger())
+	if err != nil || n != 1 {
+		t.Fatalf("BackfillThread = %d, %v; want 1, nil", n, err)
+	}
+	if got := eventBody(t, conn, watcher.EventTypeSlackReply, ts); got != "Bob: "+longText {
+		t.Errorf("body = %q, want the whole message", got)
+	}
+	if n, err := BackfillThread(conn, client, slackResource, testLogger()); err != nil || n != 0 {
+		t.Errorf("second BackfillThread = %d, %v; want 0, nil", n, err)
+	}
+}
