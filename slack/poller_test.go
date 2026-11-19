@@ -919,7 +919,14 @@ func TestBackfillThread_RewritesTruncatedBody(t *testing.T) {
 	thread.Messages = append(thread.Messages[:1], Message{TS: "1699000100.000200", UserID: "U2", Text: longText})
 	client := &fakeClient{thread: thread, users: map[string]User{"U2": {ID: "U2", DisplayName: "Bob"}}}
 
-	// A reply recorded before bodies held the whole text.
+	// A thread first polled (watch_started) with a reply recorded before
+	// bodies held the whole text.
+	rootTS := "1699000100.000200"
+	rootBody := "root"
+	if err := db.InsertEvent(conn, watcher.Event{ID: "ws", TS: "2023-11-03T08:28:20Z", ExternalTS: &rootTS,
+		Source: "slack", Type: watcher.EventTypeWatchStarted, Title: "Started watching thread: root", Body: &rootBody}, slackResource); err != nil {
+		t.Fatal(err)
+	}
 	ts := "1699000100.000200"
 	short := "Bob: " + fallbackTitle(longText)
 	if err := db.InsertEvent(conn, watcher.Event{ID: "old", TS: "2023-11-03T08:28:20Z", ExternalTS: &ts,
@@ -1025,4 +1032,56 @@ func TestBackfillThread_SkipsNeverPolledThread(t *testing.T) {
 	if got := countType(backfillRows(t, conn), watcher.EventTypeWatchStarted); got != 1 {
 		t.Errorf("watch_started after first poll = %d, want 1", got)
 	}
+}
+
+// A first poll that died after recording some replies (and before
+// watch_started) must not strand the rest: the next poll finishes it.
+func TestPoll_BackfillRetriesAfterPartialFirstPoll(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeClient{thread: backfillThread()}
+	seedReply(t, conn, "partial", "1699000100.000200", "first reply")
+
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	rows := backfillRows(t, conn)
+	if got := countType(rows, watcher.EventTypeWatchStarted); got != 1 {
+		t.Fatalf("watch_started = %d, want 1: %+v", got, rows)
+	}
+	if got := countType(rows, watcher.EventTypeSlackReply); got != 2 {
+		t.Fatalf("slack_reply = %d, want 2: %+v", got, rows)
+	}
+	for _, r := range rows {
+		if r.extTS == "1699000200.000300" && r.typ == string(watcher.EventTypeSlackReply) && r.ts != "2023-11-03T08:30:00Z" {
+			t.Errorf("remaining reply ts = %s, want its send time", r.ts)
+		}
+	}
+}
+
+func TestPoll_MalformedReplyTSStampedNow(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	thread := backfillThread()
+	thread.Messages = thread.Messages[:1]
+	client := &fakeClient{thread: thread}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	// "abc" sorts after any digit ts, so the live path sees it as new.
+	client.thread.Messages = append(client.thread.Messages, Message{TS: "abc", UserID: "U2", Text: "odd"})
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range backfillRows(t, conn) {
+		if r.extTS == "abc" {
+			assertRecent(t, "malformed-ts reply", r.ts)
+			return
+		}
+	}
+	t.Fatal("no event recorded for the malformed-ts reply")
 }

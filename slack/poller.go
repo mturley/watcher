@@ -208,11 +208,11 @@ func parseResourceID(id string) (channel, threadTS string, ok bool) {
 // Returns the count of events emitted, and the root text with its mentions
 // resolved for the caller to cache.
 //
-// The first poll (empty cursor) always emits watch_started, stamped now.
-// Without backfill that is all it does. With backfill it also records every
-// earlier reply, each stamped with the time it was SENT (emitReplies), so
-// history lands at the right point in a consumer's timeline rather than
-// flooding its top. Later polls record new replies stamped with the wall
+// The first poll (no watch_started recorded yet) always emits watch_started,
+// stamped now, and emits it last. Without backfill that is all it does. With
+// backfill it first records every earlier reply, each stamped with the time
+// it was SENT (emitReplies), so history lands at the right point in a
+// consumer's timeline rather than flooding its top. Later polls record new replies stamped with the wall
 // clock: a consumer reading "events newer than ts" (a notifier) must still
 // see a reply that was sent minutes before the poll that found it.
 //
@@ -221,12 +221,11 @@ func parseResourceID(id string) (channel, threadTS string, ok bool) {
 // user directory, and would otherwise show raw ids for the very text that
 // renders as names in the thread view.
 func processThread(conn *sql.DB, client Client, thread Thread, names map[string]string, resource watcher.Resource, backfill bool, logger *log.Logger) (int, string, error) {
-	cursor, err := db.EventCursor(conn, "slack", resource.Type, resource.ID)
+	started, err := watchStarted(conn, resource)
 	if err != nil {
-		return 0, "", fmt.Errorf("event cursor: %w", err)
+		return 0, "", err
 	}
-
-	if cursor == "" {
+	if !started {
 		replies := []Message(nil)
 		if backfill {
 			replies = threadReplies(thread)
@@ -234,13 +233,24 @@ func processThread(conn *sql.DB, client Client, thread Thread, names map[string]
 		mentions := newMentionResolver(client, names, threadTexts(thread, replies)...)
 		resolvedRoot := mentions.resolve(rootText(thread))
 		title := fallbackTitle(resolvedRoot)
+		// Replies first, watch_started last: until watch_started exists the
+		// next poll is still a first poll, so a failure part-way through is
+		// retried rather than leaving the older replies unrecorded.
+		n, err := emitReplies(conn, replies, names, mentions, title, true, resource, logger)
+		if err != nil {
+			return n, resolvedRoot, err
+		}
 		wsTitle := fmt.Sprintf("Started watching thread: %s", title)
 		body := resolvedRoot
 		if err := emitEvent(conn, watcher.EventTypeWatchStarted, wsTitle, &body, latestThreadTS(thread), "", nil, nil, nil, resource); err != nil {
-			return 0, resolvedRoot, fmt.Errorf("emit watch_started: %w", err)
+			return n, resolvedRoot, fmt.Errorf("emit watch_started: %w", err)
 		}
-		n, err := emitReplies(conn, replies, names, mentions, title, true, resource, logger)
-		return 1 + n, resolvedRoot, err
+		return n + 1, resolvedRoot, nil
+	}
+
+	cursor, err := db.EventCursor(conn, "slack", resource.Type, resource.ID)
+	if err != nil {
+		return 0, "", fmt.Errorf("event cursor: %w", err)
 	}
 
 	// Only replies past the cursor get events, so only their mentions (and
@@ -265,9 +275,9 @@ func processThread(conn *sql.DB, client Client, thread Thread, names map[string]
 // body of any recorded reply, and of the thread's watch_started, whose text
 // differs. Returns the count of events emitted or rewritten.
 //
-// A thread with no events at all (followed but never polled) is left alone:
-// recording replies here would set its cursor, and its first poll would then
-// never record watch_started. That poll backfills it itself.
+// A thread with no watch_started (followed but never polled, or a first poll
+// that failed part-way) is left alone: its next poll is still a first poll,
+// and backfills it itself.
 //
 // It never emits watch_started and touches no cached state.
 func BackfillThread(conn *sql.DB, client Client, resource watcher.Resource, logger *log.Logger) (int, error) {
@@ -275,11 +285,11 @@ func BackfillThread(conn *sql.DB, client Client, resource watcher.Resource, logg
 	if !ok {
 		return 0, fmt.Errorf("bad slack resource id %q", resource.ID)
 	}
-	cursor, err := db.EventCursor(conn, "slack", resource.Type, resource.ID)
+	started, err := watchStarted(conn, resource)
 	if err != nil {
-		return 0, fmt.Errorf("event cursor: %w", err)
+		return 0, err
 	}
-	if cursor == "" {
+	if !started {
 		return 0, nil
 	}
 	thread, err := client.Replies(context.Background(), channel, threadTS)
@@ -414,6 +424,19 @@ func slackSendTime(ts string) string {
 		return ""
 	}
 	return time.Unix(n, 0).UTC().Format(time.RFC3339)
+}
+
+// watchStarted reports whether the resource's first poll has completed,
+// which is marked by its watch_started event (always written last).
+func watchStarted(conn *sql.DB, resource watcher.Resource) (bool, error) {
+	ok, err := db.IsDuplicate(conn, db.DedupCheck{
+		Source: "slack", ResourceType: resource.Type, ResourceID: resource.ID,
+		Type: watcher.EventTypeWatchStarted, MatchTypeOnly: true,
+	})
+	if err != nil {
+		return false, fmt.Errorf("watch_started lookup: %w", err)
+	}
+	return ok, nil
 }
 
 // rootText returns the root message's text, or "" if the thread has no
