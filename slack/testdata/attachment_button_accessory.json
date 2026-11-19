@@ -1,0 +1,29 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "ts": "1700000000.000100",
+      "user": "U0EXAMPLE1",
+      "text": "shared an app message",
+      "thread_ts": "1700000000.000100",
+      "attachments": [
+        {
+          "color": "2684ff",
+          "blocks": [
+            {
+              "type": "section",
+              "block_id": "b1",
+              "text": { "type": "mrkdwn", "text": "*Sample alert* fired" },
+              "accessory": {
+                "type": "button",
+                "action_id": "a1",
+                "text": { "type": "plain_text", "text": "View", "emoji": true },
+                "url": "https://app.example.test/alerts/1"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

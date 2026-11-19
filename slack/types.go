@@ -75,9 +75,39 @@ type rawTextObject struct {
 
 type rawBlockElement struct {
 	Type     string `json:"type"` // "image" | "mrkdwn" | "plain_text" | (interactive)
-	Text     string `json:"text"` // for mrkdwn/plain_text elements
+	Text     string `json:"text"` // mrkdwn/plain_text: the text; interactive (button): its label
 	ImageURL string `json:"image_url"`
 	AltText  string `json:"alt_text"`
+}
+
+// UnmarshalJSON accepts both shapes Slack sends for "text": a string (a
+// mrkdwn/plain_text element) or a text object (an interactive accessory such
+// as a button, whose label is {"type":"plain_text","text":"View"}). Decoding
+// the object as a string failed the WHOLE conversations.replies response, so
+// a single such message made its thread unpollable.
+func (e *rawBlockElement) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Type     string          `json:"type"`
+		Text     json.RawMessage `json:"text"`
+		ImageURL string          `json:"image_url"`
+		AltText  string          `json:"alt_text"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*e = rawBlockElement{Type: raw.Type, ImageURL: raw.ImageURL, AltText: raw.AltText}
+	if len(raw.Text) == 0 || string(raw.Text) == "null" {
+		return nil
+	}
+	if raw.Text[0] == '"' {
+		return json.Unmarshal(raw.Text, &e.Text)
+	}
+	var obj rawTextObject
+	if err := json.Unmarshal(raw.Text, &obj); err != nil {
+		return nil // an unknown text shape degrades to no text, never a failed thread
+	}
+	e.Text = obj.Text
+	return nil
 }
 
 // rawBlockKit models a Block Kit block carried inside an attachment. `elements`

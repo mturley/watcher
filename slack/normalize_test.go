@@ -539,3 +539,47 @@ func TestNormalizeUserGroupElementFromJSON(t *testing.T) {
 		t.Errorf("range did not unmarshal: %+v", got[1])
 	}
 }
+
+// Slack sends an interactive accessory's text (a button's label) as a text
+// OBJECT, where image/mrkdwn elements carry a string. Decoding it as a
+// string failed the whole conversations.replies response, so one such
+// message made its entire thread unpollable.
+func TestNormalizeThread_ButtonAccessoryTextObject(t *testing.T) {
+	data, err := os.ReadFile("testdata/attachment_button_accessory.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw RepliesResponse
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	th := NormalizeThread("C0EXAMPLE", "1700000000.000100", raw)
+	if len(th.Messages) != 1 || len(th.Messages[0].Attachments) != 1 {
+		t.Fatalf("want 1 message with 1 attachment, got %+v", th.Messages)
+	}
+	b := th.Messages[0].Attachments[0].Blocks
+	if len(b) != 1 || b[0].Accessory == nil {
+		t.Fatalf("want a section with an accessory, got %+v", b)
+	}
+	if b[0].Accessory.Type != "button" || b[0].Accessory.Text != "View" {
+		t.Errorf("accessory = %+v, want button labelled View", *b[0].Accessory)
+	}
+}
+
+func TestRawBlockElementTextForms(t *testing.T) {
+	for in, want := range map[string]string{
+		`{"type":"mrkdwn","text":"plain string"}`:                    "plain string",
+		`{"type":"button","text":{"type":"plain_text","text":"Go"}}`: "Go",
+		`{"type":"image","image_url":"u"}`:                           "",
+		`{"type":"button","text":null}`:                              "",
+	} {
+		var e rawBlockElement
+		if err := json.Unmarshal([]byte(in), &e); err != nil {
+			t.Errorf("%s: %v", in, err)
+			continue
+		}
+		if e.Text != want {
+			t.Errorf("%s: Text = %q, want %q", in, e.Text, want)
+		}
+	}
+}
