@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"testing"
+	"time"
 
 	"github.com/mturley/watcher"
 	"github.com/mturley/watcher/db"
@@ -658,5 +659,200 @@ func TestCachedStateCarriesLastRead(t *testing.T) {
 	none := Thread{LastRead: "", Messages: th.Messages}
 	if got := decode(buildSlackStateJSON(none, "eng", "ana", "root"))["last_read"]; got != "" {
 		t.Fatalf("last_read = %v, want empty when the thread has no read cursor", got)
+	}
+}
+
+// backfillRow is one recorded event of the resource under test, as the
+// backfill tests need to see it.
+type backfillRow struct {
+	typ, ts, extTS string
+	authorID       sql.NullString
+}
+
+func backfillRows(t *testing.T, conn *sql.DB) []backfillRow {
+	t.Helper()
+	rows, err := conn.Query(`
+		SELECT e.type, e.ts, COALESCE(e.external_ts, ''), e.author_id
+		  FROM watcher_events e
+		  JOIN watcher_event_resources er ON er.event_id = e.id
+		 WHERE er.resource_type = ? AND er.resource_id = ?
+		 ORDER BY e.external_ts, e.type`, "slack", slackResource.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []backfillRow
+	for rows.Next() {
+		var r backfillRow
+		if err := rows.Scan(&r.typ, &r.ts, &r.extTS, &r.authorID); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func countType(rows []backfillRow, typ watcher.EventType) int {
+	n := 0
+	for _, r := range rows {
+		if r.typ == string(typ) {
+			n++
+		}
+	}
+	return n
+}
+
+// assertRecent fails unless ts is an RFC3339 time within a minute of now:
+// the wall-clock stamp, as opposed to a message's send time.
+func assertRecent(t *testing.T, what, ts string) {
+	t.Helper()
+	got, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		t.Fatalf("%s ts %q: %v", what, ts, err)
+	}
+	if d := time.Since(got); d < -time.Minute || d > time.Minute {
+		t.Errorf("%s ts = %s, want within a minute of now", what, ts)
+	}
+}
+
+func TestSlackSendTime(t *testing.T) {
+	for in, want := range map[string]string{
+		"1699000000.000100": "2023-11-03T08:26:40Z",
+		"abc":               "",
+		"":                  "",
+	} {
+		if got := slackSendTime(in); got != want {
+			t.Errorf("slackSendTime(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func backfillThread() Thread {
+	return Thread{
+		Channel:  "C1",
+		ThreadTS: "1699000000.000100",
+		Messages: []Message{
+			{TS: "1699000000.000100", UserID: "U1", Text: "root"},
+			{TS: "1699000100.000200", UserID: "U2", Text: "first reply"},
+			{TS: "1699000200.000300", UserID: "U1", Text: "second reply"},
+		},
+	}
+}
+
+func TestPoll_BackfillDatesRepliesAtSendTime(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeClient{thread: backfillThread(), users: map[string]User{
+		"U1": {ID: "U1", DisplayName: "Alice"}, "U2": {ID: "U2", DisplayName: "Bob"},
+	}}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := backfillRows(t, conn)
+	if got := countType(rows, watcher.EventTypeWatchStarted); got != 1 {
+		t.Fatalf("watch_started = %d, want 1: %+v", got, rows)
+	}
+	want := []struct{ extTS, ts, author string }{
+		{"1699000100.000200", "2023-11-03T08:28:20Z", "U2"},
+		{"1699000200.000300", "2023-11-03T08:30:00Z", "U1"},
+	}
+	var replies []backfillRow
+	for _, r := range rows {
+		if r.typ == string(watcher.EventTypeSlackReply) {
+			replies = append(replies, r)
+		} else {
+			assertRecent(t, "watch_started", r.ts)
+		}
+	}
+	if len(replies) != len(want) {
+		t.Fatalf("slack_reply = %d, want %d: %+v", len(replies), len(want), rows)
+	}
+	for i, w := range want {
+		r := replies[i]
+		if r.extTS != w.extTS || r.ts != w.ts || r.authorID.String != w.author {
+			t.Errorf("reply %d = %+v, want external_ts %s ts %s author_id %s", i, r, w.extTS, w.ts, w.author)
+		}
+	}
+
+	// A reply arriving after the backfill is live: stamped with the wall
+	// clock, so the notifier (which reads ts near now) still sees it.
+	client.thread.Messages = append(client.thread.Messages,
+		Message{TS: "1699000300.000400", UserID: "U2", Text: "live reply"})
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	rows = backfillRows(t, conn)
+	if got := countType(rows, watcher.EventTypeSlackReply); got != 3 {
+		t.Fatalf("slack_reply after live poll = %d, want 3", got)
+	}
+	last := rows[len(rows)-1]
+	if last.extTS != "1699000300.000400" {
+		t.Fatalf("last row = %+v, want the live reply", last)
+	}
+	assertRecent(t, "live reply", last.ts)
+}
+
+func TestPoll_BackfillRootOnly(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatal(err)
+	}
+	thread := backfillThread()
+	thread.Messages = thread.Messages[:1]
+	client := &fakeClient{thread: thread}
+	for i := 0; i < 2; i++ {
+		if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := backfillRows(t, conn)
+	if countType(rows, watcher.EventTypeWatchStarted) != 1 || countType(rows, watcher.EventTypeSlackReply) != 0 {
+		t.Fatalf("rows = %+v, want exactly one watch_started", rows)
+	}
+}
+
+func TestBackfillThread_FillsOnlyMissing(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	full := backfillThread()
+	full.Messages = append(full.Messages, Message{TS: "1699000300.000400", UserID: "U2", Text: "third reply"})
+
+	// Followed without backfill after the first two replies existed, then
+	// the third arrived and was recorded live.
+	client := &fakeClient{thread: Thread{Channel: "C1", ThreadTS: full.ThreadTS, Messages: full.Messages[:3]}}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	client.thread = full
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got := countType(backfillRows(t, conn), watcher.EventTypeSlackReply); got != 1 {
+		t.Fatalf("slack_reply before backfill = %d, want 1", got)
+	}
+
+	n, err := BackfillThread(conn, client, slackResource, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("BackfillThread emitted %d, want 2", n)
+	}
+	if n, err := BackfillThread(conn, client, slackResource, testLogger()); err != nil || n != 0 {
+		t.Errorf("second BackfillThread = %d, %v; want 0, nil", n, err)
+	}
+	rows := backfillRows(t, conn)
+	if countType(rows, watcher.EventTypeWatchStarted) != 1 || countType(rows, watcher.EventTypeSlackReply) != 3 {
+		t.Fatalf("rows = %+v, want 1 watch_started and 3 slack_reply", rows)
+	}
+	for _, r := range rows {
+		if r.extTS == "1699000100.000200" && r.ts != "2023-11-03T08:28:20Z" {
+			t.Errorf("backfilled reply ts = %s, want send time", r.ts)
+		}
 	}
 }

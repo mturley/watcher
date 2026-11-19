@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -153,12 +155,16 @@ func pollWith(conn *sql.DB, client Client, resources []watcher.Resource, logger 
 }
 
 // emitEvent inserts a watcher event for the given resource, setting the ID
-// and recording timestamp that db.InsertEvent does not set.
-func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS string, author, authorType, authorID *string, r watcher.Resource) error {
+// and the event ts that db.InsertEvent does not set: ts when non-empty,
+// otherwise the wall clock.
+func emitEvent(conn *sql.DB, t watcher.EventType, title string, body *string, externalTS, ts string, author, authorType, authorID *string, r watcher.Resource) error {
 	extTS := externalTS
+	if ts == "" {
+		ts = time.Now().UTC().Format(time.RFC3339)
+	}
 	return db.InsertEvent(conn, watcher.Event{
 		ID:         uuid.New().String(),
-		TS:         time.Now().UTC().Format(time.RFC3339),
+		TS:         ts,
 		ExternalTS: &extTS,
 		Source:     "slack",
 		Type:       t,
@@ -200,58 +206,92 @@ func parseResourceID(id string) (channel, threadTS string, ok bool) {
 
 // processThread processes a single Slack thread's replies and emits events.
 // Returns the count of events emitted, and the root text with its mentions
-// resolved for the caller to cache. When cursor is empty and backfill is
-// false, only a watch_started event is emitted on the first poll.
+// resolved for the caller to cache.
+//
+// The first poll (empty cursor) always emits watch_started, stamped now.
+// Without backfill that is all it does. With backfill it also records every
+// earlier reply, each stamped with the time it was SENT (backfillReplies), so
+// history lands at the right point in a consumer's timeline rather than
+// flooding its top. Later polls record new replies stamped with the wall
+// clock: a consumer reading "events newer than ts" (a notifier) must still
+// see a reply that was sent minutes before the poll that found it.
 //
 // Mention tokens ("<@U…>", "<!subteam^S…>") are resolved to names before any
 // text is stored: an event's title and body are read by consumers that have no
 // user directory, and would otherwise show raw ids for the very text that
 // renders as names in the thread view.
 func processThread(conn *sql.DB, client Client, thread Thread, names map[string]string, resource watcher.Resource, backfill bool, logger *log.Logger) (int, string, error) {
-	eventCount := 0
-
 	cursor, err := db.EventCursor(conn, "slack", resource.Type, resource.ID)
 	if err != nil {
 		return 0, "", fmt.Errorf("event cursor: %w", err)
 	}
 
-	firstPoll := cursor == "" && !backfill
+	if cursor == "" {
+		replies := []Message(nil)
+		if backfill {
+			replies = threadReplies(thread)
+		}
+		mentions := newMentionResolver(client, names, threadTexts(thread, replies)...)
+		resolvedRoot := mentions.resolve(rootText(thread))
+		title := fallbackTitle(resolvedRoot)
+		wsTitle := fmt.Sprintf("Started watching thread: %s", title)
+		body := title
+		if err := emitEvent(conn, watcher.EventTypeWatchStarted, wsTitle, &body, latestThreadTS(thread), "", nil, nil, nil, resource); err != nil {
+			return 0, resolvedRoot, fmt.Errorf("emit watch_started: %w", err)
+		}
+		n, err := emitReplies(conn, replies, names, mentions, title, true, resource, logger)
+		return 1 + n, resolvedRoot, err
+	}
 
 	// Only replies past the cursor get events, so only their mentions (and
 	// the root's, which titles every event) need a directory lookup.
 	var fresh []Message
-	if !firstPoll && len(thread.Messages) > 1 {
-		for _, m := range thread.Messages[1:] { // skip the root
-			if m.TS > cursor { // raw Slack ts string compare — the invariant
-				fresh = append(fresh, m)
-			}
+	for _, m := range threadReplies(thread) {
+		if m.TS > cursor { // raw Slack ts string compare — the invariant
+			fresh = append(fresh, m)
 		}
 	}
-	texts := []string{rootText(thread)}
-	for _, m := range fresh {
-		texts = append(texts, m.Text)
-	}
-	mentions := newMentionResolver(client, names, texts...)
+	mentions := newMentionResolver(client, names, threadTexts(thread, fresh)...)
 	resolvedRoot := mentions.resolve(rootText(thread))
-	title := fallbackTitle(resolvedRoot)
+	n, err := emitReplies(conn, fresh, names, mentions, fallbackTitle(resolvedRoot), false, resource, logger)
+	return n, resolvedRoot, err
+}
 
-	if firstPoll {
-		wsTitle := fmt.Sprintf("Started watching thread: %s", title)
-		body := title
-		if err := emitEvent(conn, watcher.EventTypeWatchStarted, wsTitle, &body, latestThreadTS(thread), nil, nil, nil, resource); err != nil {
-			return 0, resolvedRoot, fmt.Errorf("emit watch_started: %w", err)
-		}
-		return 1, resolvedRoot, nil
+// BackfillThread records every reply in the resource's thread (up to the
+// page conversations.replies returns) that has no slack_reply event yet,
+// each stamped with its send time, regardless of the event cursor. It never
+// emits watch_started and touches no cached state. Returns the count emitted.
+//
+// It exists for consumers catching up threads they followed before turning
+// on backfill: the poller only backfills on a thread's first poll.
+func BackfillThread(conn *sql.DB, client Client, resource watcher.Resource, logger *log.Logger) (int, error) {
+	channel, threadTS, ok := parseResourceID(resource.ID)
+	if !ok {
+		return 0, fmt.Errorf("bad slack resource id %q", resource.ID)
 	}
+	thread, err := client.Replies(context.Background(), channel, threadTS)
+	if err != nil {
+		return 0, fmt.Errorf("fetch thread %s: %w", resource.ID, err)
+	}
+	names := resolveAuthors(client, thread.Messages)
+	replies := threadReplies(thread)
+	mentions := newMentionResolver(client, names, threadTexts(thread, replies)...)
+	title := fallbackTitle(mentions.resolve(rootText(thread)))
+	return emitReplies(conn, replies, names, mentions, title, true, resource, logger)
+}
 
-	for _, m := range fresh {
-
+// emitReplies records a slack_reply for each message not already recorded
+// (deduped on its ts). atSendTime stamps each event with the message's send
+// time instead of the wall clock; see processThread for when each applies.
+func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions mentionResolver, title string, atSendTime bool, resource watcher.Resource, logger *log.Logger) (int, error) {
+	count := 0
+	for _, m := range msgs {
 		dup, err := db.IsDuplicate(conn, db.DedupCheck{
 			Source: "slack", ResourceType: resource.Type, ResourceID: resource.ID,
 			Type: watcher.EventTypeSlackReply, ExternalTS: &m.TS,
 		})
 		if err != nil {
-			return eventCount, resolvedRoot, fmt.Errorf("dedup: %w", err)
+			return count, fmt.Errorf("dedup: %w", err)
 		}
 		if dup {
 			continue
@@ -268,14 +308,47 @@ func processThread(conn *sql.DB, client Client, thread Thread, names map[string]
 		if author != "" {
 			authorPtr = &author
 		}
-		if err := emitEvent(conn, watcher.EventTypeSlackReply, evTitle, &body, m.TS, authorPtr, nil, optional(m.UserID), resource); err != nil {
-			return eventCount, resolvedRoot, fmt.Errorf("emit slack_reply: %w", err)
+		ts := ""
+		if atSendTime {
+			ts = slackSendTime(m.TS)
 		}
-		eventCount++
+		if err := emitEvent(conn, watcher.EventTypeSlackReply, evTitle, &body, m.TS, ts, authorPtr, nil, optional(m.UserID), resource); err != nil {
+			return count, fmt.Errorf("emit slack_reply: %w", err)
+		}
+		count++
 		logger.Printf("Emitted slack_reply for %s", resource.ID)
 	}
+	return count, nil
+}
 
-	return eventCount, resolvedRoot, nil
+// threadReplies returns the thread's messages after the root.
+func threadReplies(thread Thread) []Message {
+	if len(thread.Messages) < 2 {
+		return nil
+	}
+	return thread.Messages[1:]
+}
+
+// threadTexts is the root's text followed by each message's: the texts whose
+// mentions need resolving.
+func threadTexts(thread Thread, msgs []Message) []string {
+	texts := []string{rootText(thread)}
+	for _, m := range msgs {
+		texts = append(texts, m.Text)
+	}
+	return texts
+}
+
+// slackSendTime converts a Slack ts ("<unix seconds>.<micros>") to the
+// RFC3339 UTC time it was sent, whole seconds, matching every other event
+// ts. Returns "" when ts has no parseable seconds.
+func slackSendTime(ts string) string {
+	secs, _, _ := strings.Cut(ts, ".")
+	n, err := strconv.ParseInt(secs, 10, 64)
+	if err != nil || secs == "" {
+		return ""
+	}
+	return time.Unix(n, 0).UTC().Format(time.RFC3339)
 }
 
 // rootText returns the root message's text, or "" if the thread has no
