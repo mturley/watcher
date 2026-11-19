@@ -210,7 +210,7 @@ func parseResourceID(id string) (channel, threadTS string, ok bool) {
 //
 // The first poll (empty cursor) always emits watch_started, stamped now.
 // Without backfill that is all it does. With backfill it also records every
-// earlier reply, each stamped with the time it was SENT (backfillReplies), so
+// earlier reply, each stamped with the time it was SENT (emitReplies), so
 // history lands at the right point in a consumer's timeline rather than
 // flooding its top. Later polls record new replies stamped with the wall
 // clock: a consumer reading "events newer than ts" (a notifier) must still
@@ -257,35 +257,66 @@ func processThread(conn *sql.DB, client Client, thread Thread, names map[string]
 	return n, resolvedRoot, err
 }
 
-// BackfillThread records every reply in the resource's thread (up to the
-// page conversations.replies returns) that has no slack_reply event yet,
-// each stamped with its send time, regardless of the event cursor. It never
-// emits watch_started and touches no cached state. Returns the count emitted.
+// BackfillThread catches up a thread that was first polled without backfill
+// (it exists for consumers that followed threads before turning backfill
+// on; the poller only backfills on a thread's first poll). It records every
+// reply (up to the page conversations.replies returns) that has no
+// slack_reply event yet, each stamped with its send time, and rewrites the
+// body of any recorded reply, and of the thread's watch_started, whose text
+// differs. Returns the count of events emitted or rewritten.
 //
-// It exists for consumers catching up threads they followed before turning
-// on backfill: the poller only backfills on a thread's first poll.
+// A thread with no events at all (followed but never polled) is left alone:
+// recording replies here would set its cursor, and its first poll would then
+// never record watch_started. That poll backfills it itself.
+//
+// It never emits watch_started and touches no cached state.
 func BackfillThread(conn *sql.DB, client Client, resource watcher.Resource, logger *log.Logger) (int, error) {
 	channel, threadTS, ok := parseResourceID(resource.ID)
 	if !ok {
 		return 0, fmt.Errorf("bad slack resource id %q", resource.ID)
 	}
+	cursor, err := db.EventCursor(conn, "slack", resource.Type, resource.ID)
+	if err != nil {
+		return 0, fmt.Errorf("event cursor: %w", err)
+	}
+	if cursor == "" {
+		return 0, nil
+	}
 	thread, err := client.Replies(context.Background(), channel, threadTS)
 	if err != nil {
 		return 0, fmt.Errorf("fetch thread %s: %w", resource.ID, err)
 	}
+	if len(thread.Messages) == 0 {
+		return 0, nil
+	}
 	names := resolveAuthors(client, thread.Messages)
 	replies := threadReplies(thread)
 	mentions := newMentionResolver(client, names, threadTexts(thread, replies)...)
-	title := fallbackTitle(mentions.resolve(rootText(thread)))
-	return emitReplies(conn, replies, names, mentions, title, true, resource, logger)
+	resolvedRoot := mentions.resolve(rootText(thread))
+
+	count := 0
+	if mentions.complete(rootText(thread)) {
+		changed, err := db.UpdateEventBody(conn, db.DedupCheck{
+			Source: "slack", ResourceType: resource.Type, ResourceID: resource.ID,
+			Type: watcher.EventTypeWatchStarted, MatchTypeOnly: true,
+		}, resolvedRoot)
+		if err != nil {
+			return 0, fmt.Errorf("update watch_started body: %w", err)
+		}
+		if changed {
+			count++
+		}
+	}
+	n, err := emitReplies(conn, replies, names, mentions, fallbackTitle(resolvedRoot), true, resource, logger)
+	return count + n, err
 }
 
 // emitReplies records a slack_reply for each message not already recorded
 // (deduped on its ts). atSendTime marks a backfill: each new event is
 // stamped with the message's send time instead of the wall clock (see
 // processThread for when each applies), and an already-recorded reply whose
-// body differs is rewritten. Returns the count of events emitted or
-// rewritten.
+// body differs is rewritten, unless a name in it failed to resolve. Returns
+// the count of events emitted or rewritten.
 func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions mentionResolver, title string, atSendTime bool, resource watcher.Resource, logger *log.Logger) (int, error) {
 	count := 0
 	for _, m := range msgs {
@@ -303,7 +334,9 @@ func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions
 			// Only a backfill revisits recorded replies: it brings their
 			// text up to date (bodies recorded before they held the whole
 			// message, and edits since). A live poll never sees them again.
-			if atSendTime {
+			// A failed (e.g. rate-limited) name lookup would swap names for
+			// raw ids that nothing ever repairs, so it keeps the old body.
+			if atSendTime && nameResolved(author, m.UserID) && mentions.complete(m.Text) {
 				changed, err := db.UpdateEventBody(conn, check, body)
 				if err != nil {
 					return count, fmt.Errorf("update slack_reply body: %w", err)
@@ -331,6 +364,16 @@ func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions
 		logger.Printf("Emitted slack_reply for %s", resource.ID)
 	}
 	return count, nil
+}
+
+// nameResolved reports whether a message author's name lookup succeeded:
+// HTTPClient.Users reports a failed users.info as the id itself. A message
+// with no user (a bot or integration) has nothing to resolve.
+func nameResolved(author, userID string) bool {
+	if userID == "" {
+		return true
+	}
+	return author != "" && author != userID
 }
 
 // replyBody is a reply event's body: the author's name and the WHOLE message
@@ -509,6 +552,27 @@ func newMentionResolver(client Client, names map[string]string, texts ...string)
 
 func (r mentionResolver) resolve(text string) string {
 	return ResolveMentions(text, r.users, r.groups)
+}
+
+// complete reports whether every mention in text resolves to a name rather
+// than falling back to its raw id.
+func (r mentionResolver) complete(text string) bool {
+	userIDs, groupIDs := MentionIDs(text)
+	for _, id := range userIDs {
+		if !nameResolved(r.users[id], id) {
+			return false
+		}
+	}
+	if len(groupIDs) == 0 {
+		return true
+	}
+	resolved := r.resolve(text)
+	for _, id := range groupIDs {
+		if strings.Contains(resolved, "@"+id) {
+			return false
+		}
+	}
+	return true
 }
 
 func buildSlackStateJSON(thread Thread, channelName, rootAuthor, resolvedRoot string) string {

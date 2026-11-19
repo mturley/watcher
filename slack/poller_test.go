@@ -938,3 +938,91 @@ func TestBackfillThread_RewritesTruncatedBody(t *testing.T) {
 		t.Errorf("second BackfillThread = %d, %v; want 0, nil", n, err)
 	}
 }
+
+// seedReply records a reply event as an earlier poll would have.
+func seedReply(t *testing.T, conn *sql.DB, id, ts, body string) {
+	t.Helper()
+	if err := db.InsertEvent(conn, watcher.Event{ID: id, TS: "2023-11-03T08:28:20Z", ExternalTS: &ts,
+		Source: "slack", Type: watcher.EventTypeSlackReply, Title: "New reply in root", Body: &body}, slackResource); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A rate-limited or failed user lookup must never turn a good body into one
+// naming raw user ids: nothing would ever repair it.
+func TestBackfillThread_KeepsBodyWhenNamesUnresolved(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	thread := backfillThread()
+	thread.Messages = append(thread.Messages[:1],
+		Message{TS: "1699000100.000200", UserID: "U2", Text: "edited text"},
+		Message{TS: "1699000200.000300", UserID: "U1", Text: "hey <@U3> edited"})
+	// U2 (author) and U3 (mention) fail to resolve, as HTTPClient.Users
+	// reports a failed users.info: the id as the name.
+	client := &fakeClient{thread: thread, users: map[string]User{
+		"U1": {ID: "U1", DisplayName: "Alice"},
+		"U2": {ID: "U2", DisplayName: "U2"},
+		"U3": {ID: "U3", DisplayName: "U3"},
+	}}
+	seedReply(t, conn, "r1", "1699000100.000200", "Bob: original text")
+	seedReply(t, conn, "r2", "1699000200.000300", "Alice: hey @Carol original")
+
+	n, err := BackfillThread(conn, client, slackResource, testLogger())
+	if err != nil || n != 0 {
+		t.Fatalf("BackfillThread = %d, %v; want 0, nil", n, err)
+	}
+	if got := eventBody(t, conn, watcher.EventTypeSlackReply, "1699000100.000200"); got != "Bob: original text" {
+		t.Errorf("unresolved author rewrote body to %q", got)
+	}
+	if got := eventBody(t, conn, watcher.EventTypeSlackReply, "1699000200.000300"); got != "Alice: hey @Carol original" {
+		t.Errorf("unresolved mention rewrote body to %q", got)
+	}
+}
+
+func TestBackfillThread_RewritesWatchStartedBody(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	root := "1699000000.000100"
+	short := fallbackTitle(longText)
+	if err := db.InsertEvent(conn, watcher.Event{ID: "ws", TS: "2023-11-03T08:28:20Z", ExternalTS: &root,
+		Source: "slack", Type: watcher.EventTypeWatchStarted, Title: "Started watching thread: x", Body: &short}, slackResource); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeClient{thread: Thread{Channel: "C1", ThreadTS: root,
+		Messages: []Message{{TS: root, UserID: "U1", Text: longText}}}}
+	n, err := BackfillThread(conn, client, slackResource, testLogger())
+	if err != nil || n != 1 {
+		t.Fatalf("BackfillThread = %d, %v; want 1, nil", n, err)
+	}
+	if got := eventBody(t, conn, watcher.EventTypeWatchStarted, root); got != longText {
+		t.Errorf("watch_started body = %q, want the whole root", got)
+	}
+}
+
+// A thread followed but never polled has no events: backfilling it here
+// would set the cursor and the first poll would never record watch_started.
+// The poller backfills it itself.
+func TestBackfillThread_SkipsNeverPolledThread(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeClient{thread: backfillThread()}
+	n, err := BackfillThread(conn, client, slackResource, testLogger())
+	if err != nil || n != 0 {
+		t.Fatalf("BackfillThread = %d, %v; want 0, nil", n, err)
+	}
+	if rows := backfillRows(t, conn); len(rows) != 0 {
+		t.Fatalf("rows = %+v, want none", rows)
+	}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got := countType(backfillRows(t, conn), watcher.EventTypeWatchStarted); got != 1 {
+		t.Errorf("watch_started after first poll = %d, want 1", got)
+	}
+}
