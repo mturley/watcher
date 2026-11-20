@@ -378,6 +378,9 @@ func emitMessages(conn *sql.DB, kind watcher.EventType, msgs []Message, names ma
 		}
 
 		evTitle := "Message in " + title
+		if nameResolved(author, m.UserID) && author != "" {
+			evTitle = "Message from " + author + " in " + title
+		}
 		if kind == watcher.EventTypeSlackThreadRoot {
 			evTitle = "Thread started: " + title
 		}

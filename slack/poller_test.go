@@ -579,7 +579,7 @@ func TestEventTextResolvesMentions(t *testing.T) {
 		t.Errorf("watch_started title = %q", wsTitle)
 	}
 	r := got[watcher.EventTypeSlackReply]
-	if r.Title != "Message in "+wantTitle {
+	if r.Title != "Message from Bob in "+wantTitle {
 		t.Errorf("slack_reply title = %q", r.Title)
 	}
 	if r.Body == nil || *r.Body != "Bob: @Dee agreed" {
@@ -1238,5 +1238,39 @@ func TestBackfillThread_RewritesShortRootBody(t *testing.T) {
 	}
 	if got := eventBody(t, conn, watcher.EventTypeSlackThreadRoot, "1699000000.000100"); got != "Alice: "+longText {
 		t.Errorf("root body = %q, want the whole root", got)
+	}
+}
+
+// A reply's title names its author; one whose name lookup failed (the id
+// comes back as the name) or that has no user gets the plain form, never a
+// raw id.
+func TestPoll_ReplyTitleNamesResolvedAuthorOnly(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		users map[string]User
+		want  string
+	}{
+		{"resolved", map[string]User{"U2": {ID: "U2", DisplayName: "Bob"}}, "Message from Bob in root"},
+		{"lookup failed", map[string]User{"U2": {ID: "U2", DisplayName: "U2"}}, "Message in root"},
+		{"unknown", map[string]User{}, "Message in root"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			conn := testutil.NewTestDB(t)
+			if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+				t.Fatal(err)
+			}
+			thread := backfillThread()
+			thread.Messages = thread.Messages[:2] // root + U2's reply
+			if err := pollOnce(conn, &fakeClient{thread: thread, users: c.users}, slackResource, testLogger()); err != nil {
+				t.Fatal(err)
+			}
+			var title string
+			if err := conn.QueryRow(`SELECT title FROM watcher_events WHERE type = 'slack_reply'`).Scan(&title); err != nil {
+				t.Fatal(err)
+			}
+			if title != c.want {
+				t.Errorf("title = %q, want %q", title, c.want)
+			}
+		})
 	}
 }
