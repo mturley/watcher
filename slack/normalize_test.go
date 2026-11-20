@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -580,6 +581,34 @@ func TestRawBlockElementTextForms(t *testing.T) {
 		}
 		if e.Text != want {
 			t.Errorf("%s: Text = %q, want %q", in, e.Text, want)
+		}
+	}
+}
+
+// Every rawBlockElement field other than text decodes as plain encoding/json
+// would decode it: UnmarshalJSON must not drop a field added later.
+func TestRawBlockElementDecodesEveryField(t *testing.T) {
+	typ := reflect.TypeOf(rawBlockElement{})
+	in := map[string]string{}
+	for i := 0; i < typ.NumField(); i++ {
+		tag := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
+		if tag != "" && tag != "-" && tag != "text" {
+			in[tag] = "v-" + tag
+		}
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e rawBlockElement
+	if err := json.Unmarshal(data, &e); err != nil {
+		t.Fatal(err)
+	}
+	v := reflect.ValueOf(e)
+	for i := 0; i < typ.NumField(); i++ {
+		tag := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
+		if want, ok := in[tag]; ok && v.Field(i).String() != want {
+			t.Errorf("field %s (%q) = %q, want %q", typ.Field(i).Name, tag, v.Field(i).String(), want)
 		}
 	}
 }

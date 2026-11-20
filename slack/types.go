@@ -86,16 +86,18 @@ type rawBlockElement struct {
 // the object as a string failed the WHOLE conversations.replies response, so
 // a single such message made its thread unpollable.
 func (e *rawBlockElement) UnmarshalJSON(data []byte) error {
+	// The alias has no UnmarshalJSON, so every other field decodes as usual
+	// (a field added later included); the shallower Text wins over the
+	// alias's string one.
+	type alias rawBlockElement
 	var raw struct {
-		Type     string          `json:"type"`
-		Text     json.RawMessage `json:"text"`
-		ImageURL string          `json:"image_url"`
-		AltText  string          `json:"alt_text"`
+		alias
+		Text json.RawMessage `json:"text"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	*e = rawBlockElement{Type: raw.Type, ImageURL: raw.ImageURL, AltText: raw.AltText}
+	*e = rawBlockElement(raw.alias)
 	if len(raw.Text) == 0 || string(raw.Text) == "null" {
 		return nil
 	}
