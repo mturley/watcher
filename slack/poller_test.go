@@ -1128,7 +1128,7 @@ func TestPoll_BackfillRecordsThreadRoot(t *testing.T) {
 	if err := conn.QueryRow(`SELECT title FROM watcher_events WHERE type = ?`, string(watcher.EventTypeSlackThreadRoot)).Scan(&title); err != nil {
 		t.Fatal(err)
 	}
-	if title != "Thread started: "+fallbackTitle(longText) {
+	if title != "Thread started by Alice: "+fallbackTitle(longText) {
 		t.Errorf("root title = %q", title)
 	}
 }
@@ -1266,6 +1266,38 @@ func TestPoll_ReplyTitleNamesResolvedAuthorOnly(t *testing.T) {
 			}
 			var title string
 			if err := conn.QueryRow(`SELECT title FROM watcher_events WHERE type = 'slack_reply'`).Scan(&title); err != nil {
+				t.Fatal(err)
+			}
+			if title != c.want {
+				t.Errorf("title = %q, want %q", title, c.want)
+			}
+		})
+	}
+}
+
+// The root's title names its author the same way, falling back to the
+// plain form when the name didn't resolve.
+func TestPoll_RootTitleNamesResolvedAuthorOnly(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		users map[string]User
+		want  string
+	}{
+		{"resolved", map[string]User{"U1": {ID: "U1", DisplayName: "Alice"}}, "Thread started by Alice: root"},
+		{"lookup failed", map[string]User{"U1": {ID: "U1", DisplayName: "U1"}}, "Thread started: root"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			conn := testutil.NewTestDB(t)
+			if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+				t.Fatal(err)
+			}
+			thread := backfillThread()
+			thread.Messages = thread.Messages[:1]
+			if err := pollOnce(conn, &fakeClient{thread: thread, users: c.users}, slackResource, testLogger()); err != nil {
+				t.Fatal(err)
+			}
+			var title string
+			if err := conn.QueryRow(`SELECT title FROM watcher_events WHERE type = 'slack_thread_root'`).Scan(&title); err != nil {
 				t.Fatal(err)
 			}
 			if title != c.want {

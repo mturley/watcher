@@ -377,12 +377,18 @@ func emitMessages(conn *sql.DB, kind watcher.EventType, msgs []Message, names ma
 			continue
 		}
 
+		// The title names the author only when the name resolved: a failed
+		// lookup returns the raw id, which must never become a title.
+		named := nameResolved(author, m.UserID) && author != ""
 		evTitle := "Message in " + title
-		if nameResolved(author, m.UserID) && author != "" {
+		if named {
 			evTitle = "Message from " + author + " in " + title
 		}
 		if kind == watcher.EventTypeSlackThreadRoot {
 			evTitle = "Thread started: " + title
+			if named {
+				evTitle = "Thread started by " + author + ": " + title
+			}
 		}
 		var authorPtr *string
 		if author != "" {
