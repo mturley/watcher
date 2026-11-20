@@ -377,7 +377,7 @@ func emitMessages(conn *sql.DB, kind watcher.EventType, msgs []Message, names ma
 			continue
 		}
 
-		evTitle := "New reply in " + title
+		evTitle := "Message in " + title
 		if kind == watcher.EventTypeSlackThreadRoot {
 			evTitle = "Thread started: " + title
 		}

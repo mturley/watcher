@@ -579,7 +579,7 @@ func TestEventTextResolvesMentions(t *testing.T) {
 		t.Errorf("watch_started title = %q", wsTitle)
 	}
 	r := got[watcher.EventTypeSlackReply]
-	if r.Title != "New reply in "+wantTitle {
+	if r.Title != "Message in "+wantTitle {
 		t.Errorf("slack_reply title = %q", r.Title)
 	}
 	if r.Body == nil || *r.Body != "Bob: @Dee agreed" {
@@ -931,7 +931,7 @@ func TestBackfillThread_RewritesTruncatedBody(t *testing.T) {
 	ts := "1699000100.000200"
 	short := "Bob: " + fallbackTitle(longText)
 	if err := db.InsertEvent(conn, watcher.Event{ID: "old", TS: "2023-11-03T08:28:20Z", ExternalTS: &ts,
-		Source: "slack", Type: watcher.EventTypeSlackReply, Title: "New reply in root", Body: &short}, slackResource); err != nil {
+		Source: "slack", Type: watcher.EventTypeSlackReply, Title: "Message in root", Body: &short}, slackResource); err != nil {
 		t.Fatal(err)
 	}
 
@@ -951,7 +951,7 @@ func TestBackfillThread_RewritesTruncatedBody(t *testing.T) {
 func seedReply(t *testing.T, conn *sql.DB, id, ts, body string) {
 	t.Helper()
 	if err := db.InsertEvent(conn, watcher.Event{ID: id, TS: "2023-11-03T08:28:20Z", ExternalTS: &ts,
-		Source: "slack", Type: watcher.EventTypeSlackReply, Title: "New reply in root", Body: &body}, slackResource); err != nil {
+		Source: "slack", Type: watcher.EventTypeSlackReply, Title: "Message in root", Body: &body}, slackResource); err != nil {
 		t.Fatal(err)
 	}
 }
