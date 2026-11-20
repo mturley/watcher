@@ -1191,3 +1191,52 @@ func TestBackfillThread_KeepsRootBodyWhenAuthorUnresolved(t *testing.T) {
 		t.Errorf("root body = %q, want it unchanged", got)
 	}
 }
+
+// The first poll writes watch_started last, after the root and the replies,
+// so a poll that fails part-way is still a first poll next time.
+func TestPoll_BackfillWritesRootFirstWatchStartedLast(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pollOnce(conn, &fakeClient{thread: backfillThread()}, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := conn.Query(`SELECT type FROM watcher_events ORDER BY rowid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var order []string
+	for rows.Next() {
+		var typ string
+		if err := rows.Scan(&typ); err != nil {
+			t.Fatal(err)
+		}
+		order = append(order, typ)
+	}
+	want := []string{"slack_thread_root", "slack_reply", "slack_reply", "watch_started"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Errorf("insert order = %v, want %v", order, want)
+	}
+}
+
+func TestBackfillThread_RewritesShortRootBody(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatal(err)
+	}
+	thread := backfillThread()
+	thread.Messages = thread.Messages[:1]
+	client := &fakeClient{thread: thread, users: map[string]User{"U1": {ID: "U1", DisplayName: "Alice"}}}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	client.thread.Messages[0].Text = longText
+	if _, err := BackfillThread(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got := eventBody(t, conn, watcher.EventTypeSlackThreadRoot, "1699000000.000100"); got != "Alice: "+longText {
+		t.Errorf("root body = %q, want the whole root", got)
+	}
+}

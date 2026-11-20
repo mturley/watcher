@@ -210,11 +210,13 @@ func parseResourceID(id string) (channel, threadTS string, ok bool) {
 //
 // The first poll (no watch_started recorded yet) always emits watch_started,
 // stamped now, and emits it last. Without backfill that is all it does. With
-// backfill it first records every earlier reply, each stamped with the time
-// it was SENT (emitMessages), so history lands at the right point in a
-// consumer's timeline rather than flooding its top. Later polls record new replies stamped with the wall
-// clock: a consumer reading "events newer than ts" (a notifier) must still
-// see a reply that was sent minutes before the poll that found it.
+// backfill it first records the thread's first message (slack_thread_root)
+// and every earlier reply, each stamped with the time it was SENT
+// (emitMessages), so history lands at the right point in a consumer's
+// timeline rather than flooding its top. Later polls record new replies
+// stamped with the wall clock: a consumer reading "events newer than ts" (a
+// notifier) must still see a reply that was sent minutes before the poll
+// that found it.
 //
 // Mention tokens ("<@U…>", "<!subteam^S…>") are resolved to names before any
 // text is stored: an event's title and body are read by consumers that have no
@@ -233,9 +235,9 @@ func processThread(conn *sql.DB, client Client, thread Thread, names map[string]
 		mentions := newMentionResolver(client, names, threadTexts(thread, replies)...)
 		resolvedRoot := mentions.resolve(rootText(thread))
 		title := fallbackTitle(resolvedRoot)
-		// Replies first, watch_started last: until watch_started exists the
-		// next poll is still a first poll, so a failure part-way through is
-		// retried rather than leaving the older replies unrecorded.
+		// Messages first, watch_started last: until watch_started exists
+		// the next poll is still a first poll, so a failure part-way through
+		// is retried rather than leaving older messages unrecorded.
 		n := 0
 		if backfill {
 			// The root is history too: its own event, so it is searchable
@@ -280,11 +282,11 @@ func processThread(conn *sql.DB, client Client, thread Thread, names map[string]
 
 // BackfillThread catches up a thread that was first polled without backfill
 // (it exists for consumers that followed threads before turning backfill
-// on; the poller only backfills on a thread's first poll). It records every
-// reply (up to the page conversations.replies returns) that has no
-// slack_reply event yet, each stamped with its send time, and rewrites the
-// body of any recorded reply, and of the thread's watch_started, whose text
-// differs. Returns the count of events emitted or rewritten.
+// on; the poller only backfills on a thread's first poll). It records the
+// thread's first message (slack_thread_root) and every reply (up to the page
+// conversations.replies returns) that has no event yet, each stamped with
+// its send time, and rewrites the body of any recorded message, and of the
+// thread's watch_started, whose text differs. Returns the count of events emitted or rewritten.
 //
 // A thread with no watch_started (followed but never polled, or a first poll
 // that failed part-way) is left alone: its next poll is still a first poll,
