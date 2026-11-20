@@ -761,9 +761,10 @@ func TestPoll_BackfillDatesRepliesAtSendTime(t *testing.T) {
 	}
 	var replies []backfillRow
 	for _, r := range rows {
-		if r.typ == string(watcher.EventTypeSlackReply) {
+		switch r.typ {
+		case string(watcher.EventTypeSlackReply):
 			replies = append(replies, r)
-		} else {
+		case string(watcher.EventTypeWatchStarted):
 			assertRecent(t, "watch_started", r.ts)
 		}
 	}
@@ -840,8 +841,8 @@ func TestBackfillThread_FillsOnlyMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
-		t.Errorf("BackfillThread emitted %d, want 2", n)
+	if n != 3 { // the two older replies and the root
+		t.Errorf("BackfillThread emitted %d, want 3", n)
 	}
 	if n, err := BackfillThread(conn, client, slackResource, testLogger()); err != nil || n != 0 {
 		t.Errorf("second BackfillThread = %d, %v; want 0, nil", n, err)
@@ -935,8 +936,8 @@ func TestBackfillThread_RewritesTruncatedBody(t *testing.T) {
 	}
 
 	n, err := BackfillThread(conn, client, slackResource, testLogger())
-	if err != nil || n != 1 {
-		t.Fatalf("BackfillThread = %d, %v; want 1, nil", n, err)
+	if err != nil || n != 2 { // the rewrite, and the missing root event
+		t.Fatalf("BackfillThread = %d, %v; want 2, nil", n, err)
 	}
 	if got := eventBody(t, conn, watcher.EventTypeSlackReply, ts); got != "Bob: "+longText {
 		t.Errorf("body = %q, want the whole message", got)
@@ -1002,8 +1003,8 @@ func TestBackfillThread_RewritesWatchStartedBody(t *testing.T) {
 	client := &fakeClient{thread: Thread{Channel: "C1", ThreadTS: root,
 		Messages: []Message{{TS: root, UserID: "U1", Text: longText}}}}
 	n, err := BackfillThread(conn, client, slackResource, testLogger())
-	if err != nil || n != 1 {
-		t.Fatalf("BackfillThread = %d, %v; want 1, nil", n, err)
+	if err != nil || n != 2 { // the rewrite, and the missing root event
+		t.Fatalf("BackfillThread = %d, %v; want 2, nil", n, err)
 	}
 	if got := eventBody(t, conn, watcher.EventTypeWatchStarted, root); got != longText {
 		t.Errorf("watch_started body = %q, want the whole root", got)
@@ -1084,4 +1085,109 @@ func TestPoll_MalformedReplyTSStampedNow(t *testing.T) {
 		}
 	}
 	t.Fatal("no event recorded for the malformed-ts reply")
+}
+
+func rootRow(t *testing.T, conn *sql.DB) []backfillRow {
+	t.Helper()
+	var out []backfillRow
+	for _, r := range backfillRows(t, conn) {
+		if r.typ == string(watcher.EventTypeSlackThreadRoot) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func TestPoll_BackfillRecordsThreadRoot(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatal(err)
+	}
+	thread := backfillThread()
+	thread.Messages[0].Text = longText
+	client := &fakeClient{thread: thread, users: map[string]User{
+		"U1": {ID: "U1", DisplayName: "Alice"}, "U2": {ID: "U2", DisplayName: "Bob"},
+	}}
+	for i := 0; i < 2; i++ {
+		if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	roots := rootRow(t, conn)
+	if len(roots) != 1 {
+		t.Fatalf("slack_thread_root rows = %+v, want exactly 1", roots)
+	}
+	r := roots[0]
+	if r.extTS != "1699000000.000100" || r.ts != "2023-11-03T08:26:40Z" || r.authorID.String != "U1" {
+		t.Errorf("root = %+v, want external_ts/ts of the root's send time and author_id U1", r)
+	}
+	if got := eventBody(t, conn, watcher.EventTypeSlackThreadRoot, "1699000000.000100"); got != "Alice: "+longText {
+		t.Errorf("root body = %q, want the author and the whole root", got)
+	}
+	var title string
+	if err := conn.QueryRow(`SELECT title FROM watcher_events WHERE type = ?`, string(watcher.EventTypeSlackThreadRoot)).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Thread started: "+fallbackTitle(longText) {
+		t.Errorf("root title = %q", title)
+	}
+}
+
+func TestPoll_NoThreadRootWithoutBackfill(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pollOnce(conn, &fakeClient{thread: backfillThread()}, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if roots := rootRow(t, conn); len(roots) != 0 {
+		t.Fatalf("slack_thread_root rows = %+v, want none", roots)
+	}
+}
+
+func TestBackfillThread_AddsMissingRootOnce(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	thread := backfillThread()
+	thread.Messages = thread.Messages[:1]
+	client := &fakeClient{thread: thread, users: map[string]User{"U1": {ID: "U1", DisplayName: "Alice"}}}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	n, err := BackfillThread(conn, client, slackResource, testLogger())
+	if err != nil || n != 1 {
+		t.Fatalf("BackfillThread = %d, %v; want 1 (the root), nil", n, err)
+	}
+	if roots := rootRow(t, conn); len(roots) != 1 || roots[0].ts != "2023-11-03T08:26:40Z" {
+		t.Fatalf("roots = %+v, want one at the root's send time", roots)
+	}
+	if n, err := BackfillThread(conn, client, slackResource, testLogger()); err != nil || n != 0 {
+		t.Errorf("second BackfillThread = %d, %v; want 0, nil", n, err)
+	}
+}
+
+func TestBackfillThread_KeepsRootBodyWhenAuthorUnresolved(t *testing.T) {
+	conn := testutil.NewTestDB(t)
+	if err := db.Subscribe(conn, "test-sub", slackResource, db.SubscribeOpts{Backfill: true}); err != nil {
+		t.Fatal(err)
+	}
+	thread := backfillThread()
+	thread.Messages = thread.Messages[:1]
+	client := &fakeClient{thread: thread, users: map[string]User{"U1": {ID: "U1", DisplayName: "Alice"}}}
+	if err := pollOnce(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	client.thread.Messages[0].Text = "edited root"
+	client.users = map[string]User{"U1": {ID: "U1", DisplayName: "U1"}} // failed lookup
+	// watch_started (no author prefix) may take the edit; the root event,
+	// whose body would name the author by a raw id, must not.
+	if _, err := BackfillThread(conn, client, slackResource, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got := eventBody(t, conn, watcher.EventTypeSlackThreadRoot, "1699000000.000100"); got != "Alice: root" {
+		t.Errorf("root body = %q, want it unchanged", got)
+	}
 }

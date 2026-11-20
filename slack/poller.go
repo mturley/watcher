@@ -211,7 +211,7 @@ func parseResourceID(id string) (channel, threadTS string, ok bool) {
 // The first poll (no watch_started recorded yet) always emits watch_started,
 // stamped now, and emits it last. Without backfill that is all it does. With
 // backfill it first records every earlier reply, each stamped with the time
-// it was SENT (emitReplies), so history lands at the right point in a
+// it was SENT (emitMessages), so history lands at the right point in a
 // consumer's timeline rather than flooding its top. Later polls record new replies stamped with the wall
 // clock: a consumer reading "events newer than ts" (a notifier) must still
 // see a reply that was sent minutes before the poll that found it.
@@ -236,7 +236,18 @@ func processThread(conn *sql.DB, client Client, thread Thread, names map[string]
 		// Replies first, watch_started last: until watch_started exists the
 		// next poll is still a first poll, so a failure part-way through is
 		// retried rather than leaving the older replies unrecorded.
-		n, err := emitReplies(conn, replies, names, mentions, title, true, resource, logger)
+		n := 0
+		if backfill {
+			// The root is history too: its own event, so it is searchable
+			// and sits in the activity feed at the time it was sent.
+			k, err := emitMessages(conn, watcher.EventTypeSlackThreadRoot, thread.Messages[:1], names, mentions, title, true, resource, logger)
+			n += k
+			if err != nil {
+				return n, resolvedRoot, err
+			}
+		}
+		k, err := emitMessages(conn, watcher.EventTypeSlackReply, replies, names, mentions, title, true, resource, logger)
+		n += k
 		if err != nil {
 			return n, resolvedRoot, err
 		}
@@ -263,7 +274,7 @@ func processThread(conn *sql.DB, client Client, thread Thread, names map[string]
 	}
 	mentions := newMentionResolver(client, names, threadTexts(thread, fresh)...)
 	resolvedRoot := mentions.resolve(rootText(thread))
-	n, err := emitReplies(conn, fresh, names, mentions, fallbackTitle(resolvedRoot), false, resource, logger)
+	n, err := emitMessages(conn, watcher.EventTypeSlackReply, fresh, names, mentions, fallbackTitle(resolvedRoot), false, resource, logger)
 	return n, resolvedRoot, err
 }
 
@@ -317,22 +328,28 @@ func BackfillThread(conn *sql.DB, client Client, resource watcher.Resource, logg
 			count++
 		}
 	}
-	n, err := emitReplies(conn, replies, names, mentions, fallbackTitle(resolvedRoot), true, resource, logger)
+	title := fallbackTitle(resolvedRoot)
+	n, err := emitMessages(conn, watcher.EventTypeSlackThreadRoot, thread.Messages[:1], names, mentions, title, true, resource, logger)
+	count += n
+	if err != nil {
+		return count, err
+	}
+	n, err = emitMessages(conn, watcher.EventTypeSlackReply, replies, names, mentions, title, true, resource, logger)
 	return count + n, err
 }
 
-// emitReplies records a slack_reply for each message not already recorded
-// (deduped on its ts). atSendTime marks a backfill: each new event is
+// emitMessages records an event of kind (slack_reply, or slack_thread_root
+// for the root) for each message not already recorded (deduped on its ts). atSendTime marks a backfill: each new event is
 // stamped with the message's send time instead of the wall clock (see
 // processThread for when each applies), and an already-recorded reply whose
 // body differs is rewritten, unless a name in it failed to resolve. Returns
 // the count of events emitted or rewritten.
-func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions mentionResolver, title string, atSendTime bool, resource watcher.Resource, logger *log.Logger) (int, error) {
+func emitMessages(conn *sql.DB, kind watcher.EventType, msgs []Message, names map[string]string, mentions mentionResolver, title string, atSendTime bool, resource watcher.Resource, logger *log.Logger) (int, error) {
 	count := 0
 	for _, m := range msgs {
 		check := db.DedupCheck{
 			Source: "slack", ResourceType: resource.Type, ResourceID: resource.ID,
-			Type: watcher.EventTypeSlackReply, ExternalTS: &m.TS,
+			Type: kind, ExternalTS: &m.TS,
 		}
 		dup, err := db.IsDuplicate(conn, check)
 		if err != nil {
@@ -349,7 +366,7 @@ func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions
 			if atSendTime && nameResolved(author, m.UserID) && mentions.complete(m.Text) {
 				changed, err := db.UpdateEventBody(conn, check, body)
 				if err != nil {
-					return count, fmt.Errorf("update slack_reply body: %w", err)
+					return count, fmt.Errorf("update %s body: %w", kind, err)
 				}
 				if changed {
 					count++
@@ -358,7 +375,10 @@ func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions
 			continue
 		}
 
-		evTitle := fmt.Sprintf("New reply in %s", title)
+		evTitle := "New reply in " + title
+		if kind == watcher.EventTypeSlackThreadRoot {
+			evTitle = "Thread started: " + title
+		}
 		var authorPtr *string
 		if author != "" {
 			authorPtr = &author
@@ -367,11 +387,11 @@ func emitReplies(conn *sql.DB, msgs []Message, names map[string]string, mentions
 		if atSendTime {
 			ts = slackSendTime(m.TS)
 		}
-		if err := emitEvent(conn, watcher.EventTypeSlackReply, evTitle, &body, m.TS, ts, authorPtr, nil, optional(m.UserID), resource); err != nil {
-			return count, fmt.Errorf("emit slack_reply: %w", err)
+		if err := emitEvent(conn, kind, evTitle, &body, m.TS, ts, authorPtr, nil, optional(m.UserID), resource); err != nil {
+			return count, fmt.Errorf("emit %s: %w", kind, err)
 		}
 		count++
-		logger.Printf("Emitted slack_reply for %s", resource.ID)
+		logger.Printf("Emitted %s for %s", kind, resource.ID)
 	}
 	return count, nil
 }

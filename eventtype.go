@@ -36,6 +36,7 @@ const (
 	EventTypeJiraDescChanged           EventType = "jira_description_changed"
 	EventTypeJiraLabelsChanged         EventType = "jira_labels_changed"
 	EventTypeSlackReply                EventType = "slack_reply"
+	EventTypeSlackThreadRoot           EventType = "slack_thread_root" // a thread's first message
 	EventTypeWatchStarted              EventType = "watch_started"
 	EventTypeWatcherError              EventType = "watcher_error"
 )
@@ -71,6 +72,7 @@ var eventTypeDisplayNames = map[EventType]string{
 	EventTypeJiraDescChanged:   "description changes",
 	EventTypeJiraLabelsChanged: "label changes",
 	EventTypeSlackReply:        "Slack replies",
+	EventTypeSlackThreadRoot:   "Slack thread starts",
 	EventTypeWatchStarted:      "watch started",
 	EventTypeWatcherError:      "watcher errors",
 }
